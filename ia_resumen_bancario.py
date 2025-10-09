@@ -1,151 +1,136 @@
-import io
-import re
-import pandas as pd
-import numpy as np
-import streamlit as st
-from pathlib import Path
+# ia_resumen_bancario.py
+# Herramienta para uso interno - AIE San Justo · Developer: Alfonso Alderete
 
-# --- Assets seguros (no crashea si faltan) ---
+import io, re
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+# --- Config UI (no rompe si faltan assets) ---
 HERE = Path(__file__).parent
 LOGO = HERE / "logo_aie.png"
 FAVICON = HERE / "favicon-aie.ico"
-
-st.set_page_config(
-    page_title="IA Resumen Bancario",
-    page_icon=str(FAVICON) if FAVICON.exists() else None
-)
-
+st.set_page_config(page_title="IA Resumen Bancario", page_icon=str(FAVICON) if FAVICON.exists() else None)
 if LOGO.exists():
     st.image(str(LOGO), width=200)
-
 st.title("IA Resumen Bancario")
 
-# ====== SOLO este cambio en montos (decimales) ======
-MONEY_RE = re.compile(r"(?:\d{1,3}(?:\s?\.\s?\d{3})*|\d+)\s?,\s?\d{2}-?")  # coma + 2 decimales
+# --- Import diferido (si hay error de lib, la página igual carga y ves el error) ---
+try:
+    import pdfplumber
+except Exception as e:
+    st.error(f"No se pudo importar pdfplumber: {e}\nRevisá requirements.txt")
+    st.stop()
 
-def parse_money(s: str) -> float:
-    """Convierte '1 . 234 . 567 , 89 -' -> -1234567.89 (coma decimal)"""
-    if s is None:
+# --- Regex EXACTOS (dos decimales con coma; miles con punto o espacio; guion final opcional) ---
+DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{4}\b")
+MONEY_RE = re.compile(r"(?:\d{1,3}(?:[.\s]\d{3})*|\d+)\s?,\s?\d{2}-?")
+
+def normalize_money(tok: str) -> float:
+    """'1 . 234 . 567 , 89 -' -> -1234567.89 (coma = decimal; dos decimales)"""
+    if not tok:
         return np.nan
-    s = str(s).strip()
-    neg = s.endswith("-")
-    s = s.rstrip("-")
-    s = s.replace(" ", "")  # elimina espacios dispersos
-    s = s.replace(".", "").replace(",", ".")
+    tok = tok.strip()
+    neg = tok.endswith("-")
+    tok = tok.rstrip("-")
+    if "," not in tok:
+        return np.nan
+    main, frac = tok.rsplit(",", 1)  # decimal fijo: coma
+    main = main.replace(".", "").replace(" ", "")
     try:
-        v = float(s)
-        return -v if neg else v
+        val = float(f"{main}.{frac}")
+        return -val if neg else val
     except Exception:
         return np.nan
-# ====== fin del cambio de decimales ======
 
+def parse_pdf(file_like) -> pd.DataFrame:
+    """Extracción SOLO por TEXTO (estable). Penúltimo = Importe, Último = Saldo. Crédito RESTA / Débito SUMA."""
+    rows = []
+    with pdfplumber.open(file_like) as pdf:
+        for pageno, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            for raw in text.splitlines():
+                line = " ".join(raw.split())              # colapsa espacios
+                d = DATE_RE.search(line)                  # busca fecha en cualquier lugar
+                if not d:
+                    continue
+                amounts = MONEY_RE.findall(line)
+                if len(amounts) < 2:
+                    continue
+                saldo = normalize_money(amounts[-1])      # último = saldo
+                importe = normalize_money(amounts[-2])    # penúltimo = importe
+                first_m = MONEY_RE.search(line)
+                desc = line[d.end(): first_m.start()].strip() if first_m else line[d.end():].strip()
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.image("logo_aie.png", width=200)
-st.title(APP_TITLE)
+                up = desc.upper()
+                # Heurística mínima: SIN tocar el importe
+                is_credit = ("CR-" in up) or up.startswith("CR") or ("CR-TRSFE" in up) or ("NEG.CONT" in up) or ("TRANSF RECIB" in up)
+                debito  = 0.0 if is_credit else importe
+                credito = importe if is_credit else 0.0
 
+                rows.append({
+                    "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
+                    "descripcion": desc,
+                    "debito": debito,
+                    "credito": credito,
+                    "importe": debito - credito,  # Débito SUMA / Crédito RESTA
+                    "saldo": saldo,
+                    "pagina": pageno
+                })
+    return pd.DataFrame(rows)
+
+def find_saldo_final(file_like):
+    with pdfplumber.open(file_like) as pdf:
+        for page in reversed(pdf.pages):
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                if "Saldo al" in line:
+                    d = DATE_RE.search(line)
+                    amts = MONEY_RE.findall(line)
+                    if d and amts:
+                        return pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"), normalize_money(amts[-1])
+    return pd.NaT, np.nan
+
+# --- UI principal ---
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
-
 if uploaded is None:
+    st.info("Cargá un PDF. La app usa extracción por TEXTO; no inventa números.")
     st.stop()
 
-file_like = io.BytesIO(uploaded.read())
+data = uploaded.read()
+file_like = io.BytesIO(data)
 
-# 1) Extraer movimientos
-df = extract_movimientos(file_like)
+with st.spinner("Procesando PDF..."):
+    df = parse_pdf(io.BytesIO(data))
+
 if df.empty:
-    st.error("No se detectaron movimientos en el PDF. Ajusto el parser si me compartís este archivo por mensaje.")
+    st.error("No se detectaron movimientos. Si el PDF tiene un formato distinto, pasame una línea de ejemplo (fecha + concepto + 2 montos).")
     st.stop()
 
-# 2) Regla de signo pedida (se traduce a una sola columna 'importe')
-df["importe"] = df["debito"].fillna(0.0) - df["credito"].fillna(0.0)  # Débito suma / Crédito resta
-
-# 3) Saldo final del PDF y saldo inicial calculado
+# Saldos
 file_like.seek(0)
-fecha_cierre, saldo_final_pdf = find_saldo_final(file_like)
-saldo_inicial_calc = saldo_final_pdf - df["importe"].sum() if not np.isnan(saldo_final_pdf) else np.nan
+fecha_cierre, saldo_final = find_saldo_final(io.BytesIO(data))
+saldo_inicial = saldo_final - df["importe"].sum() if not np.isnan(saldo_final) else np.nan
 
-# 4) Clasificaciones puntuales para el resumen
-U = df["descripcion"].str.upper().fillna("")
-tipo = pd.Series("OTROS", index=df.index)
-tipo[U.str.contains(r"\bSIRCREB\b")] = "SIRCREB"
-tipo[U.str.contains(r"\bIMPTRANS\b|LEY\s*25413")] = "IMP_LEY_25413"
-tipo[U.str.contains(r"\bIVA\b") & ~U.str.contains("PERCEP")] = "IVA"
-tipo[U.str.contains("PERCEP") & U.str.contains("IVA")] = "PERCEPCION_IVA"
-tipo[U.str.contains(r"DB\.INMED|DB/PG/VS|DEB\.AUT|PAGO\s*VISA|DB-")] = "DEBITO_AUTOMATICO"
-tipo[U.str.contains(r"TRSFE-IT|TRSFE-ET|TRSFE-RT")] = "TRF_TERCEROS_SALIENTE"
-tipo[U.str.contains(r"CR-TRSFE|TRSFE\s+RECIB|CR-")] = "TRF_TERCEROS_ENTRANTE"
-tipo[U.str.contains(r"ENTRE CUENTAS|PROPIA|MISMA TITULARIDAD")] = "TRF_PROPIAS"
-df["tipo"] = tipo
-
-# 5) Resúmenes
-def pos(x): return x[x>0].sum()
-def neg_abs(x): return (-x[x<0]).sum()
-
-summary = {
-    "saldo_inicial": saldo_inicial_calc,
-    "saldo_final": saldo_final_pdf,
-    "trf_recibidas_terceros": pos(df.loc[df["tipo"]=="TRF_TERCEROS_ENTRANTE","importe"]),
-    "trf_realizadas_terceros": neg_abs(df.loc[df["tipo"]=="TRF_TERCEROS_SALIENTE","importe"]),
-    "trf_propias_recibidas": pos(df.loc[df["tipo"]=="TRF_PROPIAS","importe"]),
-    "trf_propias_realizadas": neg_abs(df.loc[df["tipo"]=="TRF_PROPIAS","importe"]),
-    "sircreb": neg_abs(df.loc[df["tipo"]=="SIRCREB","importe"]),
-    "imp_25413": neg_abs(df.loc[df["tipo"]=="IMP_LEY_25413","importe"]),
-    "debitos_automaticos": neg_abs(df.loc[df["tipo"]=="DEBITO_AUTOMATICO","importe"]),
-    "iva": neg_abs(df.loc[df["tipo"]=="IVA","importe"]),
-    "percepciones_iva": neg_abs(df.loc[df["tipo"]=="PERCEPCION_IVA","importe"]),
-}
-
-# 6) UI de resumen
+# Resumen
 st.subheader("Resumen del período")
-c1, c2, c3 = st.columns(3)
-c1.metric("Saldo inicial (calculado)", f"$ {summary['saldo_inicial']:,.2f}" if not np.isnan(summary['saldo_inicial']) else "—")
-c2.metric("Saldo final (del PDF)", f"$ {summary['saldo_final']:,.2f}" if not np.isnan(summary['saldo_final']) else "—")
+c1, c2 = st.columns(2)
+c1.metric("Saldo inicial (calculado)", f"$ {saldo_inicial:,.2f}" if not np.isnan(saldo_inicial) else "—")
+c2.metric("Saldo final (PDF)", f"$ {saldo_final:,.2f}" if not np.isnan(saldo_final) else "—")
 if pd.notna(fecha_cierre):
-    c3.write(f"**Cierre:** {fecha_cierre.strftime('%d/%m/%Y')}")
-
-c1.metric("Trf. terceros recibidas", f"$ {summary['trf_recibidas_terceros']:,.2f}")
-c2.metric("Trf. terceros realizadas", f"$ {summary['trf_realizadas_terceros']:,.2f}")
-c3.metric("Trf. propias recibidas", f"$ {summary['trf_propias_recibidas']:,.2f}")
-c1.metric("Trf. propias realizadas", f"$ {summary['trf_propias_realizadas']:,.2f}")
+    st.caption(f"Cierre: {fecha_cierre.strftime('%d/%m/%Y')}")
 
 st.divider()
-st.subheader("Retenciones y débitos automáticos")
-c1, c2, c3 = st.columns(3)
-c1.metric("SIRCREB", f"$ {summary['sircreb']:,.2f}")
-c2.metric("Imp. Ley 25413", f"$ {summary['imp_25413']:,.2f}")
-c3.metric("Débitos automáticos", f"$ {summary['debitos_automaticos']:,.2f}")
-c1.metric("IVA (líneas 'IVA')", f"$ {summary['iva']:,.2f}")
-c2.metric("Percepciones de IVA", f"$ {summary['percepciones_iva']:,.2f}")
+st.subheader("Detalle de movimientos (con dos decimales obligatorios)")
+st.dataframe(df.sort_values(["fecha","pagina"]).reset_index(drop=True))
 
-# 7) Tablas completas (débitos y créditos)
-df_sorted = df.sort_values(["fecha","pagina"]).reset_index(drop=True)
-st.subheader("Detalle completo de movimientos")
-st.dataframe(df_sorted[["fecha","descripcion","debito","credito","importe","saldo","tipo","cuit","pagina"]])
-
-st.subheader("TODOS los Débitos")
-deb = df_sorted.loc[df_sorted["importe"]<0, ["fecha","descripcion","importe","tipo","cuit","pagina"]].copy()
-deb["monto"] = -deb["importe"]
-st.dataframe(deb.drop(columns=["importe"]))
-
-st.subheader("TODOS los Créditos")
-cre = df_sorted.loc[df_sorted["importe"]>0, ["fecha","descripcion","importe","tipo","cuit","pagina"]].copy()
-cre["monto"] = cre["importe"]
-st.dataframe(cre.drop(columns=["importe"]))
-
-st.subheader("Transferencias de/para terceros por CUIT")
-trf = df_sorted[df_sorted["tipo"].isin(["TRF_TERCEROS_ENTRANTE","TRF_TERCEROS_SALIENTE"])].copy()
-agr = trf.groupby(["tipo","cuit"], dropna=False)["importe"].sum().reset_index()
-agr["abs"] = agr["importe"].abs()
-st.dataframe(agr.sort_values("abs", ascending=False)[["tipo","cuit","importe"]])
-
-# ---- Footer fijo ----
 st.markdown(
     """
     <div style="position:fixed; left:0; right:0; bottom:0; padding:8px 12px; background:#f6f8fa; color:#444; font-size:12px; text-align:center; border-top:1px solid #e5e7eb;">
-    Herramienta para uso interno - AIE San Justo · Developer: Alfonso Alderete
+      Herramienta para uso interno - AIE San Justo · Developer: Alfonso Alderete
     </div>
-    """, unsafe_allow_html=True
+    """,
+    unsafe_allow_html=True,
 )
+
