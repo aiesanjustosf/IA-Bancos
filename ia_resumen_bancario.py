@@ -1,6 +1,5 @@
 
 # ia_resumen_bancario.py
-# Streamlit app to read Argentine bank statement PDFs and build a precise summary.
 # Autor: Herramienta para uso interno - AIE San Justo | Developer: Alfonso Alderete
 # Requisitos: streamlit, pdfplumber, pandas, numpy, python-dateutil
 
@@ -18,7 +17,7 @@ APP_TITLE = "IA Resumen Bancario"
 # -----------------------------
 # Utilidades
 # -----------------------------
-CUIT_RE = re.compile(r"\b\d{2}-?\d{8}-?\d\b")
+CUIT_RE = re.compile(r"\b\d{2}-?\d{8}-?\d\b")  # SIN grupos
 MONEY_RE = re.compile(r"[-+]?\d{1,3}(?:\.\d{3})*,\d{2}|\d+(?:[.,]\d+)?")
 
 def parse_money(text):
@@ -53,6 +52,11 @@ def detect_date(s):
     except Exception:
         return pd.NaT
 
+def extract_first_cuit(text):
+    """Devuelve el primer CUIT encontrado en el texto o NaN (evita error de grupos)."""
+    m = CUIT_RE.search(str(text))
+    return m.group(0) if m else np.nan
+
 # -----------------------------
 # Extracción del PDF
 # -----------------------------
@@ -76,6 +80,8 @@ def extract_tables_from_pdf(file_like) -> pd.DataFrame:
             if not tables:
                 tables = page.extract_tables({"vertical_strategy":"text","horizontal_strategy":"text"}) or []
             for table in tables:
+                if not table:
+                    continue
                 header = [normalize_space(c) for c in (table[0] or [])]
                 cols = [c.lower() for c in header]
                 idx_fecha = idx_desc = idx_debito = idx_credito = idx_saldo = None
@@ -118,16 +124,15 @@ def extract_tables_from_pdf(file_like) -> pd.DataFrame:
     df["debito"] = df["debito_raw"].apply(parse_money)
     df["credito"] = df["credito_raw"].apply(parse_money)
     df["saldo"] = df["saldo_raw"].apply(parse_money)
-    df["cuit"] = df["descripcion"].str.extract(CUIT_RE, expand=False)
-    df["descripcion"] = df["descripcion"].apply(normalize_space)
+    df["descripcion"] = df["descripcion"].astype(str).apply(normalize_space)
+    # FIX: extraer CUIT sin grupos
+    df["cuit"] = df["descripcion"].apply(extract_first_cuit)
     mask_empty_amounts = df["debito"].isna() & df["credito"].isna()
     df = df[~(mask_empty_amounts & df["descripcion"].str.len().lt(2))].copy()
     return df.reset_index(drop=True)
 
 def find_period_final_balance(pdf_file_like):
-    """
-    Busca “Saldo al dd/mm/yyyy” y su importe. Devuelve dict con 'fecha' y 'monto'.
-    """
+    """Busca “Saldo al dd/mm/yyyy” y su importe. Devuelve dict con 'fecha' y 'monto'."""
     with pdfplumber.open(pdf_file_like) as pdf:
         candidates = []
         for pageno, page in enumerate(pdf.pages, start=1):
@@ -168,11 +173,7 @@ def clasificar(df: pd.DataFrame) -> pd.DataFrame:
 # Cálculos y Resúmenes
 # -----------------------------
 def construir_signo(df: pd.DataFrame):
-    """
-    Regla fija solicitada por el usuario:
-    - Crédito RESTA (negativo)
-    - Débito SUMA (positivo)
-    """
+    """Regla fija: Crédito RESTA (negativo), Débito SUMA (positivo)."""
     debit = df["debito"].fillna(0.0)
     credit = df["credito"].fillna(0.0)
     df["importe"] = debit - credit
