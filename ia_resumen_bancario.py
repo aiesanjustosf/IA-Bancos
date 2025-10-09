@@ -158,7 +158,8 @@ saldo_inicial_calc = saldo_final_pdf - df["importe"].sum() if not np.isnan(saldo
 U = df["descripcion"].str.upper().fillna("")
 tipo = pd.Series("OTROS", index=df.index)
 tipo[U.str.contains(r"\bSIRCREB\b")] = "SIRCREB"
-tipo[U.str_contains := U.str.contains(r"\bIMPTRANS\b|LEY\s*25413")] = "IMP_LEY_25413"
+mask_imp = U.str.contains(r"\bIMPTRANS\b|LEY\s*25413", regex=True)
+tipo[mask_imp] = "IMP_LEY_25413"
 tipo[U.str.contains(r"\bIVA\b") & ~U.str.contains("PERCEP")] = "IVA"
 tipo[U.str.contains("PERCEP") & U.str.contains("IVA")] = "PERCEPCION_IVA"
 tipo[U.str.contains(r"DB\.INMED|DB/PG/VS|DEB\.AUT|PAGO\s*VISA|DB-")] = "DEBITO_AUTOMATICO"
