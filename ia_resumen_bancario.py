@@ -22,7 +22,7 @@ APP_TITLE = "IA Resumen Bancario"
 MONEY_RE_STRICT = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}-?")
 # Tolerante (con espacios entre dígitos/sep): 1 . 234 , 56  -
 MONEY_RE_FUZZY  = re.compile(r"\d{1,3}(?:\s?\.\s?\d{3})*(?:\s?,\s?\d{2})(?:\s?-)?")
-DATE_RE  = re.compile(r"^\d{1,2}/\d{2}/\d{4}")
+DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{4}\b")
 CUIT_RE  = re.compile(r"\b\d{11}\b")
 
 def parse_money(s: str) -> float:
@@ -69,7 +69,7 @@ def extract_movimientos(file_like) -> pd.DataFrame:
                 continue
             for line in bucket_lines(words, tol=2.0):
                 full_line_txt = "".join(w["text"] for w in line)
-                m = DATE_RE.match(full_line_txt)
+                m = DATE_RE.search(full_line_txt)
                 if not m:
                     continue
                 fecha = m.group(0)
