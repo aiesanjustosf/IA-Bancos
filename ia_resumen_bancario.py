@@ -1,122 +1,230 @@
 
-# ia_resumen_bancario.py (PyPDF ultra-lean)
-# Herramienta para uso interno - AIE San Justo · Developer: Alfonso Alderete
+# ia_resumen_bancario.py
+# Herramienta para uso interno - AIE San Justo | Developer: Alfonso Alderete
 
-import io, re
-from pypdf import PdfReader
+import io
+import re
+import pdfplumber
 import pandas as pd
 import numpy as np
 import streamlit as st
+from datetime import datetime
 
+# ---- UI meta (debe ser el primer llamado de Streamlit) ----
 st.set_page_config(page_title="IA Resumen Bancario", page_icon="favicon-aie.ico")
-st.image("logo_aie.png", width=200)
-st.title("IA Resumen Bancario")
 
-DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{4}\b")
-MONEY_RE = re.compile(r"(?:\d{1,3}(?:[.\s]\d{3})*|\d+),\d{2}-?")  # SIEMPRE coma + 2 decimales
+APP_TITLE = "IA Resumen Bancario"
 
-def normalize_money(tok: str) -> float:
-    tok = tok.strip()
-    neg = tok.endswith("-")
-    tok = tok.rstrip("-")
-    if "," not in tok:
+# -----------------------------
+# Utilidades
+# -----------------------------
+MONEY_RE = re.compile(r"(?:\d{1,3}(?:\s?\.\s?\d{3})*|\d+)\s?,\s?\d{2}-?")*,\d{2}(?:-)?")
+DATE_RE  = re.compile(r"^\d{1,2}/\d{2}/\d{4}")
+CUIT_RE  = re.compile(r"\b\d{11}\b")
+
+def parse_money(s: str) -> float:
+    """Convierte variantes como '1 . 234 . 567 , 89 -' -> -1234567.89 (coma = decimal)"""
+    if s is None:
         return np.nan
-    main, frac = tok.rsplit(",", 1)
-    main = main.replace(".", "").replace(" ", "")
-    s = f"{main}.{frac}"
+    s = str(s).strip()
+    neg = s.endswith("-")
+    s = s.rstrip("-")
+    s = s.replace(" ", "")  # eliminar espacios sueltos
+    s = s.replace(".", "").replace(",", ".")
     try:
         v = float(s)
         return -v if neg else v
     except Exception:
         return np.nan
 
-def pdf_text_lines(file_like):
-    reader = PdfReader(file_like)
-    for p in reader.pages:
-        text = p.extract_text() or ""
-        for raw in text.splitlines():
-            yield " ".join(raw.split())  # collapse spaces
+def bucket_lines(words, tol=2.0):
+    """Agrupa palabras por línea usando la coordenada 'top' con tolerancia."""
+    lines = []
+    current = []
+    current_top = None
+    for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
+        if current_top is None or abs(w["top"] - current_top) <= tol:
+            current.append(w)
+            if current_top is None:
+                current_top = w["top"]
+        else:
+            lines.append(current)
+            current = [w]
+            current_top = w["top"]
+    if current:
+        lines.append(current)
+    return lines
 
-def parse_pdf(file_like):
+def extract_movimientos(file_like) -> pd.DataFrame:
+    """Parser robusto por coordenadas (no depende de tablas)."""
     rows = []
-    for pageno, page_lines in enumerate([list(pdf_text_lines(file_like))], start=1):
-        # pdf_text_lines already iterates all pages; we just build rows.
-        pass
-    # Re-iterate to build rows with page numbers
-    file_like.seek(0)
-    reader = PdfReader(file_like)
-    page_no = 0
-    for page in reader.pages:
-        page_no += 1
-        text = page.extract_text() or ""
-        for raw in text.splitlines():
-            line = " ".join(raw.split())
-            d = DATE_RE.search(line)
-            if not d:
+    with pdfplumber.open(file_like) as pdf:
+        for pageno, page in enumerate(pdf.pages, start=1):
+            width = float(page.width)
+            words = page.extract_words(extra_attrs=["x0", "x1", "top", "bottom"])
+            if not words:
                 continue
-            monies = MONEY_RE.findall(line)
-            if len(monies) < 2:
-                continue
-            saldo = normalize_money(monies[-1])
-            importe = normalize_money(monies[-2])
-            first_m = MONEY_RE.search(line)
-            desc = line[d.end(): first_m.start()].strip() if first_m else line[d.end():].strip()
-            up = desc.upper()
-            is_credit = ("CR-" in up) or up.startswith("CR") or ("CR-TRSFE" in up) or ("NEG.CONT" in up) or ("TRANSF RECIB" in up)
-            debito = 0.0 if is_credit else importe
-            credito = importe if is_credit else 0.0
-            rows.append({
-                "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
-                "descripcion": desc,
-                "debito": debito,
-                "credito": credito,
-                "importe": debito - credito,
-                "saldo": saldo,
-                "pagina": page_no
-            })
-    return pd.DataFrame(rows)
+            for line in bucket_lines(words, tol=2.0):
+                s = "".join(w["text"] for w in line)
+                m = DATE_RE.match(s)
+                if not m:
+                    continue
+                fecha = m.group(0)
+                # derecha: montos (importe y saldo)
+                right_txt = "".join(w["text"] for w in line if w["x0"] >= width * 0.55)
+                monies = MONEY_RE.findall(right_txt)
+                if len(monies) < 2:
+                    continue
+                importe = parse_money(monies[-2])
+                saldo   = parse_money(monies[-1])
+                # izquierda: descripción
+                left_txt = "".join(w["text"] for w in line if w["x0"] < width * 0.55)
+                descripcion = left_txt[len(fecha):]
+                up = descripcion.upper()
+
+                # Clasificación básica (sin inventar): decide signo del importe
+                sign = -1  # por defecto lo tratamos como débito
+                if "CR-" in up or up.startswith("CR") or "NEG.CONT" in up or "CR-TRSFE" in up:
+                    sign = +1
+                elif "TRSFE-IT" in up or "TRSFE-ET" in up or "DB" in up or "DEB." in up or "IMPTRANS" in up or "SIRCREB" in up or "IVA" in up:
+                    sign = -1
+                elif "TRSFE" in up:
+                    sign = +1  # recibidas
+                # Construcción deb/cred
+                debito  = importe if sign == -1 else 0.0
+                credito = importe if sign == +1 else 0.0
+
+                # CUIT (si se encuentra)
+                m_cuit = CUIT_RE.search(descripcion.replace("-", ""))
+                cuit = m_cuit.group(0) if m_cuit else ""
+
+                rows.append({
+                    "fecha": pd.to_datetime(fecha, dayfirst=True, errors="coerce"),
+                    "descripcion": descripcion,
+                    "debito": debito,
+                    "credito": credito,
+                    "saldo": saldo,
+                    "cuit": cuit,
+                    "pagina": pageno
+                })
+    df = pd.DataFrame(rows)
+    return df
 
 def find_saldo_final(file_like):
-    reader = PdfReader(file_like)
-    for page in reversed(reader.pages):
-        text = page.extract_text() or ""
-        for line in text.splitlines():
-            if "Saldo al" in line:
-                d = DATE_RE.search(line)
-                amounts = MONEY_RE.findall(line)
-                if d and amounts:
-                    return (pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
-                            normalize_money(amounts[-1]))
+    """Busca una línea 'Saldo al dd/mm/aaaa ...' en el texto del PDF."""
+    with pdfplumber.open(file_like) as pdf:
+        for page in pdf.pages[::-1]:  # desde el final
+            text = page.extract_text() or ""
+            for line in text.splitlines():
+                if "Saldo al" in line:
+                    m_date = re.search(r"\d{1,2}/\d{2}/\d{4}", line)
+                    m_val  = MONEY_RE.search(line)
+                    if m_date and m_val:
+                        return pd.to_datetime(m_date.group(0), dayfirst=True), parse_money(m_val.group(0))
     return pd.NaT, np.nan
 
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.image("logo_aie.png", width=200)
+st.title(APP_TITLE)
+
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
+
 if uploaded is None:
     st.stop()
 
-data = uploaded.read()
-file_like = io.BytesIO(data)
+file_like = io.BytesIO(uploaded.read())
 
-with st.spinner("Procesando PDF..."):
-    df = parse_pdf(io.BytesIO(data))
-
+# 1) Extraer movimientos
+df = extract_movimientos(file_like)
 if df.empty:
-    st.error("No se detectaron movimientos en el PDF.")
+    st.error("No se detectaron movimientos en el PDF. Ajusto el parser si me compartís este archivo por mensaje.")
     st.stop()
 
-fecha_cierre, saldo_final = find_saldo_final(io.BytesIO(data))
-saldo_inicial = saldo_final - df["importe"].sum() if not np.isnan(saldo_final) else np.nan
+# 2) Regla de signo pedida (se traduce a una sola columna 'importe')
+df["importe"] = df["debito"].fillna(0.0) - df["credito"].fillna(0.0)  # Débito suma / Crédito resta
 
+# 3) Saldo final del PDF y saldo inicial calculado
+file_like.seek(0)
+fecha_cierre, saldo_final_pdf = find_saldo_final(file_like)
+saldo_inicial_calc = saldo_final_pdf - df["importe"].sum() if not np.isnan(saldo_final_pdf) else np.nan
+
+# 4) Clasificaciones puntuales para el resumen
+U = df["descripcion"].str.upper().fillna("")
+tipo = pd.Series("OTROS", index=df.index)
+tipo[U.str.contains(r"\bSIRCREB\b")] = "SIRCREB"
+tipo[U.str.contains(r"\bIMPTRANS\b|LEY\s*25413")] = "IMP_LEY_25413"
+tipo[U.str.contains(r"\bIVA\b") & ~U.str.contains("PERCEP")] = "IVA"
+tipo[U.str.contains("PERCEP") & U.str.contains("IVA")] = "PERCEPCION_IVA"
+tipo[U.str.contains(r"DB\.INMED|DB/PG/VS|DEB\.AUT|PAGO\s*VISA|DB-")] = "DEBITO_AUTOMATICO"
+tipo[U.str.contains(r"TRSFE-IT|TRSFE-ET|TRSFE-RT")] = "TRF_TERCEROS_SALIENTE"
+tipo[U.str.contains(r"CR-TRSFE|TRSFE\s+RECIB|CR-")] = "TRF_TERCEROS_ENTRANTE"
+tipo[U.str.contains(r"ENTRE CUENTAS|PROPIA|MISMA TITULARIDAD")] = "TRF_PROPIAS"
+df["tipo"] = tipo
+
+# 5) Resúmenes
+def pos(x): return x[x>0].sum()
+def neg_abs(x): return (-x[x<0]).sum()
+
+summary = {
+    "saldo_inicial": saldo_inicial_calc,
+    "saldo_final": saldo_final_pdf,
+    "trf_recibidas_terceros": pos(df.loc[df["tipo"]=="TRF_TERCEROS_ENTRANTE","importe"]),
+    "trf_realizadas_terceros": neg_abs(df.loc[df["tipo"]=="TRF_TERCEROS_SALIENTE","importe"]),
+    "trf_propias_recibidas": pos(df.loc[df["tipo"]=="TRF_PROPIAS","importe"]),
+    "trf_propias_realizadas": neg_abs(df.loc[df["tipo"]=="TRF_PROPIAS","importe"]),
+    "sircreb": neg_abs(df.loc[df["tipo"]=="SIRCREB","importe"]),
+    "imp_25413": neg_abs(df.loc[df["tipo"]=="IMP_LEY_25413","importe"]),
+    "debitos_automaticos": neg_abs(df.loc[df["tipo"]=="DEBITO_AUTOMATICO","importe"]),
+    "iva": neg_abs(df.loc[df["tipo"]=="IVA","importe"]),
+    "percepciones_iva": neg_abs(df.loc[df["tipo"]=="PERCEPCION_IVA","importe"]),
+}
+
+# 6) UI de resumen
 st.subheader("Resumen del período")
-c1, c2 = st.columns(2)
-c1.metric("Saldo inicial (calculado)", f"$ {saldo_inicial:,.2f}" if not np.isnan(saldo_inicial) else "—")
-c2.metric("Saldo final (PDF)", f"$ {saldo_final:,.2f}" if not np.isnan(saldo_final) else "—")
+c1, c2, c3 = st.columns(3)
+c1.metric("Saldo inicial (calculado)", f"$ {summary['saldo_inicial']:,.2f}" if not np.isnan(summary['saldo_inicial']) else "—")
+c2.metric("Saldo final (del PDF)", f"$ {summary['saldo_final']:,.2f}" if not np.isnan(summary['saldo_final']) else "—")
 if pd.notna(fecha_cierre):
-    st.caption(f"Cierre: {fecha_cierre.strftime('%d/%m/%Y')}")
+    c3.write(f"**Cierre:** {fecha_cierre.strftime('%d/%m/%Y')}")
+
+c1.metric("Trf. terceros recibidas", f"$ {summary['trf_recibidas_terceros']:,.2f}")
+c2.metric("Trf. terceros realizadas", f"$ {summary['trf_realizadas_terceros']:,.2f}")
+c3.metric("Trf. propias recibidas", f"$ {summary['trf_propias_recibidas']:,.2f}")
+c1.metric("Trf. propias realizadas", f"$ {summary['trf_propias_realizadas']:,.2f}")
 
 st.divider()
-st.subheader("Detalle de movimientos")
-st.dataframe(df.sort_values(["fecha","pagina"]).reset_index(drop=True))
+st.subheader("Retenciones y débitos automáticos")
+c1, c2, c3 = st.columns(3)
+c1.metric("SIRCREB", f"$ {summary['sircreb']:,.2f}")
+c2.metric("Imp. Ley 25413", f"$ {summary['imp_25413']:,.2f}")
+c3.metric("Débitos automáticos", f"$ {summary['debitos_automaticos']:,.2f}")
+c1.metric("IVA (líneas 'IVA')", f"$ {summary['iva']:,.2f}")
+c2.metric("Percepciones de IVA", f"$ {summary['percepciones_iva']:,.2f}")
 
+# 7) Tablas completas (débitos y créditos)
+df_sorted = df.sort_values(["fecha","pagina"]).reset_index(drop=True)
+st.subheader("Detalle completo de movimientos")
+st.dataframe(df_sorted[["fecha","descripcion","debito","credito","importe","saldo","tipo","cuit","pagina"]])
+
+st.subheader("TODOS los Débitos")
+deb = df_sorted.loc[df_sorted["importe"]<0, ["fecha","descripcion","importe","tipo","cuit","pagina"]].copy()
+deb["monto"] = -deb["importe"]
+st.dataframe(deb.drop(columns=["importe"]))
+
+st.subheader("TODOS los Créditos")
+cre = df_sorted.loc[df_sorted["importe"]>0, ["fecha","descripcion","importe","tipo","cuit","pagina"]].copy()
+cre["monto"] = cre["importe"]
+st.dataframe(cre.drop(columns=["importe"]))
+
+st.subheader("Transferencias de/para terceros por CUIT")
+trf = df_sorted[df_sorted["tipo"].isin(["TRF_TERCEROS_ENTRANTE","TRF_TERCEROS_SALIENTE"])].copy()
+agr = trf.groupby(["tipo","cuit"], dropna=False)["importe"].sum().reset_index()
+agr["abs"] = agr["importe"].abs()
+st.dataframe(agr.sort_values("abs", ascending=False)[["tipo","cuit","importe"]])
+
+# ---- Footer fijo ----
 st.markdown(
     """
     <div style="position:fixed; left:0; right:0; bottom:0; padding:8px 12px; background:#f6f8fa; color:#444; font-size:12px; text-align:center; border-top:1px solid #e5e7eb;">
