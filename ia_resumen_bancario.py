@@ -1,127 +1,44 @@
-
-# ia_resumen_bancario.py
-# Herramienta para uso interno - AIE San Justo | Developer: Alfonso Alderete
-
 import io
 import re
-import pdfplumber
 import pandas as pd
 import numpy as np
 import streamlit as st
-from datetime import datetime
+from pathlib import Path
 
-# ---- UI meta (debe ser el primer llamado de Streamlit) ----
-st.set_page_config(page_title="IA Resumen Bancario", page_icon="favicon-aie.ico")
+# --- Assets seguros (no crashea si faltan) ---
+HERE = Path(__file__).parent
+LOGO = HERE / "logo_aie.png"
+FAVICON = HERE / "favicon-aie.ico"
 
-APP_TITLE = "IA Resumen Bancario"
+st.set_page_config(
+    page_title="IA Resumen Bancario",
+    page_icon=str(FAVICON) if FAVICON.exists() else None
+)
 
-# -----------------------------
-# Utilidades
-# -----------------------------
-MONEY_RE = re.compile(r"(?:\d{1,3}(?:\s?\.\s?\d{3})*|\d+)\s?,\s?\d{2}-?")*,\d{2}(?:-)?")
-DATE_RE  = re.compile(r"^\d{1,2}/\d{2}/\d{4}")
-CUIT_RE  = re.compile(r"\b\d{11}\b")
+if LOGO.exists():
+    st.image(str(LOGO), width=200)
+
+st.title("IA Resumen Bancario")
+
+# ====== SOLO este cambio en montos (decimales) ======
+MONEY_RE = re.compile(r"(?:\d{1,3}(?:\s?\.\s?\d{3})*|\d+)\s?,\s?\d{2}-?")  # coma + 2 decimales
 
 def parse_money(s: str) -> float:
-    """Convierte variantes como '1 . 234 . 567 , 89 -' -> -1234567.89 (coma = decimal)"""
+    """Convierte '1 . 234 . 567 , 89 -' -> -1234567.89 (coma decimal)"""
     if s is None:
         return np.nan
     s = str(s).strip()
     neg = s.endswith("-")
     s = s.rstrip("-")
-    s = s.replace(" ", "")  # eliminar espacios sueltos
+    s = s.replace(" ", "")  # elimina espacios dispersos
     s = s.replace(".", "").replace(",", ".")
     try:
         v = float(s)
         return -v if neg else v
     except Exception:
         return np.nan
+# ====== fin del cambio de decimales ======
 
-def bucket_lines(words, tol=2.0):
-    """Agrupa palabras por línea usando la coordenada 'top' con tolerancia."""
-    lines = []
-    current = []
-    current_top = None
-    for w in sorted(words, key=lambda w: (w["top"], w["x0"])):
-        if current_top is None or abs(w["top"] - current_top) <= tol:
-            current.append(w)
-            if current_top is None:
-                current_top = w["top"]
-        else:
-            lines.append(current)
-            current = [w]
-            current_top = w["top"]
-    if current:
-        lines.append(current)
-    return lines
-
-def extract_movimientos(file_like) -> pd.DataFrame:
-    """Parser robusto por coordenadas (no depende de tablas)."""
-    rows = []
-    with pdfplumber.open(file_like) as pdf:
-        for pageno, page in enumerate(pdf.pages, start=1):
-            width = float(page.width)
-            words = page.extract_words(extra_attrs=["x0", "x1", "top", "bottom"])
-            if not words:
-                continue
-            for line in bucket_lines(words, tol=2.0):
-                s = "".join(w["text"] for w in line)
-                m = DATE_RE.match(s)
-                if not m:
-                    continue
-                fecha = m.group(0)
-                # derecha: montos (importe y saldo)
-                right_txt = "".join(w["text"] for w in line if w["x0"] >= width * 0.55)
-                monies = MONEY_RE.findall(right_txt)
-                if len(monies) < 2:
-                    continue
-                importe = parse_money(monies[-2])
-                saldo   = parse_money(monies[-1])
-                # izquierda: descripción
-                left_txt = "".join(w["text"] for w in line if w["x0"] < width * 0.55)
-                descripcion = left_txt[len(fecha):]
-                up = descripcion.upper()
-
-                # Clasificación básica (sin inventar): decide signo del importe
-                sign = -1  # por defecto lo tratamos como débito
-                if "CR-" in up or up.startswith("CR") or "NEG.CONT" in up or "CR-TRSFE" in up:
-                    sign = +1
-                elif "TRSFE-IT" in up or "TRSFE-ET" in up or "DB" in up or "DEB." in up or "IMPTRANS" in up or "SIRCREB" in up or "IVA" in up:
-                    sign = -1
-                elif "TRSFE" in up:
-                    sign = +1  # recibidas
-                # Construcción deb/cred
-                debito  = importe if sign == -1 else 0.0
-                credito = importe if sign == +1 else 0.0
-
-                # CUIT (si se encuentra)
-                m_cuit = CUIT_RE.search(descripcion.replace("-", ""))
-                cuit = m_cuit.group(0) if m_cuit else ""
-
-                rows.append({
-                    "fecha": pd.to_datetime(fecha, dayfirst=True, errors="coerce"),
-                    "descripcion": descripcion,
-                    "debito": debito,
-                    "credito": credito,
-                    "saldo": saldo,
-                    "cuit": cuit,
-                    "pagina": pageno
-                })
-    df = pd.DataFrame(rows)
-    return df
-
-def find_saldo_final(file_like):
-    """Busca una línea 'Saldo al dd/mm/aaaa ...' en el texto del PDF."""
-    with pdfplumber.open(file_like) as pdf:
-        for page in pdf.pages[::-1]:  # desde el final
-            text = page.extract_text() or ""
-            for line in text.splitlines():
-                if "Saldo al" in line:
-                    m_date = re.search(r"\d{1,2}/\d{2}/\d{4}", line)
-                    m_val  = MONEY_RE.search(line)
-                    if m_date and m_val:
-                        return pd.to_datetime(m_date.group(0), dayfirst=True), parse_money(m_val.group(0))
-    return pd.NaT, np.nan
 
 # -----------------------------
 # Streamlit UI
