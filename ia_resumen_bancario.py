@@ -1,9 +1,9 @@
 
-# ia_resumen_bancario.py (LITE - TEXT ONLY)
-# Herramienta para uso interno - AIE San Justo | Developer: Alfonso Alderete
+# ia_resumen_bancario.py (PyPDF ultra-lean)
+# Herramienta para uso interno - AIE San Justo · Developer: Alfonso Alderete
 
 import io, re
-import pdfplumber
+from pypdf import PdfReader
 import pandas as pd
 import numpy as np
 import streamlit as st
@@ -12,70 +12,81 @@ st.set_page_config(page_title="IA Resumen Bancario", page_icon="favicon-aie.ico"
 st.image("logo_aie.png", width=200)
 st.title("IA Resumen Bancario")
 
-# ----- Regex sólidos y rápidos -----
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{4}\b")
-MONEY_RE = re.compile(r"(?:\d{1,3}(?:[.\s]\d{3})*|\d+),\d{2}-?")  # dos decimales SIEMPRE
+MONEY_RE = re.compile(r"(?:\d{1,3}(?:[.\s]\d{3})*|\d+),\d{2}-?")  # SIEMPRE coma + 2 decimales
 
 def normalize_money(tok: str) -> float:
     tok = tok.strip()
     neg = tok.endswith("-")
     tok = tok.rstrip("-")
-    # separador decimal fijo: coma
-    if "," in tok:
-        main, frac = tok.rsplit(",", 1)
-    else:
+    if "," not in tok:
         return np.nan
+    main, frac = tok.rsplit(",", 1)
     main = main.replace(".", "").replace(" ", "")
     s = f"{main}.{frac}"
     try:
-        val = float(s)
-        return -val if neg else val
+        v = float(s)
+        return -v if neg else v
     except Exception:
         return np.nan
 
-def parse_pdf(file_like) -> pd.DataFrame:
+def pdf_text_lines(file_like):
+    reader = PdfReader(file_like)
+    for p in reader.pages:
+        text = p.extract_text() or ""
+        for raw in text.splitlines():
+            yield " ".join(raw.split())  # collapse spaces
+
+def parse_pdf(file_like):
     rows = []
-    with pdfplumber.open(file_like) as pdf:
-        for pageno, page in enumerate(pdf.pages, start=1):
-            txt = page.extract_text() or ""
-            for raw in txt.splitlines():
-                line = " ".join(raw.split())
-                d = DATE_RE.search(line)
-                if not d:
-                    continue
-                monies = MONEY_RE.findall(line)
-                if len(monies) < 2:
-                    continue
-                saldo = normalize_money(monies[-1])
-                importe = normalize_money(monies[-2])
-                first_m = MONEY_RE.search(line)
-                desc = line[d.end(): first_m.start()].strip() if first_m else line[d.end():].strip()
-                up = desc.upper()
-                is_credit = ("CR-" in up) or up.startswith("CR") or ("CR-TRSFE" in up) or ("NEG.CONT" in up) or ("TRANSF RECIB" in up)
-                debito = 0.0 if is_credit else importe
-                credito = importe if is_credit else 0.0
-                rows.append({
-                    "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
-                    "descripcion": desc,
-                    "debito": debito,
-                    "credito": credito,
-                    "importe": debito - credito,
-                    "saldo": saldo,
-                    "pagina": pageno
-                })
+    for pageno, page_lines in enumerate([list(pdf_text_lines(file_like))], start=1):
+        # pdf_text_lines already iterates all pages; we just build rows.
+        pass
+    # Re-iterate to build rows with page numbers
+    file_like.seek(0)
+    reader = PdfReader(file_like)
+    page_no = 0
+    for page in reader.pages:
+        page_no += 1
+        text = page.extract_text() or ""
+        for raw in text.splitlines():
+            line = " ".join(raw.split())
+            d = DATE_RE.search(line)
+            if not d:
+                continue
+            monies = MONEY_RE.findall(line)
+            if len(monies) < 2:
+                continue
+            saldo = normalize_money(monies[-1])
+            importe = normalize_money(monies[-2])
+            first_m = MONEY_RE.search(line)
+            desc = line[d.end(): first_m.start()].strip() if first_m else line[d.end():].strip()
+            up = desc.upper()
+            is_credit = ("CR-" in up) or up.startswith("CR") or ("CR-TRSFE" in up) or ("NEG.CONT" in up) or ("TRANSF RECIB" in up)
+            debito = 0.0 if is_credit else importe
+            credito = importe if is_credit else 0.0
+            rows.append({
+                "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
+                "descripcion": desc,
+                "debito": debito,
+                "credito": credito,
+                "importe": debito - credito,
+                "saldo": saldo,
+                "pagina": page_no
+            })
     return pd.DataFrame(rows)
 
 def find_saldo_final(file_like):
-    with pdfplumber.open(file_like) as pdf:
-        for page in reversed(pdf.pages):
-            txt = page.extract_text() or ""
-            for line in txt.splitlines():
-                if "Saldo al" in line:
-                    d = DATE_RE.search(line)
-                    m_all = MONEY_RE.findall(line)
-                    if d and m_all:
-                        return (pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
-                                normalize_money(m_all[-1]))
+    reader = PdfReader(file_like)
+    for page in reversed(reader.pages):
+        text = page.extract_text() or ""
+        for line in text.splitlines():
+            if "Saldo al" in line:
+                d = DATE_RE.search(line)
+                amounts = MONEY_RE.findall(line)
+                if d and amounts:
+                    return (pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
+                            normalize_money(amounts[-1]))
     return pd.NaT, np.nan
 
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
@@ -86,20 +97,19 @@ data = uploaded.read()
 file_like = io.BytesIO(data)
 
 with st.spinner("Procesando PDF..."):
-    df = parse_pdf(file_like)
+    df = parse_pdf(io.BytesIO(data))
 
 if df.empty:
     st.error("No se detectaron movimientos en el PDF.")
     st.stop()
 
-file_like.seek(0)
-fecha_cierre, saldo_final = find_saldo_final(file_like)
+fecha_cierre, saldo_final = find_saldo_final(io.BytesIO(data))
 saldo_inicial = saldo_final - df["importe"].sum() if not np.isnan(saldo_final) else np.nan
 
 st.subheader("Resumen del período")
-col1, col2 = st.columns(2)
-col1.metric("Saldo inicial (calculado)", f"$ {saldo_inicial:,.2f}" if not np.isnan(saldo_inicial) else "—")
-col2.metric("Saldo final (PDF)", f"$ {saldo_final:,.2f}" if not np.isnan(saldo_final) else "—")
+c1, c2 = st.columns(2)
+c1.metric("Saldo inicial (calculado)", f"$ {saldo_inicial:,.2f}" if not np.isnan(saldo_inicial) else "—")
+c2.metric("Saldo final (PDF)", f"$ {saldo_final:,.2f}" if not np.isnan(saldo_final) else "—")
 if pd.notna(fecha_cierre):
     st.caption(f"Cierre: {fecha_cierre.strftime('%d/%m/%Y')}")
 
