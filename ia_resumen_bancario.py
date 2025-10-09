@@ -18,13 +18,21 @@ APP_TITLE = "IA Resumen Bancario"
 # -----------------------------
 # Utilidades
 # -----------------------------
-MONEY_RE = re.compile(r"\d+(?:\.\d{3})*,\d{2}(?:-)?")
+# Estricta (sin espacios): 1.234,56-
+MONEY_RE_STRICT = re.compile(r"\d{1,3}(?:\.\d{3})*,\d{2}-?")
+# Tolerante (con espacios entre dígitos/sep): 1 . 234 , 56  -
+MONEY_RE_FUZZY  = re.compile(r"\d{1,3}(?:\s?\.\s?\d{3})*(?:\s?,\s?\d{2})(?:\s?-)?")
 DATE_RE  = re.compile(r"^\d{1,2}/\d{2}/\d{4}")
 CUIT_RE  = re.compile(r"\b\d{11}\b")
 
 def parse_money(s: str) -> float:
-    """Convierte '1.234.567,89-' -> -1234567.89"""
-    neg = s.endswith("-")
+    """Convierte '1.234.567,89-' o '1 .234 , 567 , 89 -' -> signo correcto."""
+    if s is None:
+        return np.nan
+    s = str(s)
+    neg = s.strip().endswith("-")
+    # Normalizar: quitar espacios dispersos
+    s = s.replace(" ", "")
     s = s.replace(".", "").replace(",", ".").rstrip("-")
     try:
         v = float(s)
@@ -51,7 +59,7 @@ def bucket_lines(words, tol=2.0):
     return lines
 
 def extract_movimientos(file_like) -> pd.DataFrame:
-    """Parser robusto por coordenadas (no depende de tablas)."""
+    """Parser robusto por coordenadas; reensambla números con coma decimal aunque vengan fragmentados."""
     rows = []
     with pdfplumber.open(file_like) as pdf:
         for pageno, page in enumerate(pdf.pages, start=1):
@@ -60,36 +68,40 @@ def extract_movimientos(file_like) -> pd.DataFrame:
             if not words:
                 continue
             for line in bucket_lines(words, tol=2.0):
-                s = "".join(w["text"] for w in line)
-                m = DATE_RE.match(s)
+                full_line_txt = "".join(w["text"] for w in line)
+                m = DATE_RE.match(full_line_txt)
                 if not m:
                     continue
                 fecha = m.group(0)
                 # derecha: montos (importe y saldo)
-                right_txt = "".join(w["text"] for w in line if w["x0"] >= width * 0.55)
-                monies = MONEY_RE.findall(right_txt)
+                right_tokens = [w["text"] for w in line if w["x0"] >= width * 0.55]
+                right_txt = " ".join(right_tokens)
+                monies = MONEY_RE_FUZZY.findall(right_txt)
+                if len(monies) < 2:
+                    # último intento: usar estricta por si vino sin espacios
+                    monies = MONEY_RE_STRICT.findall(right_txt)
                 if len(monies) < 2:
                     continue
                 importe = parse_money(monies[-2])
                 saldo   = parse_money(monies[-1])
+
                 # izquierda: descripción
                 left_txt = "".join(w["text"] for w in line if w["x0"] < width * 0.55)
                 descripcion = left_txt[len(fecha):]
                 up = descripcion.upper()
 
-                # Clasificación básica (sin inventar): decide signo del importe
-                sign = -1  # por defecto lo tratamos como débito
+                # Clasificación (heurstica mínima para DB/CR)
+                sign = -1  # débito por defecto
                 if "CR-" in up or up.startswith("CR") or "NEG.CONT" in up or "CR-TRSFE" in up:
                     sign = +1
                 elif "TRSFE-IT" in up or "TRSFE-ET" in up or "DB" in up or "DEB." in up or "IMPTRANS" in up or "SIRCREB" in up or "IVA" in up:
                     sign = -1
                 elif "TRSFE" in up:
                     sign = +1  # recibidas
-                # Construcción deb/cred
                 debito  = importe if sign == -1 else 0.0
                 credito = importe if sign == +1 else 0.0
 
-                # CUIT (si se encuentra)
+                # CUIT
                 m_cuit = CUIT_RE.search(descripcion.replace("-", ""))
                 cuit = m_cuit.group(0) if m_cuit else ""
 
@@ -98,22 +110,22 @@ def extract_movimientos(file_like) -> pd.DataFrame:
                     "descripcion": descripcion,
                     "debito": debito,
                     "credito": credito,
+                    "importe": debito - credito,   # Débito suma / Crédito resta
                     "saldo": saldo,
                     "cuit": cuit,
                     "pagina": pageno
                 })
-    df = pd.DataFrame(rows)
-    return df
+    return pd.DataFrame(rows)
 
 def find_saldo_final(file_like):
-    """Busca una línea 'Saldo al dd/mm/aaaa ...' en el texto del PDF."""
+    """Busca una línea 'Saldo al dd/mm/aaaa ...' en el texto del PDF (tolerando espacios)."""
     with pdfplumber.open(file_like) as pdf:
         for page in pdf.pages[::-1]:  # desde el final
             text = page.extract_text() or ""
             for line in text.splitlines():
                 if "Saldo al" in line:
                     m_date = re.search(r"\d{1,2}/\d{2}/\d{4}", line)
-                    m_val  = MONEY_RE.search(line)
+                    m_val  = MONEY_RE_FUZZY.search(line) or MONEY_RE_STRICT.search(line)
                     if m_date and m_val:
                         return pd.to_datetime(m_date.group(0), dayfirst=True), parse_money(m_val.group(0))
     return pd.NaT, np.nan
@@ -134,22 +146,19 @@ file_like = io.BytesIO(uploaded.read())
 # 1) Extraer movimientos
 df = extract_movimientos(file_like)
 if df.empty:
-    st.error("No se detectaron movimientos en el PDF. Ajusto el parser si me compartís este archivo por mensaje.")
+    st.error("No se detectaron movimientos en el PDF.")
     st.stop()
 
-# 2) Regla de signo pedida (se traduce a una sola columna 'importe')
-df["importe"] = df["debito"].fillna(0.0) - df["credito"].fillna(0.0)  # Débito suma / Crédito resta
-
-# 3) Saldo final del PDF y saldo inicial calculado
+# 2) Saldo final del PDF y saldo inicial calculado
 file_like.seek(0)
 fecha_cierre, saldo_final_pdf = find_saldo_final(file_like)
 saldo_inicial_calc = saldo_final_pdf - df["importe"].sum() if not np.isnan(saldo_final_pdf) else np.nan
 
-# 4) Clasificaciones puntuales para el resumen
+# 3) Clasificaciones para el resumen
 U = df["descripcion"].str.upper().fillna("")
 tipo = pd.Series("OTROS", index=df.index)
 tipo[U.str.contains(r"\bSIRCREB\b")] = "SIRCREB"
-tipo[U.str.contains(r"\bIMPTRANS\b|LEY\s*25413")] = "IMP_LEY_25413"
+tipo[U.str_contains := U.str.contains(r"\bIMPTRANS\b|LEY\s*25413")] = "IMP_LEY_25413"
 tipo[U.str.contains(r"\bIVA\b") & ~U.str.contains("PERCEP")] = "IVA"
 tipo[U.str.contains("PERCEP") & U.str.contains("IVA")] = "PERCEPCION_IVA"
 tipo[U.str.contains(r"DB\.INMED|DB/PG/VS|DEB\.AUT|PAGO\s*VISA|DB-")] = "DEBITO_AUTOMATICO"
@@ -158,7 +167,7 @@ tipo[U.str.contains(r"CR-TRSFE|TRSFE\s+RECIB|CR-")] = "TRF_TERCEROS_ENTRANTE"
 tipo[U.str.contains(r"ENTRE CUENTAS|PROPIA|MISMA TITULARIDAD")] = "TRF_PROPIAS"
 df["tipo"] = tipo
 
-# 5) Resúmenes
+# 4) Resúmenes
 def pos(x): return x[x>0].sum()
 def neg_abs(x): return (-x[x<0]).sum()
 
@@ -176,7 +185,7 @@ summary = {
     "percepciones_iva": neg_abs(df.loc[df["tipo"]=="PERCEPCION_IVA","importe"]),
 }
 
-# 6) UI de resumen
+# 5) UI de resumen
 st.subheader("Resumen del período")
 c1, c2, c3 = st.columns(3)
 c1.metric("Saldo inicial (calculado)", f"$ {summary['saldo_inicial']:,.2f}" if not np.isnan(summary['saldo_inicial']) else "—")
@@ -198,7 +207,7 @@ c3.metric("Débitos automáticos", f"$ {summary['debitos_automaticos']:,.2f}")
 c1.metric("IVA (líneas 'IVA')", f"$ {summary['iva']:,.2f}")
 c2.metric("Percepciones de IVA", f"$ {summary['percepciones_iva']:,.2f}")
 
-# 7) Tablas completas (débitos y créditos)
+# 6) Tablas
 df_sorted = df.sort_values(["fecha","pagina"]).reset_index(drop=True)
 st.subheader("Detalle completo de movimientos")
 st.dataframe(df_sorted[["fecha","descripcion","debito","credito","importe","saldo","tipo","cuit","pagina"]])
