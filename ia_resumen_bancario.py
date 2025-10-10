@@ -264,6 +264,58 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+# --- Descargar grilla en Excel (con fallback a CSV) ---
+st.divider()
+st.subheader("Descargar")
+
+try:
+    import xlsxwriter  # preferido por pandas para escribir .xlsx
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        # hoja principal
+        df_sorted.to_excel(writer, index=False, sheet_name="Movimientos")
+        wb  = writer.book
+        ws  = writer.sheets["Movimientos"]
+
+        # formato miles/decimales (Excel usará tu configuración regional al mostrar)
+        money_fmt = wb.add_format({"num_format": "#,##0.00"})
+        date_fmt  = wb.add_format({"num_format": "dd/mm/yyyy"})
+
+        # autosize columnas y aplicar formato a columnas de dinero/fecha
+        for idx, col in enumerate(df_sorted.columns, start=0):
+            col_values = df_sorted[col].astype(str)
+            max_len = max(len(col), *(len(v) for v in col_values))
+            ws.set_column(idx, idx, min(max_len + 2, 40))  # ancho razonable
+
+        # aplicar formato específico si existen
+        cols_money = ["debito", "credito", "importe", "saldo"]
+        for c in cols_money:
+            if c in df_sorted.columns:
+                j = df_sorted.columns.get_loc(c)
+                ws.set_column(j, j, 16, money_fmt)
+
+        if "fecha" in df_sorted.columns:
+            j = df_sorted.columns.get_loc("fecha")
+            ws.set_column(j, j, 14, date_fmt)
+
+    st.download_button(
+        "📥 Descargar Excel",
+        data=output.getvalue(),
+        file_name="resumen_bancario.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
+
+except Exception:
+    # Fallback seguro a CSV
+    csv_bytes = df_sorted.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "📥 Descargar CSV (fallback)",
+        data=csv_bytes,
+        file_name="resumen_bancario.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
 
 
 
