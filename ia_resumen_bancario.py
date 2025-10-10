@@ -205,20 +205,54 @@ df.loc[mask & (df["delta_saldo"] < 0), "debito"]  = monto[mask & (df["delta_sald
 # importe con convención Débito - Crédito
 df["importe"] = df["debito"] - df["credito"]
 
-# --- cabecera ---
-fecha_cierre, saldo_final = find_saldo_final(io.BytesIO(data))
+# --- cabecera / totales / conciliación ---
+fecha_cierre, saldo_final_pdf = find_saldo_final(io.BytesIO(data))
 
+# Orden final (ya viene con SALDO ANTERIOR al inicio)
+df = df.sort_values(["fecha", "orden", "pagina"]).reset_index(drop=True)
+df_sorted = df.drop(columns=["orden"]).reset_index(drop=True)
+
+# Totales
+saldo_inicial = float(df_sorted.loc[0, "saldo"])
+total_debitos = float(df_sorted["debito"].sum())
+total_creditos = float(df_sorted["credito"].sum())
+saldo_final_visto = (
+    float(df_sorted["saldo"].iloc[-1])
+    if np.isnan(saldo_final_pdf) else float(saldo_final_pdf)
+)
+saldo_final_calculado = saldo_inicial + total_creditos - total_debitos
+diferencia = saldo_final_calculado - saldo_final_visto
+cuadra = abs(diferencia) < 0.01  # tolerancia de 1 centavo
+
+# Encabezado
 st.subheader("Resumen del período")
-c1, c2 = st.columns(2)
-c1.metric("Saldo inicial (PDF)", f"$ {fmt_ar(df.iloc[0]['saldo'])}" if not df.empty else "—")
-c2.metric("Saldo final (PDF)",  f"$ {fmt_ar(saldo_final)}" if not np.isnan(saldo_final) else "—")
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.metric("Saldo inicial", f"$ {fmt_ar(saldo_inicial)}")
+with c2:
+    st.metric("Total créditos (+)", f"$ {fmt_ar(total_creditos)}")
+with c3:
+    st.metric("Total débitos (–)", f"$ {fmt_ar(total_debitos)}")
+
+c4, c5, c6 = st.columns(3)
+with c4:
+    st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final_visto)}")
+with c5:
+    st.metric("Saldo final calculado", f"$ {fmt_ar(saldo_final_calculado)}")
+with c6:
+    st.metric("Diferencia", f"$ {fmt_ar(diferencia)}")
+
+if cuadra:
+    st.success("✅ Conciliado: Saldo inicial + Créditos – Débitos = Saldo final.")
+else:
+    st.error("❌ No cuadra la conciliación. Revisá diferencias o líneas descartadas.")
+
 if pd.notna(fecha_cierre):
-    st.caption(f"Cierre: {fecha_cierre.strftime('%d/%m/%Y')}")
+    st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
 st.divider()
 st.subheader("Detalle de movimientos")
-
-df_sorted = df.drop(columns=["orden"]).reset_index(drop=True)
 styled = df_sorted.style.format({c: fmt_ar for c in ["debito","credito","importe","saldo"]}, na_rep="—")
 st.dataframe(styled, use_container_width=True)
 
@@ -230,6 +264,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
 
 
