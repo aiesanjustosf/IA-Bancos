@@ -23,14 +23,13 @@ except Exception as e:
     st.error(f"No se pudo importar pdfplumber: {e}\nRevisá requirements.txt")
     st.stop()
 
-# --- Regex EXACTOS (dos decimales con coma; miles con punto o espacio; guion final opcional) ---
+# --- Regex EXACTOS (dos decimales con coma; guion final opcional; con bordes para no pegarse a texto) ---
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{4}\b")
+
 # Antes:
 # MONEY_RE = re.compile(r"(?:\d{1,3}(?:[.\s]\d{3})*|\d+)\s?,\s?\d{2}-?")
-
-# Después (robusto):
+# Después (robusto, sin espacios como miles y con bordes):
 MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
-
 
 def normalize_money(tok: str) -> float:
     """'1 . 234 . 567 , 89 -' -> -1234567.89 (coma = decimal; dos decimales)"""
@@ -48,12 +47,13 @@ def normalize_money(tok: str) -> float:
         return -val if neg else val
     except Exception:
         return np.nan
-        
+
 def fmt_ar(n) -> str:
     """Devuelve 1.234.567,89 para números; '—' si es NaN."""
     if n is None or (isinstance(n, float) and np.isnan(n)):
         return "—"
     return f"{n:,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+
 def lines_from_text(page):
     txt = page.extract_text() or ""
     return [" ".join(l.split()) for l in txt.splitlines()]
@@ -77,8 +77,6 @@ def lines_from_words(page, ytol=2.0):
         lines.append(" ".join(x["text"] for x in cur))
     return [" ".join(l.split()) for l in lines]
 
-        
-
 def parse_pdf(file_like) -> pd.DataFrame:
     """
     Lee TODAS las páginas. Por línea exige >=2 montos con coma:
@@ -101,8 +99,8 @@ def parse_pdf(file_like) -> pd.DataFrame:
                         descartadas.append((pageno, line))
                     continue
 
-                saldo_tok  = am[-1].group(0)
-                saldo      = normalize_money(saldo_tok)
+                saldo_tok   = am[-1].group(0)
+                saldo       = normalize_money(saldo_tok)
                 importe_tok = am[-2].group(0)
                 importe     = normalize_money(importe_tok)
 
@@ -140,8 +138,8 @@ def parse_pdf(file_like) -> pd.DataFrame:
                             descartadas.append((pageno, line))
                         continue
 
-                    saldo_tok  = am[-1].group(0)
-                    saldo      = normalize_money(saldo_tok)
+                    saldo_tok   = am[-1].group(0)
+                    saldo       = normalize_money(saldo_tok)
                     importe_tok = am[-2].group(0)
                     importe     = normalize_money(importe_tok)
 
@@ -182,11 +180,25 @@ def parse_pdf(file_like) -> pd.DataFrame:
 
     return df
 
+def find_saldo_final(file_like):
+    """Busca la línea 'Saldo al dd/mm/aaaa ... <saldo>' y devuelve (fecha_cierre, saldo_final)."""
+    with pdfplumber.open(file_like) as pdf:
+        for page in reversed(pdf.pages):
+            txt = page.extract_text() or ""
+            for line in txt.splitlines():
+                if "Saldo al" in line:
+                    d = DATE_RE.search(line)
+                    am = list(MONEY_RE.finditer(line))
+                    if d and am:
+                        fecha = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
+                        saldo = normalize_money(am[-1].group(0))
+                        return fecha, saldo
+    return pd.NaT, np.nan
 
 # --- UI principal ---
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
 if uploaded is None:
-    st.info("Cargá un PDF. La app usa extracción por TEXTO; no inventa números.")
+    st.info("Cargá un PDF. La app usa extracción por TEXTO (con fallback por palabras) y no inventa montos.")
     st.stop()
 
 data = uploaded.read()
@@ -200,7 +212,6 @@ if df.empty:
     st.stop()
 
 # Saldos
-file_like.seek(0)
 fecha_cierre, saldo_final = find_saldo_final(io.BytesIO(data))
 saldo_inicial = saldo_final - df["importe"].sum() if not np.isnan(saldo_final) else np.nan
 
@@ -222,7 +233,6 @@ cols_money = ["debito", "credito", "importe", "saldo"]
 styled = df_sorted.style.format({c: fmt_ar for c in cols_money}, na_rep="—")
 st.dataframe(styled, use_container_width=True)
 
-
 st.markdown(
     """
     <div style="position:fixed; left:0; right:0; bottom:0; padding:8px 12px; background:#f6f8fa; color:#444; font-size:12px; text-align:center; border-top:1px solid #e5e7eb;">
@@ -231,4 +241,5 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
