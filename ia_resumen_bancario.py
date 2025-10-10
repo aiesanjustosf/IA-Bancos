@@ -43,6 +43,13 @@ def normalize_money(tok: str) -> float:
         return -val if neg else val
     except Exception:
         return np.nan
+        
+def fmt_ar(n) -> str:
+    """Devuelve 1.234.567,89 para números; '—' si es NaN."""
+    if n is None or (isinstance(n, float) and np.isnan(n)):
+        return "—"
+    return f"{n:,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+        
 
 def parse_pdf(file_like) -> pd.DataFrame:
     """Extracción SOLO por TEXTO (estable). Penúltimo = Importe, Último = Saldo. Crédito RESTA / Débito SUMA."""
