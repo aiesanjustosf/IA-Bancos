@@ -116,14 +116,21 @@ saldo_inicial = saldo_final - df["importe"].sum() if not np.isnan(saldo_final) e
 # Resumen
 st.subheader("Resumen del período")
 c1, c2 = st.columns(2)
-c1.metric("Saldo inicial (calculado)", f"$ {saldo_inicial:,.2f}" if not np.isnan(saldo_inicial) else "—")
-c2.metric("Saldo final (PDF)", f"$ {saldo_final:,.2f}" if not np.isnan(saldo_final) else "—")
+c1.metric("Saldo inicial (calculado)", f"$ {fmt_ar(saldo_inicial)}")
+c2.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final)}")
 if pd.notna(fecha_cierre):
     st.caption(f"Cierre: {fecha_cierre.strftime('%d/%m/%Y')}")
 
 st.divider()
-st.subheader("Detalle de movimientos (con dos decimales obligatorios)")
-st.dataframe(df.sort_values(["fecha","pagina"]).reset_index(drop=True))
+st.subheader("Detalle de movimientos")
+
+df_sorted = df.sort_values(["fecha","pagina"]).reset_index(drop=True)
+cols_money = ["debito", "credito", "importe", "saldo"]
+
+# Estilo: miles con punto y decimales con coma; mantiene dtype numérico
+styled = df_sorted.style.format({c: fmt_ar for c in cols_money}, na_rep="—")
+st.dataframe(styled, use_container_width=True)
+
 
 st.markdown(
     """
