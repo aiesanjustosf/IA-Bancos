@@ -124,28 +124,38 @@ def find_saldo_final(file_like):
 # --- saldo anterior (misma línea) ---
 def find_saldo_anterior(file_like):
     """
-    Devuelve (saldo_anterior) tomando EXCLUSIVAMENTE el último monto con coma
-    de la MISMA línea que contiene 'SALDO ANTERIOR'.
+    Devuelve el saldo anterior tomando EXCLUSIVAMENTE el último monto con coma
+    de la MISMA línea que contiene 'SALDO ANTERIOR'. Intenta por palabras y,
+    si no lo encuentra, cae a texto crudo.
     """
     with pdfplumber.open(file_like) as pdf:
+        # 1) Intento por PALABRAS (más robusto a alineación)
         for page in pdf.pages:
             words = page.extract_words(extra_attrs=["top", "x0"])
-            if not words:
-                continue
-            ytol = 2.0
-            lines = {}
-            for w in words:
-                band = round(w["top"]/ytol)
-                lines.setdefault(band, []).append(w)
-            for band in sorted(lines.keys()):
-                ws = sorted(lines[band], key=lambda w: w["x0"])
-                line_text = " ".join(w["text"] for w in ws)
-                if "SALDO ANTERIOR" in line_text.upper():
-                    am_tokens = list(MONEY_RE.finditer(line_text))
-                    if am_tokens:
-                        return normalize_money(am_tokens[-1].group(0))
-                    return np.nan
+            if words:
+                ytol = 2.0
+                lines = {}
+                for w in words:
+                    band = round(w["top"] / ytol)
+                    lines.setdefault(band, []).append(w)
+                for band in sorted(lines):
+                    ws = sorted(lines[band], key=lambda w: w["x0"])
+                    line_text = " ".join(w["text"] for w in ws)
+                    if "SALDO ANTERIOR" in line_text.upper():
+                        am = list(MONEY_RE.finditer(line_text))
+                        if am:
+                            return normalize_money(am[-1].group(0))
+        # 2) Fallback por TEXTO (algunos PDFs no devuelven bien 'words')
+        for page in pdf.pages:
+            txt = page.extract_text() or ""
+            for raw in txt.splitlines():
+                line = " ".join(raw.split())
+                if "SALDO ANTERIOR" in line.upper():
+                    am = list(MONEY_RE.finditer(line))
+                    if am:
+                        return normalize_money(am[-1].group(0))
     return np.nan
+
 
 # --- UI principal ---
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
