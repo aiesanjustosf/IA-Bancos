@@ -160,7 +160,7 @@ def find_saldo_anterior(file_like):
 # --- UI principal ---
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
 if uploaded is None:
-    st.info("Cargá un PDF. La app no almacena datos, toda la información está protegida.")
+    st.info("La app no almacena datos, toda la información está protegida.")
     st.stop()
 
 data = uploaded.read()
