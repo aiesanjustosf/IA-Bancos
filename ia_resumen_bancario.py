@@ -25,7 +25,12 @@ except Exception as e:
 
 # --- Regex EXACTOS (dos decimales con coma; miles con punto o espacio; guion final opcional) ---
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{4}\b")
-MONEY_RE = re.compile(r"(?:\d{1,3}(?:[.\s]\d{3})*|\d+)\s?,\s?\d{2}-?")
+# Antes:
+# MONEY_RE = re.compile(r"(?:\d{1,3}(?:[.\s]\d{3})*|\d+)\s?,\s?\d{2}-?")
+
+# Después (robusto):
+MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
+
 
 def normalize_money(tok: str) -> float:
     """'1 . 234 . 567 , 89 -' -> -1234567.89 (coma = decimal; dos decimales)"""
