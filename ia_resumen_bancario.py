@@ -161,6 +161,33 @@ def find_saldo_final(file_like):
                         return fecha, saldo
     return pd.NaT, np.nan
 
+def find_saldo_anterior(file_like):
+    """
+    Detecta 'SALDO ANTERIOR' y devuelve el primer monto (con coma) que aparece
+    en esa línea o inmediatamente después. Devuelve (fecha_detectada_o_NaT, saldo_inicial).
+    """
+    with pdfplumber.open(file_like) as pdf:
+        for pageno, page in enumerate(pdf.pages, start=1):
+            lines = (page.extract_text() or "").splitlines()
+            for i, line in enumerate(lines):
+                if "SALDO ANTERIOR" in line.upper():
+                    # monto en la misma línea
+                    am = list(MONEY_RE.finditer(line))
+                    if am:
+                        return pd.NaT, normalize_money(am[-1].group(0))
+                    # o en la(s) siguiente(s) líneas hasta encontrar un monto
+                    j = i + 1
+                    while j < len(lines):
+                        am2 = list(MONEY_RE.finditer(lines[j]))
+                        if am2:
+                            return pd.NaT, normalize_money(am2[-1].group(0))
+                        # si aparece una fecha antes del monto, frenamos (ya arrancaron los movimientos)
+                        if DATE_RE.search(lines[j]):
+                            break
+                        j += 1
+                    return pd.NaT, np.nan
+    return pd.NaT, np.nan
+
 # --- UI principal ---
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
 if uploaded is None:
@@ -176,6 +203,22 @@ with st.spinner("Procesando PDF..."):
 if df.empty:
     st.error("No se detectaron movimientos. Si el PDF tiene un formato distinto, pasame una línea ejemplo (fecha + descripción + importe + saldo).")
     st.stop()
+
+# --- INSERTAR SALDO ANTERIOR COMO PRIMER REGISTRO (sin importe) ---
+_, saldo_anterior = find_saldo_anterior(io.BytesIO(data))
+if not np.isnan(saldo_anterior):
+    # usar como fecha la del primer movimiento (para orden), sin inventar otra
+    first_date = df["fecha"].min()
+    apertura = pd.DataFrame([{
+        "fecha": first_date,
+        "descripcion": "SALDO ANTERIOR",
+        "debito": 0.0,
+        "credito": 0.0,
+        "importe": 0.0,
+        "saldo": float(saldo_anterior),
+        "pagina": 1
+    }])
+    df = pd.concat([apertura, df], ignore_index=True)
 
 # --- CLASIFICACIÓN POR VARIACIÓN DE SALDO (TU REGLA) ---
 # Orden lógico
@@ -193,7 +236,7 @@ df["credito"] = 0.0
 
 mask = df["delta_saldo"].notna()
 
-# Tu regla explícita:
+# Tu regla:
 #   - Si el saldo SUBE  -> CRÉDITO
 #   - Si el saldo BAJA  -> DÉBITO
 creditos = mask & (df["delta_saldo"] > 0)
@@ -202,19 +245,18 @@ debitos  = mask & (df["delta_saldo"] < 0)
 df.loc[creditos, "credito"] = monto[creditos]
 df.loc[debitos,  "debito"]  = monto[debitos]
 
-# Primera fila: sin delta -> 0/0 (no infiero)
-# Recalculo importe con tu convención (débito - crédito)
+# Primera fila (apertura) queda con 0/0
 df["importe"] = df["debito"] - df["credito"]
 # --- FIN CLASIFICACIÓN ---
 
-# Saldos
+# Saldos de cierre (solo para mostrar en la cabecera)
 fecha_cierre, saldo_final = find_saldo_final(io.BytesIO(data))
-saldo_inicial = saldo_final - df["importe"].sum() if not np.isnan(saldo_final) else np.nan
+saldo_inicial_calc = saldo_final - df["importe"].sum() if not np.isnan(saldo_final) else np.nan
 
 # Resumen
 st.subheader("Resumen del período")
 c1, c2 = st.columns(2)
-c1.metric("Saldo inicial (calculado)", f"$ {fmt_ar(saldo_inicial)}")
+c1.metric("Saldo inicial (PDF)", f"$ {fmt_ar(df.iloc[0]['saldo'])}" if not df.empty else "—")
 c2.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final)}")
 if pd.notna(fecha_cierre):
     st.caption(f"Cierre: {fecha_cierre.strftime('%d/%m/%Y')}")
