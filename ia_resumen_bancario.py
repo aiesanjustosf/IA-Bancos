@@ -79,40 +79,51 @@ def lines_from_words(page, ytol=2.0):
 
 def parse_pdf(file_like) -> pd.DataFrame:
     """
-    Lee TODAS las páginas. Por línea exige >=2 montos con coma:
-    - anteúltimo = importe (movimiento, único por fila)
-    - último = saldo (a la derecha, puede terminar en '-')
-    Enteros sin decimales SIEMPRE se ignoran (son parte de la descripción).
+    Lee TODAS las páginas. Para cada línea toma:
+    - SALDO = último número con coma+2 decimales
+    - IMPORTE = el número con coma+2 decimales inmediatamente a la izquierda del saldo
+    Si la línea no tiene ≥2 montos con coma, se descarta (enteros sin decimales se ignoran).
+    Se procesan SIEMPRE líneas por TEXTO y por PALABRAS y se unen sin duplicados.
     """
     rows = []
-    descartadas = []  # diagnóstico de líneas sin 2 montos con coma
+    descartadas = []
 
     with pdfplumber.open(file_like) as pdf:
         for pageno, page in enumerate(pdf.pages, start=1):
-            hits_en_pagina = 0
+            # 1) Obtener líneas de ambas fuentes
+            lt = lines_from_text(page)
+            lw = lines_from_words(page, ytol=2.0)
 
-            # 1) TEXTO
-            for line in lines_from_text(page):
-                am = list(MONEY_RE.finditer(line))  # SOLO montos con coma (no enteros)
+            # Unir sin duplicar (preferimos el texto tal cual y agregamos solo las que no están)
+            seen = set(lt)
+            combined = lt + [l for l in lw if l not in seen]
+
+            for line in combined:
+                # Buscar montos válidos (coma + 2 decimales). Enteros NO se consideran.
+                am = list(MONEY_RE.finditer(line))
                 if len(am) < 2:
                     if line.strip():
                         descartadas.append((pageno, line))
                     continue
 
+                # SALDO = último con coma; IMPORTE = el inmediatamente a su izquierda
                 saldo_tok   = am[-1].group(0)
-                saldo       = normalize_money(saldo_tok)
                 importe_tok = am[-2].group(0)
+                saldo       = normalize_money(saldo_tok)
                 importe     = normalize_money(importe_tok)
 
-                # descripción: desde el fin de la fecha hasta el primer monto con coma
+                # Fecha en cualquier parte
                 d = DATE_RE.search(line)
                 if not d:
                     if line.strip():
                         descartadas.append((pageno, line))
                     continue
+
+                # Descripción = entre fin de fecha y comienzo del primer monto con coma
                 first_money = am[0]
                 desc = line[d.end(): first_money.start()].strip()
 
+                # DB/CR según tu heurística (sin tocar el importe)
                 up = desc.upper()
                 is_credit = ("CR-" in up) or up.startswith("CR") or ("CR-TRSFE" in up) or ("NEG.CONT" in up) or ("TRANSF RECIB" in up)
                 debito  = 0.0 if is_credit else importe
@@ -127,58 +138,19 @@ def parse_pdf(file_like) -> pd.DataFrame:
                     "saldo": saldo,
                     "pagina": pageno
                 })
-                hits_en_pagina += 1
-
-            # 2) FALLBACK por PALABRAS solo si por texto no hubo ningún hit
-            if hits_en_pagina == 0:
-                for line in lines_from_words(page, ytol=2.0):
-                    am = list(MONEY_RE.finditer(line))
-                    if len(am) < 2:
-                        if line.strip():
-                            descartadas.append((pageno, line))
-                        continue
-
-                    saldo_tok   = am[-1].group(0)
-                    saldo       = normalize_money(saldo_tok)
-                    importe_tok = am[-2].group(0)
-                    importe     = normalize_money(importe_tok)
-
-                    d = DATE_RE.search(line)
-                    if not d:
-                        if line.strip():
-                            descartadas.append((pageno, line))
-                        continue
-                    first_money = am[0]
-                    desc = line[d.end(): first_money.start()].strip()
-
-                    up = desc.upper()
-                    is_credit = ("CR-" in up) or up.startswith("CR") or ("CR-TRSFE" in up) or ("NEG.CONT" in up) or ("TRANSF RECIB" in up)
-                    debito  = 0.0 if is_credit else importe
-                    credito = importe if is_credit else 0.0
-
-                    rows.append({
-                        "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
-                        "descripcion": desc,
-                        "debito": debito,
-                        "credito": credito,
-                        "importe": debito - credito,
-                        "saldo": saldo,
-                        "pagina": pageno
-                    })
 
     df = pd.DataFrame(rows)
 
-    # Diagnóstico visible (opcional): cuántas líneas del PDF no cumplen la regla
-    if 'st' in globals():
-        if descartadas:
-            st.warning(f"Líneas descartadas por no contener 2 montos con coma (importe + saldo): {len(descartadas)}")
-            # Mostrar un muestreo de hasta 10 para controlar
-            sample = descartadas[:10]
-            st.caption("Ejemplos (página, línea):")
-            for p, l in sample:
-                st.text(f"[p.{p}] {l}")
+    # Diagnóstico (opcional)
+    if 'st' in globals() and descartadas:
+        st.warning(f"Líneas descartadas por no contener 2 montos con coma (importe + saldo): {len(descartadas)}")
+        sample = descartadas[:10]
+        st.caption("Ejemplos (página, línea):")
+        for p, l in sample:
+            st.text(f"[p.{p}] {l}")
 
     return df
+
 
 def find_saldo_final(file_like):
     """Busca la línea 'Saldo al dd/mm/aaaa ... <saldo>' y devuelve (fecha_cierre, saldo_final)."""
