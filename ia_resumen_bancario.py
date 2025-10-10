@@ -25,11 +25,11 @@ except Exception as e:
 
 # --- Regex EXACTOS ---
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{4}\b")
-# Montos válidos: coma y 2 decimales; miles con punto (sin espacios como miles); guion final opcional.
-# Bordes: no debe estar pegado a otros caracteres (inicio/espacio a la izquierda y espacio/fin a la derecha).
+# Montos válidos: coma y 2 decimales; miles con punto; guion final opcional.
+# Bordes: no pegado a otros caracteres (inicio/espacio a la izq. y espacio/fin a la der.).
 MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
 
-# --- Utilidades de parseo/estilo ---
+# --- Utilidades ---
 def normalize_money(tok: str) -> float:
     """'1.234.567,89-' -> -1234567.89 (coma decimal; dos decimales)."""
     if not tok:
@@ -39,7 +39,7 @@ def normalize_money(tok: str) -> float:
     tok = tok.rstrip("-")
     if "," not in tok:
         return np.nan
-    main, frac = tok.rsplit(",", 1)  # separador decimal fijo: coma
+    main, frac = tok.rsplit(",", 1)
     main = main.replace(".", "").replace(" ", "")
     try:
         val = float(f"{main}.{frac}")
@@ -58,7 +58,7 @@ def lines_from_text(page):
     return [" ".join(l.split()) for l in txt.splitlines()]
 
 def lines_from_words(page, ytol=2.0):
-    """Reconstruye líneas agrupando por altura; se usa SIEMPRE junto a lines_from_text."""
+    """Reconstruye líneas agrupando por altura; se usa junto a lines_from_text."""
     words = page.extract_words(extra_attrs=["x0", "top"])
     if not words:
         return []
@@ -76,121 +76,101 @@ def lines_from_words(page, ytol=2.0):
         lines.append(" ".join(x["text"] for x in cur))
     return [" ".join(l.split()) for l in lines]
 
-# --- Parser principal (según regla acordada) ---
+# --- Parser principal ---
 def parse_pdf(file_like) -> pd.DataFrame:
     """
     Para cada línea:
       - SALDO = último número con coma+2 decimales (puede terminar en '-')
-      - IMPORTE = el número con coma+2 decimales inmediatamente a la izquierda del saldo (el más cercano)
+      - IMPORTE = el número con coma+2 decimales inmediatamente a la izquierda del saldo
       - Si la línea no tiene ≥2 montos con coma, se descarta (enteros sin decimales se ignoran)
-    Se procesan SIEMPRE TEXTO y PALABRAS por cada página y se UNEN sin duplicados.
+    Se procesan TEXTO y PALABRAS por página y se UNEN sin duplicados.
     """
     rows = []
-    descartadas = []
-
     with pdfplumber.open(file_like) as pdf:
         for pageno, page in enumerate(pdf.pages, start=1):
-            # Obtener líneas de TEXTO y de PALABRAS
             lt = lines_from_text(page)
             lw = lines_from_words(page, ytol=2.0)
-
-            # Unir sin duplicar (preferimos el texto; sumamos solo las no vistas)
             seen = set(lt)
             combined = lt + [l for l in lw if l not in seen]
 
             for line in combined:
                 if not line.strip():
                     continue
-
-                # Montos válidos: SOLO coma+2 decimales (enteros NO son importes)
                 am = list(MONEY_RE.finditer(line))
                 if len(am) < 2:
-                    descartadas.append((pageno, line))
-                    continue
+                    continue  # no inventamos montos
 
-                # Regla: saldo = último; importe = inmediato a la izquierda
                 saldo_tok   = am[-1].group(0)
                 importe_tok = am[-2].group(0)
                 saldo       = normalize_money(saldo_tok)
                 importe     = normalize_money(importe_tok)
 
-                # Fecha (en cualquier parte de la línea)
                 d = DATE_RE.search(line)
                 if not d:
-                    descartadas.append((pageno, line))
                     continue
 
-                # Descripción = desde fin de fecha hasta inicio del PRIMER monto con coma
                 first_money = am[0]
                 desc = line[d.end(): first_money.start()].strip()
 
                 rows.append({
                     "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
                     "descripcion": desc,
-                    "debito": 0.0,   # se recalculan luego por delta de saldo
-                    "credito": 0.0,  # se recalculan luego por delta de saldo
-                    "importe": importe,  # magnitud del movimiento; signo se decide después
+                    "debito": 0.0,            # se recalculan luego por delta de saldo
+                    "credito": 0.0,
+                    "importe": importe,        # magnitud; el signo se decide con delta
                     "saldo": saldo,
                     "pagina": pageno
                 })
 
-    df = pd.DataFrame(rows)
+    return pd.DataFrame(rows)
 
-    # Diagnóstico (opcional): ver qué no cumplió la regla de 2 montos con coma
-    if 'st' in globals() and descartadas:
-        st.warning(f"Líneas descartadas por no contener 2 montos con coma (importe + saldo): {len(descartadas)}")
-        sample = descartadas[:10]
-        st.caption("Ejemplos (página, línea):")
-        for p, l in sample:
-            st.text(f"[p.{p}] {l}")
-
-    return df
+def find_saldo_final(file_like):
+    """Busca 'Saldo al dd/mm/aaaa ... <saldo>' y devuelve (fecha_cierre, saldo_final)."""
+    with pdfplumber.open(file_like) as pdf:
+        for page in reversed(pdf.pages):
+            txt = page.extract_text() or ""
+            for line in txt.splitlines():
+                if "Saldo al" in line:
+                    d = DATE_RE.search(line)
+                    am = list(MONEY_RE.finditer(line))
+                    if d and am:
+                        fecha = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
+                        saldo = normalize_money(am[-1].group(0))
+                        return fecha, saldo
+    return pd.NaT, np.nan
 
 def find_saldo_anterior(file_like):
     """
     Devuelve el saldo de apertura de la línea que contiene 'SALDO ANTERIOR'.
-    Se reconstruye la línea por 'altura' usando extract_words y se toma
-    EXCLUSIVAMENTE el último número con coma de ESA línea.
+    Reconstruye la línea por 'altura' y toma EXCLUSIVAMENTE el último monto con coma de ESA línea.
     """
-    import pdfplumber
     with pdfplumber.open(file_like) as pdf:
         for page in pdf.pages:
-            words = page.extract_words(extra_attrs=["top", "x0", "x1"])
+            words = page.extract_words(extra_attrs=["top", "x0"])
             if not words:
                 continue
-
-            # Agrupar por banda de altura (y) para reconstruir líneas
             ytol = 2.0
             lines = {}
             for w in words:
                 band = round(w["top"]/ytol)
                 lines.setdefault(band, []).append(w)
-
             for band in sorted(lines.keys()):
                 ws = sorted(lines[band], key=lambda w: w["x0"])
                 line_text = " ".join(w["text"] for w in ws)
                 if "SALDO ANTERIOR" in line_text.upper():
-                    # En esta MISMA línea buscamos montos válidos (coma + 2 decimales)
-                    am_tokens = []
-                    cur = []
-                    # reconstruyo el texto de la línea con espacios normalizados
-                    line_text = " ".join(w["text"] for w in ws)
                     am_tokens = list(MONEY_RE.finditer(line_text))
                     if am_tokens:
                         return pd.NaT, normalize_money(am_tokens[-1].group(0))
-                    # Si por algún motivo no hay montos con coma en la misma línea, no invento nada
                     return pd.NaT, np.nan
     return pd.NaT, np.nan
-
 
 # --- UI principal ---
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
 if uploaded is None:
-    st.info("Cargá un PDF emitido por la entidad Bancaria. La app no almacena información, todos los datos son efímeros).")
+    st.info("Cargá un PDF. La app no inventa montos: exige importe+saldo (ambos con coma y 2 decimales).")
     st.stop()
 
 data = uploaded.read()
-file_like = io.BytesIO(data)
 
 with st.spinner("Procesando PDF..."):
     df = parse_pdf(io.BytesIO(data))
@@ -199,10 +179,9 @@ if df.empty:
     st.error("No se detectaron movimientos. Si el PDF tiene un formato distinto, pasame una línea ejemplo (fecha + descripción + importe + saldo).")
     st.stop()
 
-# --- INSERTAR SALDO ANTERIOR COMO PRIMER REGISTRO (sin importe) ---
+# --- Insertar SALDO ANTERIOR como primera fila (sin importe) ---
 _, saldo_anterior = find_saldo_anterior(io.BytesIO(data))
 if not np.isnan(saldo_anterior):
-    # usar como fecha la del primer movimiento (para orden), sin inventar otra
     first_date = df["fecha"].min()
     apertura = pd.DataFrame([{
         "fecha": first_date,
@@ -215,44 +194,32 @@ if not np.isnan(saldo_anterior):
     }])
     df = pd.concat([apertura, df], ignore_index=True)
 
-# --- CLASIFICACIÓN POR VARIACIÓN DE SALDO (TU REGLA) ---
-# Orden lógico
+# --- Clasificación por variación de saldo (tu regla) ---
 df = df.sort_values(["fecha", "pagina"]).reset_index(drop=True)
-
-# Variación entre saldos consecutivos
 df["delta_saldo"] = df["saldo"].diff()
 
-# Magnitud del movimiento (positiva)
 monto = df["importe"].abs()
-
-# Inicializo
 df["debito"] = 0.0
 df["credito"] = 0.0
 
 mask = df["delta_saldo"].notna()
-
-# Tu regla:
-#   - Si el saldo SUBE  -> CRÉDITO
-#   - Si el saldo BAJA  -> DÉBITO
-creditos = mask & (df["delta_saldo"] > 0)
-debitos  = mask & (df["delta_saldo"] < 0)
+creditos = mask & (df["delta_saldo"] > 0)   # sube el saldo -> crédito
+debitos  = mask & (df["delta_saldo"] < 0)   # baja el saldo -> débito
 
 df.loc[creditos, "credito"] = monto[creditos]
 df.loc[debitos,  "debito"]  = monto[debitos]
 
-# Primera fila (apertura) queda con 0/0
+# Recalcular importe con la convención Débito - Crédito (primera fila queda 0/0)
 df["importe"] = df["debito"] - df["credito"]
-# --- FIN CLASIFICACIÓN ---
 
-# Saldos de cierre (solo para mostrar en la cabecera)
+# --- Saldos cabecera ---
 fecha_cierre, saldo_final = find_saldo_final(io.BytesIO(data))
-saldo_inicial_calc = saldo_final - df["importe"].sum() if not np.isnan(saldo_final) else np.nan
 
 # Resumen
 st.subheader("Resumen del período")
 c1, c2 = st.columns(2)
 c1.metric("Saldo inicial (PDF)", f"$ {fmt_ar(df.iloc[0]['saldo'])}" if not df.empty else "—")
-c2.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final)}")
+c2.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final)}" if not np.isnan(saldo_final) else "—")
 if pd.notna(fecha_cierre):
     st.caption(f"Cierre: {fecha_cierre.strftime('%d/%m/%Y')}")
 
@@ -261,8 +228,6 @@ st.subheader("Detalle de movimientos")
 
 df_sorted = df.sort_values(["fecha","pagina"]).reset_index(drop=True)
 cols_money = ["debito", "credito", "importe", "saldo"]
-
-# Estilo: miles con punto y decimales con coma; mantiene dtype numérico
 styled = df_sorted.style.format({c: fmt_ar for c in cols_money}, na_rep="—")
 st.dataframe(styled, use_container_width=True)
 
@@ -274,4 +239,5 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 
