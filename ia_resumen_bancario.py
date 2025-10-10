@@ -124,18 +124,12 @@ def parse_pdf(file_like) -> pd.DataFrame:
                 first_money = am[0]
                 desc = line[d.end(): first_money.start()].strip()
 
-                # Clasificación DB/CR (sin tocar el importe)
-                up = desc.upper()
-                is_credit = ("CR-" in up) or up.startswith("CR") or ("CR-TRSFE" in up) or ("NEG.CONT" in up) or ("TRANSF RECIB" in up)
-                debito  = 0.0 if is_credit else importe
-                credito = importe if is_credit else 0.0
-
                 rows.append({
                     "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
                     "descripcion": desc,
-                    "debito": debito,
-                    "credito": credito,
-                    "importe": debito - credito,  # Débito suma / Crédito resta
+                    "debito": 0.0,   # se recalculan luego por delta de saldo
+                    "credito": 0.0,  # se recalculan luego por delta de saldo
+                    "importe": importe,  # magnitud del movimiento; signo se decide después
                     "saldo": saldo,
                     "pagina": pageno
                 })
@@ -182,6 +176,36 @@ with st.spinner("Procesando PDF..."):
 if df.empty:
     st.error("No se detectaron movimientos. Si el PDF tiene un formato distinto, pasame una línea ejemplo (fecha + descripción + importe + saldo).")
     st.stop()
+
+# --- CLASIFICACIÓN POR VARIACIÓN DE SALDO (TU REGLA) ---
+# Orden lógico
+df = df.sort_values(["fecha", "pagina"]).reset_index(drop=True)
+
+# Variación entre saldos consecutivos
+df["delta_saldo"] = df["saldo"].diff()
+
+# Magnitud del movimiento (positiva)
+monto = df["importe"].abs()
+
+# Inicializo
+df["debito"] = 0.0
+df["credito"] = 0.0
+
+mask = df["delta_saldo"].notna()
+
+# Tu regla explícita:
+#   - Si el saldo SUBE  -> CRÉDITO
+#   - Si el saldo BAJA  -> DÉBITO
+creditos = mask & (df["delta_saldo"] > 0)
+debitos  = mask & (df["delta_saldo"] < 0)
+
+df.loc[creditos, "credito"] = monto[creditos]
+df.loc[debitos,  "debito"]  = monto[debitos]
+
+# Primera fila: sin delta -> 0/0 (no infiero)
+# Recalculo importe con tu convención (débito - crédito)
+df["importe"] = df["debito"] - df["credito"]
+# --- FIN CLASIFICACIÓN ---
 
 # Saldos
 fecha_cierre, saldo_final = find_saldo_final(io.BytesIO(data))
