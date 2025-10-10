@@ -23,16 +23,15 @@ except Exception as e:
     st.error(f"No se pudo importar pdfplumber: {e}\nRevisá requirements.txt")
     st.stop()
 
-# --- Regex EXACTOS (dos decimales con coma; guion final opcional; con bordes para no pegarse a texto) ---
+# --- Regex EXACTOS ---
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{4}\b")
-
-# Antes:
-# MONEY_RE = re.compile(r"(?:\d{1,3}(?:[.\s]\d{3})*|\d+)\s?,\s?\d{2}-?")
-# Después (robusto, sin espacios como miles y con bordes):
+# Montos válidos: coma y 2 decimales; miles con punto (sin espacios como miles); guion final opcional.
+# Bordes: no debe estar pegado a otros caracteres (inicio/espacio a la izquierda y espacio/fin a la derecha).
 MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
 
+# --- Utilidades de parseo/estilo ---
 def normalize_money(tok: str) -> float:
-    """'1 . 234 . 567 , 89 -' -> -1234567.89 (coma = decimal; dos decimales)"""
+    """'1.234.567,89-' -> -1234567.89 (coma decimal; dos decimales)."""
     if not tok:
         return np.nan
     tok = tok.strip()
@@ -40,7 +39,7 @@ def normalize_money(tok: str) -> float:
     tok = tok.rstrip("-")
     if "," not in tok:
         return np.nan
-    main, frac = tok.rsplit(",", 1)  # decimal fijo: coma
+    main, frac = tok.rsplit(",", 1)  # separador decimal fijo: coma
     main = main.replace(".", "").replace(" ", "")
     try:
         val = float(f"{main}.{frac}")
@@ -59,7 +58,7 @@ def lines_from_text(page):
     return [" ".join(l.split()) for l in txt.splitlines()]
 
 def lines_from_words(page, ytol=2.0):
-    """Reconstruye líneas agrupando por altura; solo para fallback."""
+    """Reconstruye líneas agrupando por altura; se usa SIEMPRE junto a lines_from_text."""
     words = page.extract_words(extra_attrs=["x0", "top"])
     if not words:
         return []
@@ -77,53 +76,55 @@ def lines_from_words(page, ytol=2.0):
         lines.append(" ".join(x["text"] for x in cur))
     return [" ".join(l.split()) for l in lines]
 
+# --- Parser principal (según regla acordada) ---
 def parse_pdf(file_like) -> pd.DataFrame:
     """
-    Lee TODAS las páginas. Para cada línea toma:
-    - SALDO = último número con coma+2 decimales
-    - IMPORTE = el número con coma+2 decimales inmediatamente a la izquierda del saldo
-    Si la línea no tiene ≥2 montos con coma, se descarta (enteros sin decimales se ignoran).
-    Se procesan SIEMPRE líneas por TEXTO y por PALABRAS y se unen sin duplicados.
+    Para cada línea:
+      - SALDO = último número con coma+2 decimales (puede terminar en '-')
+      - IMPORTE = el número con coma+2 decimales inmediatamente a la izquierda del saldo (el más cercano)
+      - Si la línea no tiene ≥2 montos con coma, se descarta (enteros sin decimales se ignoran)
+    Se procesan SIEMPRE TEXTO y PALABRAS por cada página y se UNEN sin duplicados.
     """
     rows = []
     descartadas = []
 
     with pdfplumber.open(file_like) as pdf:
         for pageno, page in enumerate(pdf.pages, start=1):
-            # 1) Obtener líneas de ambas fuentes
+            # Obtener líneas de TEXTO y de PALABRAS
             lt = lines_from_text(page)
             lw = lines_from_words(page, ytol=2.0)
 
-            # Unir sin duplicar (preferimos el texto tal cual y agregamos solo las que no están)
+            # Unir sin duplicar (preferimos el texto; sumamos solo las no vistas)
             seen = set(lt)
             combined = lt + [l for l in lw if l not in seen]
 
             for line in combined:
-                # Buscar montos válidos (coma + 2 decimales). Enteros NO se consideran.
-                am = list(MONEY_RE.finditer(line))
-                if len(am) < 2:
-                    if line.strip():
-                        descartadas.append((pageno, line))
+                if not line.strip():
                     continue
 
-                # SALDO = último con coma; IMPORTE = el inmediatamente a su izquierda
+                # Montos válidos: SOLO coma+2 decimales (enteros NO son importes)
+                am = list(MONEY_RE.finditer(line))
+                if len(am) < 2:
+                    descartadas.append((pageno, line))
+                    continue
+
+                # Regla: saldo = último; importe = inmediato a la izquierda
                 saldo_tok   = am[-1].group(0)
                 importe_tok = am[-2].group(0)
                 saldo       = normalize_money(saldo_tok)
                 importe     = normalize_money(importe_tok)
 
-                # Fecha en cualquier parte
+                # Fecha (en cualquier parte de la línea)
                 d = DATE_RE.search(line)
                 if not d:
-                    if line.strip():
-                        descartadas.append((pageno, line))
+                    descartadas.append((pageno, line))
                     continue
 
-                # Descripción = entre fin de fecha y comienzo del primer monto con coma
+                # Descripción = desde fin de fecha hasta inicio del PRIMER monto con coma
                 first_money = am[0]
                 desc = line[d.end(): first_money.start()].strip()
 
-                # DB/CR según tu heurística (sin tocar el importe)
+                # Clasificación DB/CR (sin tocar el importe)
                 up = desc.upper()
                 is_credit = ("CR-" in up) or up.startswith("CR") or ("CR-TRSFE" in up) or ("NEG.CONT" in up) or ("TRANSF RECIB" in up)
                 debito  = 0.0 if is_credit else importe
@@ -141,7 +142,7 @@ def parse_pdf(file_like) -> pd.DataFrame:
 
     df = pd.DataFrame(rows)
 
-    # Diagnóstico (opcional)
+    # Diagnóstico (opcional): ver qué no cumplió la regla de 2 montos con coma
     if 'st' in globals() and descartadas:
         st.warning(f"Líneas descartadas por no contener 2 montos con coma (importe + saldo): {len(descartadas)}")
         sample = descartadas[:10]
@@ -151,9 +152,8 @@ def parse_pdf(file_like) -> pd.DataFrame:
 
     return df
 
-
 def find_saldo_final(file_like):
-    """Busca la línea 'Saldo al dd/mm/aaaa ... <saldo>' y devuelve (fecha_cierre, saldo_final)."""
+    """Busca 'Saldo al dd/mm/aaaa ... <saldo>' y devuelve (fecha_cierre, saldo_final)."""
     with pdfplumber.open(file_like) as pdf:
         for page in reversed(pdf.pages):
             txt = page.extract_text() or ""
@@ -170,7 +170,7 @@ def find_saldo_final(file_like):
 # --- UI principal ---
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
 if uploaded is None:
-    st.info("Cargá un PDF. La app usa extracción por TEXTO (con fallback por palabras) y no inventa montos.")
+    st.info("Cargá un PDF. La app no inventa montos: exige importe+saldo (ambos con coma y 2 decimales).")
     st.stop()
 
 data = uploaded.read()
@@ -180,7 +180,7 @@ with st.spinner("Procesando PDF..."):
     df = parse_pdf(io.BytesIO(data))
 
 if df.empty:
-    st.error("No se detectaron movimientos. Si el PDF tiene un formato distinto, pasame una línea de ejemplo (fecha + concepto + 2 montos).")
+    st.error("No se detectaron movimientos. Si el PDF tiene un formato distinto, pasame una línea ejemplo (fecha + descripción + importe + saldo).")
     st.stop()
 
 # Saldos
@@ -213,5 +213,4 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 
