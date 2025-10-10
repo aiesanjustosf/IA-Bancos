@@ -265,6 +265,129 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# =========================
+# Análisis por categorías
+# =========================
+st.divider()
+st.subheader("Análisis por categorías")
+
+# 1) Extraer CUIT (primer secuencia de 11 dígitos en la descripción)
+CUIT_RE = re.compile(r"\b\d{11}\b")
+def extraer_cuit(desc: str):
+    if not isinstance(desc, str):
+        return None
+    m = CUIT_RE.search(desc)
+    return m.group(0) if m else None
+
+# 2) Clasificación por reglas (sin tocar importes)
+def clasificar(desc: str, deb: float, cre: float) -> str:
+    if not isinstance(desc, str):
+        return "OTROS"
+    u = desc.upper()
+
+    # --- Transferencias ---
+    # Entre cuentas propias (el banco suele rotular ET = Entre cuentas)
+    if "TRSFE-ET" in u or "ENTRE CUENTAS" in u or "ECUENT" in u:
+        return "TRANSFERENCIAS PROPIAS"
+
+    # Recibidas de terceros (crédito)
+    if cre > 0 and ("CR-TRSFE" in u or "TRANSF" in u or "TRSFE" in u):
+        return "TRANSFERENCIAS DE TERCEROS RECIBIDAS"
+
+    # Enviadas a terceros (débito)
+    if deb > 0 and ("TRSFE-IT" in u or "DB-TRSFE" in u or "TRANSF" in u or "TRSFE" in u):
+        return "TRANSFERENCIAS A TERCEROS REALIZADAS"
+
+    # --- Débitos automáticos / API / ARCA / Seguros ---
+    if "ARCA" in u:
+        return "DÉBITOS ARCA"
+    if "DB/PG/VS DB-SERVICIO DE PAGO" in u or "DB.INMED" in u or "API" in u:
+        return "DÉBITOS API"
+    if "SEGURO" in u or "SEGU" in u or "LA SEGUNDA" in u:
+        return "OTROS DÉBITOS AUTOMÁTICOS"
+
+    # --- SIRCREB ---
+    if "SIRCREB" in u:
+        return "SIRCREB"
+
+    # --- DyC (Débitos y Cargos genéricos, si no entró en otras) ---
+    if (deb > 0) and ("DEB" in u or "DB-" in u or "DEB." in u or "DEB.AUT" in u):
+        return "DyC"
+
+    # --- Comisiones (varios rótulos de comisiones del resumen) ---
+    if ("COM" in u or "COMI" in u or "COMVCAUT" in u or "COM.TR" in u or "COMTRSIT" in u
+        or "CO.EXCESO" in u or "GTO" in u or "GASTO" in u):
+        return "GASTOS POR COMISIONES"
+
+    # --- Percepciones de IVA ---
+    if "IVA PERC" in u or "PERCEP" in u:
+        return "PERCEPCIONES DE IVA"
+
+    return "OTROS"
+
+tmp = df_sorted.copy()
+tmp["cuit"] = tmp["descripcion"].map(extraer_cuit)
+tmp["categoria"] = tmp.apply(lambda r: clasificar(r["descripcion"], float(r["debito"]), float(r["credito"])), axis=1)
+
+# 3) Resumen por categoría (débitos, créditos y neto)
+res_cat = (
+    tmp.groupby("categoria", as_index=False)[["debito","credito"]]
+      .sum()
+      .assign(neto=lambda d: d["credito"] - d["debito"])
+      .sort_values("neto", ascending=False)
+)
+st.markdown("**Totales por categoría**")
+st.dataframe(
+    res_cat.style.format({"debito": fmt_ar, "credito": fmt_ar, "neto": fmt_ar}),
+    use_container_width=True
+)
+
+# 4) Transferencias de terceros — detalle por CUIT
+st.markdown("**Transferencias de terceros — detalle por CUIT**")
+f_rec = tmp["categoria"].eq("TRANSFERENCIAS DE TERCEROS RECIBIDAS")
+f_env = tmp["categoria"].eq("TRANSFERENCIAS A TERCEROS REALIZADAS")
+
+recibidas_por_cuit = (
+    tmp.loc[f_rec]
+       .groupby("cuit", dropna=False, as_index=False)[["credito"]]
+       .sum()
+       .sort_values("credito", ascending=False)
+       .rename(columns={"credito":"total_recibido"})
+)
+enviadas_por_cuit = (
+    tmp.loc[f_env]
+       .groupby("cuit", dropna=False, as_index=False)[["debito"]]
+       .sum()
+       .sort_values("debito", ascending=False)
+       .rename(columns={"debito":"total_enviado"})
+)
+
+c1, c2 = st.columns(2)
+with c1:
+    st.caption("Recibidas (por CUIT)")
+    st.dataframe(recibidas_por_cuit.style.format({"total_recibido": fmt_ar}), use_container_width=True)
+with c2:
+    st.caption("Realizadas (por CUIT)")
+    st.dataframe(enviadas_por_cuit.style.format({"total_enviado": fmt_ar}), use_container_width=True)
+
+# 5) Vistas rápidas por rubro puntual (si existen filas)
+def mostrar_subtabla(titulo: str, filtro):
+    sub = tmp.loc[filtro, ["fecha","descripcion","debito","credito","saldo","cuit"]].copy()
+    if not sub.empty:
+        st.markdown(f"**{titulo}**")
+        st.dataframe(
+            sub.sort_values(["fecha","descripcion"]).style.format({"debito": fmt_ar, "credito": fmt_ar, "saldo": fmt_ar}),
+            use_container_width=True
+        )
+
+mostrar_subtabla("Transferencias entre cuentas propias", tmp["categoria"].eq("TRANSFERENCIAS PROPIAS"))
+mostrar_subtabla("Débitos de API",                      tmp["categoria"].eq("DÉBITOS API"))
+mostrar_subtabla("Débitos ARCA",                        tmp["categoria"].eq("DÉBITOS ARCA"))
+mostrar_subtabla("Otros débitos automáticos (seguros)", tmp["categoria"].eq("OTROS DÉBITOS AUTOMÁTICOS"))
+mostrar_subtabla("SIRCREB",                             tmp["categoria"].eq("SIRCREB"))
+mostrar_subtabla("DyC (débitos y cargos)",              tmp["categoria"].eq("DyC"))
+mostrar_subtabla("Gastos por comisiones",               tmp["categoria"].eq("GASTOS POR COMISIONES"))
+mostrar_subtabla("Percepciones de IVA",                 tmp["categoria"].eq("PERCEPCIONES DE IVA"))
 
 
 
