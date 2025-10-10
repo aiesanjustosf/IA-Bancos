@@ -25,6 +25,7 @@ except Exception as e:
 
 # --- regex ---
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{4}\b")
+# número con coma y 2 decimales; miles con punto; posible guion final
 MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
 
 # --- utils ---
@@ -85,7 +86,7 @@ def parse_pdf(file_like) -> pd.DataFrame:
                     continue
                 am = list(MONEY_RE.finditer(line))
                 if len(am) < 2:
-                    continue
+                    continue  # se requieren importe+saldo (ambos con coma)
                 saldo   = normalize_money(am[-1].group(0))
                 importe = normalize_money(am[-2].group(0))
                 d = DATE_RE.search(line)
@@ -98,9 +99,10 @@ def parse_pdf(file_like) -> pd.DataFrame:
                     "descripcion": desc,
                     "debito": 0.0,
                     "credito": 0.0,
-                    "importe": importe,   # magnitud; signo lo da el delta
+                    "importe": importe,   # magnitud; el signo lo da el delta
                     "saldo": saldo,
-                    "pagina": pageno
+                    "pagina": pageno,
+                    "orden": 1
                 })
     return pd.DataFrame(rows)
 
@@ -121,6 +123,10 @@ def find_saldo_final(file_like):
 
 # --- saldo anterior (misma línea) ---
 def find_saldo_anterior(file_like):
+    """
+    Devuelve (saldo_anterior) tomando EXCLUSIVAMENTE el último monto con coma
+    de la MISMA línea que contiene 'SALDO ANTERIOR'.
+    """
     with pdfplumber.open(file_like) as pdf:
         for page in pdf.pages:
             words = page.extract_words(extra_attrs=["top", "x0"])
@@ -137,14 +143,14 @@ def find_saldo_anterior(file_like):
                 if "SALDO ANTERIOR" in line_text.upper():
                     am_tokens = list(MONEY_RE.finditer(line_text))
                     if am_tokens:
-                        return pd.NaT, normalize_money(am_tokens[-1].group(0))
-                    return pd.NaT, np.nan
-    return pd.NaT, np.nan
+                        return normalize_money(am_tokens[-1].group(0))
+                    return np.nan
+    return np.nan
 
 # --- UI principal ---
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
 if uploaded is None:
-    st.info("Cargá un PDF. La app no almaceda datos, toda la información es efímera y segura.")
+    st.info("Cargá un PDF. La app no inventa montos: exige importe+saldo (ambos con coma y 2 decimales).")
     st.stop()
 
 data = uploaded.read()
@@ -156,12 +162,12 @@ if df.empty:
     st.error("No se detectaron movimientos. Si el PDF tiene un formato distinto, pasame una línea ejemplo (fecha + descripción + importe + saldo).")
     st.stop()
 
-# --- insertar SALDO ANTERIOR como PRIMERA fila ---
-_, saldo_anterior = find_saldo_anterior(io.BytesIO(data))
-df["orden"] = 1  # por defecto, movimientos
+# --- insertar SALDO ANTERIOR como PRIMERA fila sí o sí ---
+saldo_anterior = find_saldo_anterior(io.BytesIO(data))
 if not np.isnan(saldo_anterior):
     first_date = df["fecha"].min()
-    fecha_apertura = first_date - pd.Timedelta(seconds=1)  # asegura que va PRIMERO
+    # lo pongo el día anterior para que jamás empate por fecha
+    fecha_apertura = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59)
     apertura = pd.DataFrame([{
         "fecha": fecha_apertura,
         "descripcion": "SALDO ANTERIOR",
@@ -169,7 +175,7 @@ if not np.isnan(saldo_anterior):
         "credito": 0.0,
         "importe": 0.0,
         "saldo": float(saldo_anterior),
-        "pagina": 1,
+        "pagina": 0,
         "orden": 0
     }])
     df = pd.concat([apertura, df], ignore_index=True)
@@ -178,15 +184,15 @@ if not np.isnan(saldo_anterior):
 df = df.sort_values(["fecha", "orden", "pagina"]).reset_index(drop=True)
 df["delta_saldo"] = df["saldo"].diff()
 
-monto = df["importe"].abs()
-df["debito"] = 0.0
+df["debito"]  = 0.0
 df["credito"] = 0.0
+monto = df["importe"].abs()
 
 mask = df["delta_saldo"].notna()
 df.loc[mask & (df["delta_saldo"] > 0), "credito"] = monto[mask & (df["delta_saldo"] > 0)]
 df.loc[mask & (df["delta_saldo"] < 0), "debito"]  = monto[mask & (df["delta_saldo"] < 0)]
 
-# Recalcular importe con convención Débito - Crédito
+# importe con convención Débito - Crédito
 df["importe"] = df["debito"] - df["credito"]
 
 # --- cabecera ---
