@@ -146,52 +146,47 @@ def parse_pdf(file_like) -> pd.DataFrame:
 
     return df
 
-def find_saldo_final(file_like):
-    """Busca 'Saldo al dd/mm/aaaa ... <saldo>' y devuelve (fecha_cierre, saldo_final)."""
-    with pdfplumber.open(file_like) as pdf:
-        for page in reversed(pdf.pages):
-            txt = page.extract_text() or ""
-            for line in txt.splitlines():
-                if "Saldo al" in line:
-                    d = DATE_RE.search(line)
-                    am = list(MONEY_RE.finditer(line))
-                    if d and am:
-                        fecha = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
-                        saldo = normalize_money(am[-1].group(0))
-                        return fecha, saldo
-    return pd.NaT, np.nan
-
 def find_saldo_anterior(file_like):
     """
-    Detecta 'SALDO ANTERIOR' y devuelve el primer monto (con coma) que aparece
-    en esa línea o inmediatamente después. Devuelve (fecha_detectada_o_NaT, saldo_inicial).
+    Devuelve el saldo de apertura de la línea que contiene 'SALDO ANTERIOR'.
+    Se reconstruye la línea por 'altura' usando extract_words y se toma
+    EXCLUSIVAMENTE el último número con coma de ESA línea.
     """
+    import pdfplumber
     with pdfplumber.open(file_like) as pdf:
-        for pageno, page in enumerate(pdf.pages, start=1):
-            lines = (page.extract_text() or "").splitlines()
-            for i, line in enumerate(lines):
-                if "SALDO ANTERIOR" in line.upper():
-                    # monto en la misma línea
-                    am = list(MONEY_RE.finditer(line))
-                    if am:
-                        return pd.NaT, normalize_money(am[-1].group(0))
-                    # o en la(s) siguiente(s) líneas hasta encontrar un monto
-                    j = i + 1
-                    while j < len(lines):
-                        am2 = list(MONEY_RE.finditer(lines[j]))
-                        if am2:
-                            return pd.NaT, normalize_money(am2[-1].group(0))
-                        # si aparece una fecha antes del monto, frenamos (ya arrancaron los movimientos)
-                        if DATE_RE.search(lines[j]):
-                            break
-                        j += 1
+        for page in pdf.pages:
+            words = page.extract_words(extra_attrs=["top", "x0", "x1"])
+            if not words:
+                continue
+
+            # Agrupar por banda de altura (y) para reconstruir líneas
+            ytol = 2.0
+            lines = {}
+            for w in words:
+                band = round(w["top"]/ytol)
+                lines.setdefault(band, []).append(w)
+
+            for band in sorted(lines.keys()):
+                ws = sorted(lines[band], key=lambda w: w["x0"])
+                line_text = " ".join(w["text"] for w in ws)
+                if "SALDO ANTERIOR" in line_text.upper():
+                    # En esta MISMA línea buscamos montos válidos (coma + 2 decimales)
+                    am_tokens = []
+                    cur = []
+                    # reconstruyo el texto de la línea con espacios normalizados
+                    line_text = " ".join(w["text"] for w in ws)
+                    am_tokens = list(MONEY_RE.finditer(line_text))
+                    if am_tokens:
+                        return pd.NaT, normalize_money(am_tokens[-1].group(0))
+                    # Si por algún motivo no hay montos con coma en la misma línea, no invento nada
                     return pd.NaT, np.nan
     return pd.NaT, np.nan
+
 
 # --- UI principal ---
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
 if uploaded is None:
-    st.info("Cargá un PDF. La app no inventa montos: exige importe+saldo (ambos con coma y 2 decimales).")
+    st.info("Cargá un PDF emitido por la entidad Bancaria. La app no almacena información, todos los datos son efímeros).")
     st.stop()
 
 data = uploaded.read()
