@@ -23,6 +23,17 @@ except Exception as e:
     st.error(f"No se pudo importar pdfplumber: {e}\nRevisá requirements.txt")
     st.stop()
 
+# === NUEVO: deps para PDF (opcional) ===
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+    REPORTLAB_OK = True
+except Exception:
+    REPORTLAB_OK = False
+# =======================================
+
 # --- regex ---
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{4}\b")
 # número con coma y 2 decimales; miles con punto; posible guion final
@@ -123,11 +134,6 @@ def find_saldo_final(file_like):
 
 # --- saldo anterior (misma línea) ---
 def find_saldo_anterior(file_like):
-    """
-    Devuelve el saldo anterior tomando EXCLUSIVAMENTE el último monto con coma
-    de la MISMA línea que contiene 'SALDO ANTERIOR'. Intenta por palabras y,
-    si no lo encuentra, cae a texto crudo.
-    """
     with pdfplumber.open(file_like) as pdf:
         # 1) Intento por PALABRAS (más robusto a alineación)
         for page in pdf.pages:
@@ -278,9 +284,7 @@ df["Clasificación"] = df.apply(
 # -----------------------------------
 
 # ====== Vincular IVA con Comisiones y calcular totales por alícuota ======
-# Columna para guardar cuánto IVA corresponde a cada comisión
 df["iva_asociada"] = 0.0
-
 U = df["descripcion"].astype(str).str.upper()
 
 def es_linea_iva_21(u: str) -> bool:
@@ -292,32 +296,28 @@ def es_linea_iva_105(u: str) -> bool:
 def es_linea_comision(u: str) -> bool:
     return ("COM." in u) or ("COMVCAUT" in u) or ("COMTRSIT" in u) or ("COM.NEGO" in u)
 
-# Para cada línea de IVA, buscar la comisión más cercana (mismo bloque) en ±3 filas.
 def vincular_iva_a_comision():
     for idx in df.index:
         ui = U.iat[idx]
         if not ("IVA " in ui):
             continue
 
-        # Determinar alícuota de la línea IVA
         if es_linea_iva_21(ui):
             ali = "21%"
         elif es_linea_iva_105(ui):
             ali = "10,5%"
         else:
-            continue  # no es IVA imputable a comisiones
+            continue
 
-        # Monto de IVA (usualmente en débito)
         iva_monto = float(df.at[idx, "debito"]) if pd.notna(df.at[idx, "debito"]) else 0.0
         if iva_monto == 0.0:
             iva_monto = abs(float(df.at[idx, "importe"])) if pd.notna(df.at[idx, "importe"]) else 0.0
         if iva_monto == 0.0:
             continue
 
-        # Buscar comisión más cercana dentro de ±3 filas, priorizando anteriores
         mejor_j = None
         for off in (1, 2, 3, -1, -2, -3):
-            j = idx - off  # priorizamos comisiones previas
+            j = idx - off  # prioriza comisiones previas
             if j < 0 or j >= len(df):
                 continue
             uj = U.iat[j]
@@ -327,14 +327,11 @@ def vincular_iva_a_comision():
         if mejor_j is None:
             continue
 
-        # Asignar IVA a esa comisión
         df.at[mejor_j, "iva_asociada"] = float(df.at[mejor_j, "iva_asociada"]) + iva_monto
-        # Guardar etiqueta auxiliar de alícuota para esa comisión
         df.at[mejor_j, "_ali_comision"] = ali
 
 vincular_iva_a_comision()
 
-# Totales por alícuota (neto = débito de la comisión; IVA = iva_asociada)
 mask_comm = df["Clasificación"].eq("Gastos por comisiones") & (df["debito"] > 0)
 neto_21 = float(df.loc[mask_comm & (df.get("_ali_comision", pd.Series(index=df.index)) == "21%"), "debito"].sum())
 iva_21  = float(df.loc[mask_comm & (df.get("_ali_comision", pd.Series(index=df.index)) == "21%"), "iva_asociada"].sum())
@@ -345,7 +342,10 @@ iva_105  = float(df.loc[mask_comm & (df.get("_ali_comision", pd.Series(index=df.
 # Totales de impuestos específicos
 total_ley25413 = float(df.loc[df["Clasificación"].eq("LEY 25413"), "debito"].sum())
 total_sircreb  = float(df.loc[df["Clasificación"].eq("SIRCREB"),   "debito"].sum())
-# ========================================================================
+
+# === NUEVO: total percepciones de IVA ===
+total_perc_iva = float(df.loc[df["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
+# ========================================
 
 # --- cabecera / totales / conciliación ---
 fecha_cierre, saldo_final_pdf = find_saldo_final(io.BytesIO(data))
@@ -393,7 +393,7 @@ else:
 if pd.notna(fecha_cierre):
     st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
-# === Bloque de métricas adicionales (Comisiones por alícuota e impuestos) ===
+# === Bloque de métricas adicionales (Comisiones por alícuota) ===
 st.divider()
 st.subheader("Gastos bancarios por alícuota")
 
@@ -407,13 +407,70 @@ with cB:
 
 st.caption("El IVA se vincula por cercanía (±3 filas) a la comisión más próxima. No altera conciliación.")
 
+# === NUEVO: Resumen Operativo IVA + botón PDF ===
 st.divider()
-st.subheader("Totales impuestos")
-cC, cD = st.columns(2)
+st.subheader("Resumen Operativo: Registración Módulo IVA")
+cC, cD, cE = st.columns(3)
 with cC:
     st.metric("Ley 25.413 (IMPTRANS)", f"$ {fmt_ar(total_ley25413)}")
 with cD:
     st.metric("SIRCREB", f"$ {fmt_ar(total_sircreb)}")
+with cE:
+    st.metric("Percepciones de IVA", f"$ {fmt_ar(total_perc_iva)}")
+
+def build_pdf_resumen_iva() -> bytes:
+    if not REPORTLAB_OK:
+        return b""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=42, bottomMargin=42)
+    styles = getSampleStyleSheet()
+    story = []
+    title = "Resumen Operativo: Registración Módulo IVA"
+    story.append(Paragraph(title, styles["Title"]))
+    sub = f"Período de cierre: {fecha_cierre.strftime('%d/%m/%Y') if pd.notna(fecha_cierre) else '—'}"
+    story.append(Paragraph(sub, styles["Normal"]))
+    story.append(Spacer(1, 12))
+
+    data_tbl = [
+        ["Concepto", "Importe"],
+        ["Comisiones 21% · Neto", fmt_ar(neto_21)],
+        ["Comisiones 21% · IVA",  fmt_ar(iva_21)],
+        ["Comisiones 10,5% · Neto", fmt_ar(neto_105)],
+        ["Comisiones 10,5% · IVA",  fmt_ar(iva_105)],
+        ["Ley 25.413 (IMPTRANS)", fmt_ar(total_ley25413)],
+        ["SIRCREB", fmt_ar(total_sircreb)],
+        ["Percepciones de IVA", fmt_ar(total_perc_iva)],
+    ]
+    t = Table(data_tbl, colWidths=[300, 120])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f0f0f0")),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#bdbdbd")),
+        ("ALIGN", (1,1), (1,-1), "RIGHT"),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("BOTTOMPADDING", (0,0), (-1,0), 8),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 18))
+    story.append(Paragraph("Herramienta para uso interno - AIE San Justo · Developer: Alfonso Alderete", styles["Italic"]))
+
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
+
+# Botón PDF (si reportlab está disponible)
+if REPORTLAB_OK:
+    pdf_bytes = build_pdf_resumen_iva()
+    st.download_button(
+        "📄 Descargar PDF del Resumen Operativo IVA",
+        data=pdf_bytes,
+        file_name="resumen_operativo_iva.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+else:
+    st.info("Para generar el PDF instalá reportlab en requirements.txt (línea: reportlab>=3.6).")
+# ===============================================================
 
 # === Grilla ===
 st.divider()
@@ -481,6 +538,7 @@ except Exception:
         mime="text/csv",
         use_container_width=True,
     )
+
 
 
 
