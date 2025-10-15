@@ -203,7 +203,7 @@ df.loc[mask & (df["delta_saldo"] < 0), "debito"]  = monto[mask & (df["delta_sald
 # importe con convención Débito - Crédito
 df["importe"] = df["debito"] - df["credito"]
 
-# ---------- CLASIFICACIÓN (NUEVO) ----------
+# ---------- CLASIFICACIÓN ----------
 def clasificar(desc: str, deb: float, cre: float) -> str:
     u = (desc or "").upper()
 
@@ -275,7 +275,77 @@ df["Clasificación"] = df.apply(
     lambda r: clasificar(str(r.get("descripcion","")), r.get("debito",0.0), r.get("credito",0.0)),
     axis=1
 )
-# -------------------------------------------
+# -----------------------------------
+
+# ====== Vincular IVA con Comisiones y calcular totales por alícuota ======
+# Columna para guardar cuánto IVA corresponde a cada comisión
+df["iva_asociada"] = 0.0
+
+U = df["descripcion"].astype(str).str.upper()
+
+def es_linea_iva_21(u: str) -> bool:
+    return ("IVA GRAL" in u)
+
+def es_linea_iva_105(u: str) -> bool:
+    return ("IVA RINS" in u) or ("IVA REDUC" in u) or ("10,5" in u) or ("10,50" in u)
+
+def es_linea_comision(u: str) -> bool:
+    return ("COM." in u) or ("COMVCAUT" in u) or ("COMTRSIT" in u) or ("COM.NEGO" in u)
+
+# Para cada línea de IVA, buscar la comisión más cercana (mismo bloque) en ±3 filas.
+def vincular_iva_a_comision():
+    for idx in df.index:
+        ui = U.iat[idx]
+        if not ("IVA " in ui):
+            continue
+
+        # Determinar alícuota de la línea IVA
+        if es_linea_iva_21(ui):
+            ali = "21%"
+        elif es_linea_iva_105(ui):
+            ali = "10,5%"
+        else:
+            continue  # no es IVA imputable a comisiones
+
+        # Monto de IVA (usualmente en débito)
+        iva_monto = float(df.at[idx, "debito"]) if pd.notna(df.at[idx, "debito"]) else 0.0
+        if iva_monto == 0.0:
+            iva_monto = abs(float(df.at[idx, "importe"])) if pd.notna(df.at[idx, "importe"]) else 0.0
+        if iva_monto == 0.0:
+            continue
+
+        # Buscar comisión más cercana dentro de ±3 filas, priorizando anteriores
+        mejor_j = None
+        for off in (1, 2, 3, -1, -2, -3):
+            j = idx - off  # priorizamos comisiones previas
+            if j < 0 or j >= len(df):
+                continue
+            uj = U.iat[j]
+            if es_linea_comision(uj) and df.at[j, "debito"] and df.at[j, "debito"] > 0:
+                mejor_j = j
+                break
+        if mejor_j is None:
+            continue
+
+        # Asignar IVA a esa comisión
+        df.at[mejor_j, "iva_asociada"] = float(df.at[mejor_j, "iva_asociada"]) + iva_monto
+        # Guardar etiqueta auxiliar de alícuota para esa comisión
+        df.at[mejor_j, "_ali_comision"] = ali
+
+vincular_iva_a_comision()
+
+# Totales por alícuota (neto = débito de la comisión; IVA = iva_asociada)
+mask_comm = df["Clasificación"].eq("Gastos por comisiones") & (df["debito"] > 0)
+neto_21 = float(df.loc[mask_comm & (df.get("_ali_comision", pd.Series(index=df.index)) == "21%"), "debito"].sum())
+iva_21  = float(df.loc[mask_comm & (df.get("_ali_comision", pd.Series(index=df.index)) == "21%"), "iva_asociada"].sum())
+
+neto_105 = float(df.loc[mask_comm & (df.get("_ali_comision", pd.Series(index=df.index)) == "10,5%"), "debito"].sum())
+iva_105  = float(df.loc[mask_comm & (df.get("_ali_comision", pd.Series(index=df.index)) == "10,5%"), "iva_asociada"].sum())
+
+# Totales de impuestos específicos
+total_ley25413 = float(df.loc[df["Clasificación"].eq("LEY 25413"), "debito"].sum())
+total_sircreb  = float(df.loc[df["Clasificación"].eq("SIRCREB"),   "debito"].sum())
+# ========================================================================
 
 # --- cabecera / totales / conciliación ---
 fecha_cierre, saldo_final_pdf = find_saldo_final(io.BytesIO(data))
@@ -284,7 +354,7 @@ fecha_cierre, saldo_final_pdf = find_saldo_final(io.BytesIO(data))
 df = df.sort_values(["fecha", "orden", "pagina"]).reset_index(drop=True)
 df_sorted = df.drop(columns=["orden"]).reset_index(drop=True)
 
-# Totales
+# Totales generales
 saldo_inicial = float(df_sorted.loc[0, "saldo"])
 total_debitos = float(df_sorted["debito"].sum())
 total_creditos = float(df_sorted["credito"].sum())
@@ -323,9 +393,32 @@ else:
 if pd.notna(fecha_cierre):
     st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
+# === Bloque de métricas adicionales (Comisiones por alícuota e impuestos) ===
+st.divider()
+st.subheader("Gastos bancarios por alícuota")
+
+cA, cB = st.columns(2)
+with cA:
+    st.metric("Comisiones 21% · Neto", f"$ {fmt_ar(neto_21)}")
+    st.metric("Comisiones 21% · IVA",  f"$ {fmt_ar(iva_21)}")
+with cB:
+    st.metric("Comisiones 10,5% · Neto", f"$ {fmt_ar(neto_105)}")
+    st.metric("Comisiones 10,5% · IVA",  f"$ {fmt_ar(iva_105)}")
+
+st.caption("El IVA se vincula por cercanía (±3 filas) a la comisión más próxima. No altera conciliación.")
+
+st.divider()
+st.subheader("Totales impuestos")
+cC, cD = st.columns(2)
+with cC:
+    st.metric("Ley 25.413 (IMPTRANS)", f"$ {fmt_ar(total_ley25413)}")
+with cD:
+    st.metric("SIRCREB", f"$ {fmt_ar(total_sircreb)}")
+
+# === Grilla ===
 st.divider()
 st.subheader("Detalle de movimientos")
-styled = df_sorted.style.format({c: fmt_ar for c in ["debito","credito","importe","saldo"]}, na_rep="—")
+styled = df_sorted.style.format({c: fmt_ar for c in ["debito","credito","importe","saldo","iva_asociada"]}, na_rep="—")
 st.dataframe(styled, use_container_width=True)
 
 st.markdown(
@@ -360,7 +453,7 @@ try:
             max_len = max(len(col), *(len(v) for v in col_values))
             ws.set_column(idx, idx, min(max_len + 2, 40))  # ancho razonable
 
-        cols_money = ["debito", "credito", "importe", "saldo"]
+        cols_money = ["debito", "credito", "importe", "saldo", "iva_asociada"]
         for c in cols_money:
             if c in df_sorted.columns:
                 j = df_sorted.columns.get_loc(c)
