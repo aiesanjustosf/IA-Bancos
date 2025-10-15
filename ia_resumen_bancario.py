@@ -422,15 +422,21 @@ def build_pdf_resumen_iva() -> bytes:
     if not REPORTLAB_OK:
         return b""
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=42, bottomMargin=42)
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=36, rightMargin=36, topMargin=42, bottomMargin=42
+    )
     styles = getSampleStyleSheet()
     story = []
-    title = "Resumen Operativo: Registración Módulo IVA"
-    story.append(Paragraph(title, styles["Title"]))
+
+    # --- Título y subtítulo ---
+    story.append(Paragraph("Resumen Operativo: Registración Módulo IVA", styles["Title"]))
     sub = f"Período de cierre: {fecha_cierre.strftime('%d/%m/%Y') if pd.notna(fecha_cierre) else '—'}"
     story.append(Paragraph(sub, styles["Normal"]))
     story.append(Spacer(1, 12))
 
+    # --- Datos ---
     data_tbl = [
         ["Concepto", "Importe"],
         ["Comisiones 21% · Neto", fmt_ar(neto_21)],
@@ -441,17 +447,32 @@ def build_pdf_resumen_iva() -> bytes:
         ["SIRCREB", fmt_ar(total_sircreb)],
         ["Percepciones de IVA", fmt_ar(total_perc_iva)],
     ]
+
+    # Calcular total general
+    valores = [neto_21, iva_21, neto_105, iva_105, total_ley25413, total_sircreb, total_perc_iva]
+    total_general = sum(v for v in valores if not np.isnan(v))
+    data_tbl.append(["TOTAL GENERAL", fmt_ar(total_general)])
+
+    # --- Tabla ---
     t = Table(data_tbl, colWidths=[300, 120])
     t.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#f0f0f0")),
-        ("GRID", (0,0), (-1,-1), 0.25, colors.HexColor("#bdbdbd")),
-        ("ALIGN", (1,1), (1,-1), "RIGHT"),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("BOTTOMPADDING", (0,0), (-1,0), 8),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f0f0")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("ALIGN", (1, 1), (1, -1), "RIGHT"),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#bdbdbd")),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 8),
+        ("TOPPADDING", (0, -1), (-1, -1), 6),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#e0e0e0")),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
     ]))
     story.append(t)
     story.append(Spacer(1, 18))
-    story.append(Paragraph("Herramienta para uso interno - AIE San Justo · Developer: Alfonso Alderete", styles["Italic"]))
+
+    # --- Leyenda ---
+    story.append(Paragraph(
+        "Herramienta para uso interno – AIE San Justo",
+        styles["Italic"]
+    ))
 
     doc.build(story)
     pdf_bytes = buf.getvalue()
@@ -470,6 +491,7 @@ if REPORTLAB_OK:
     )
 else:
     st.info("Para generar el PDF instalá reportlab en requirements.txt (línea: reportlab>=3.6).")
+
 # ===============================================================
 
 # === Grilla ===
