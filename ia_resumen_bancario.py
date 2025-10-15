@@ -145,7 +145,7 @@ def find_saldo_anterior(file_like):
                         am = list(MONEY_RE.finditer(line_text))
                         if am:
                             return normalize_money(am[-1].group(0))
-        # 2) Fallback por TEXTO (algunos PDFs no devuelven bien 'words')
+        # 2) Fallback por TEXTO
         for page in pdf.pages:
             txt = page.extract_text() or ""
             for raw in txt.splitlines():
@@ -155,7 +155,6 @@ def find_saldo_anterior(file_like):
                     if am:
                         return normalize_money(am[-1].group(0))
     return np.nan
-
 
 # --- UI principal ---
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
@@ -176,7 +175,6 @@ if df.empty:
 saldo_anterior = find_saldo_anterior(io.BytesIO(data))
 if not np.isnan(saldo_anterior):
     first_date = df["fecha"].min()
-    # lo pongo el día anterior para que jamás empate por fecha
     fecha_apertura = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59)
     apertura = pd.DataFrame([{
         "fecha": fecha_apertura,
@@ -204,6 +202,80 @@ df.loc[mask & (df["delta_saldo"] < 0), "debito"]  = monto[mask & (df["delta_sald
 
 # importe con convención Débito - Crédito
 df["importe"] = df["debito"] - df["credito"]
+
+# ---------- CLASIFICACIÓN (NUEVO) ----------
+def clasificar(desc: str, deb: float, cre: float) -> str:
+    u = (desc or "").upper()
+
+    if "SALDO ANTERIOR" in u:
+        return "SALDO ANTERIOR"
+
+    # Impuesto ley 25413 / IMPTRANS
+    if "LEY 25413" in u or "IMPTRANS" in u:
+        return "LEY 25413"
+
+    # SIRCREB
+    if "SIRCREB" in u:
+        return "SIRCREB"
+
+    # Percepciones de IVA
+    if "IVA PERC" in u or "IVA PERCEP" in u or "RG3337" in u:
+        return "Percepciones de IVA"
+
+    # IVA general / reducido (sobre comisiones)
+    if "IVA GRAL" in u or "IVA RINS" in u or "IVA REDUC" in u:
+        return "IVA (sobre comisiones)"
+
+    # Comisiones varias
+    if "COM." in u or "COMVCAUT" in u or "COMTRSIT" in u or "COM.NEGO" in u:
+        return "Gastos por comisiones"
+
+    # Débitos automáticos (seguros/servicios)
+    if "DB-SNP" in u or "DEB.AUT" in u or "DEB.AUTOM" in u or "SEGU" in u:
+        return "Débito automático"
+
+    # DyC / ARCA / API
+    if "DYC" in u:
+        return "DyC"
+    if "ARCA" in u:
+        return "ARCA"
+    if "API" in u:
+        return "API"
+
+    # Préstamos
+    if "DEB.CUOTA PRESTAMO" in u or ("PRESTAMO" in u and "DEB." in u):
+        return "Cuota de préstamo"
+    if "CR.PREST" in u or "CREDITO PRESTAMOS" in u:
+        return "Crédito de préstamo"
+
+    # Cheques 48hs
+    if "CH 48 HS" in u or "CH.48 HS" in u:
+        return "Cheques 48 hs"
+
+    # Transferencias
+    if ("CR-TRSFE" in u or "TRANSF RECIB" in u) and cre and cre != 0:
+        return "Transferencia de terceros recibida"
+    if (("DB-TRSFE" in u) or ("TRSFE-ET" in u) or ("TRSFE-IT" in u)) and deb and deb != 0:
+        return "Transferencia a terceros realizada"
+    if "DTNCTAPR" in u or "ENTRE CTA" in u or "CTA PROPIA" in u:
+        return "Transferencia entre cuentas propias"
+
+    # Negociados / acreditaciones
+    if "NEG.CONT" in u or "NEGOCIADOS" in u:
+        return "Acreditación de valores"
+
+    # Fallback por signo
+    if cre and cre != 0:
+        return "Crédito"
+    if deb and deb != 0:
+        return "Débito"
+    return "Otros"
+
+df["Clasificación"] = df.apply(
+    lambda r: clasificar(str(r.get("descripcion","")), r.get("debito",0.0), r.get("credito",0.0)),
+    axis=1
+)
+# -------------------------------------------
 
 # --- cabecera / totales / conciliación ---
 fecha_cierre, saldo_final_pdf = find_saldo_final(io.BytesIO(data))
@@ -264,6 +336,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
 # --- Descargar grilla en Excel (con fallback a CSV) ---
 st.divider()
 st.subheader("Descargar")
@@ -287,7 +360,6 @@ try:
             max_len = max(len(col), *(len(v) for v in col_values))
             ws.set_column(idx, idx, min(max_len + 2, 40))  # ancho razonable
 
-        # aplicar formato específico si existen
         cols_money = ["debito", "credito", "importe", "saldo"]
         for c in cols_money:
             if c in df_sorted.columns:
@@ -316,6 +388,7 @@ except Exception:
         mime="text/csv",
         use_container_width=True,
     )
+
 
 
 
