@@ -33,8 +33,9 @@ try:
 except Exception:
     REPORTLAB_OK = False
 
-# --- regex ---
-DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{4}\b")
+# --- regex (ajustes para Macro) ---
+# Acepta 2 o 4 dígitos de año: Macro suele usar dd/mm/aa
+DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{2,4}\b")
 MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
 LONG_INT_RE = re.compile(r"\b\d{6,}\b")
 
@@ -83,7 +84,7 @@ def lines_from_words(page, ytol=2.0):
     return [" ".join(l.split()) for l in lines]
 
 def normalize_desc(desc: str) -> str:
-    """Estandariza descripciones: quita prefijos de sucursal, enteros largos y normaliza espacios."""
+    """Estandariza descripciones: quita prefijos, enteros largos y normaliza espacios."""
     if not desc:
         return ""
     u = desc.upper()
@@ -91,11 +92,45 @@ def normalize_desc(desc: str) -> str:
         if u.startswith(pref):
             u = u[len(pref):]
             break
+    # quita referencias largas numéricas que Macro suele incluir (códigos / legajos / ref)
     u = LONG_INT_RE.sub("", u)
     u = " ".join(u.split())
     return u
 
-# --- parser movimientos ---
+# ---------- DETECCIÓN DE BANCO (solo banner informativo) ----------
+BANK_MACRO_HINTS = (
+    "BANCO MACRO",
+    "CUENTA CORRIENTE BANCARIA NRO",     # encabezado Macro
+    "SALDO ULTIMO EXTRACTO AL",          # Macro
+    "DEBITO FISCAL IVA BASICO",          # IVA 21% Macro
+    "N/D DBCR 25413",                    # ley 25413 Macro
+)
+BANK_SANTAFE_HINTS = (
+    "BANCO DE SANTA FE",
+    "NUEVO BANCO DE SANTA FE",
+    "SALDO ANTERIOR",                    # común en Santa Fe
+    "IMPTRANS",                          # ley 25413 en Santa Fe
+    "IVA GRAL",                          # IVA 21% Santa Fe
+)
+
+def _text_from_pdf(file_like) -> str:
+    try:
+        with pdfplumber.open(file_like) as pdf:
+            return "\n".join((p.extract_text() or "") for p in pdf.pages)
+    except Exception:
+        return ""
+
+def detect_bank_from_text(txt: str) -> str:
+    U = (txt or "").upper()
+    score_macro = sum(1 for k in BANK_MACRO_HINTS if k in U)
+    score_sf    = sum(1 for k in BANK_SANTAFE_HINTS if k in U)
+    if score_macro > score_sf and score_macro > 0:
+        return "Banco Macro"
+    if score_sf > score_macro and score_sf > 0:
+        return "Banco de Santa Fe"
+    return "Banco no identificado"
+
+# --- parser movimientos (genérico; sirve para Santa Fe y Macro) ---
 def parse_pdf(file_like) -> pd.DataFrame:
     rows = []
     with pdfplumber.open(file_like) as pdf:
@@ -108,6 +143,7 @@ def parse_pdf(file_like) -> pd.DataFrame:
                 if not line.strip():
                     continue
                 am = list(MONEY_RE.finditer(line))
+                # Mínimo: un importe de movimiento (débito o crédito) + saldo
                 if len(am) < 2:
                     continue
                 saldo   = normalize_money(am[-1].group(0))
@@ -130,13 +166,18 @@ def parse_pdf(file_like) -> pd.DataFrame:
                 })
     return pd.DataFrame(rows)
 
-# --- saldo final ---
+# --- saldo final (cubre Santa Fe + Macro) ---
 def find_saldo_final(file_like):
+    # Patrones posibles:
+    # - "Saldo al dd/mm/aaaa ..."
+    # - "SALDO FINAL AL DIA dd/mm/aaaa ...", "SALDO FINAL AL DÍA ..."
+    # - "SALDO AL dd/mm/aaaa ..."
+    FINAL_PAT = re.compile(r"(SALDO\s+FINAL\s+AL\s+D[ÍI]A|SALDO\s+AL|Saldo\s+al)", re.IGNORECASE)
     with pdfplumber.open(file_like) as pdf:
         for page in reversed(pdf.pages):
             txt = page.extract_text() or ""
             for line in txt.splitlines():
-                if "Saldo al" in line:
+                if FINAL_PAT.search(line):
                     d = DATE_RE.search(line)
                     am = list(MONEY_RE.finditer(line))
                     if d and am:
@@ -145,9 +186,14 @@ def find_saldo_final(file_like):
                         return fecha, saldo
     return pd.NaT, np.nan
 
-# --- saldo anterior (misma línea) ---
+# --- saldo anterior (cubre Santa Fe + Macro) ---
 def find_saldo_anterior(file_like):
+    # Patrones posibles:
+    # - "SALDO ANTERIOR ...."
+    # - "SALDO ULTIMO EXTRACTO AL dd/mm/aa" (Macro)
+    ANT_PAT_TEXT = re.compile(r"(SALDO\s+ANTERIOR|SALDO\s+ULTIMO\s+EXTRACTO\s+AL)", re.IGNORECASE)
     with pdfplumber.open(file_like) as pdf:
+        # 1) Vía words (alineación robusta)
         for page in pdf.pages:
             words = page.extract_words(extra_attrs=["top", "x0"])
             if words:
@@ -159,15 +205,16 @@ def find_saldo_anterior(file_like):
                 for band in sorted(lines):
                     ws = sorted(lines[band], key=lambda w: w["x0"])
                     line_text = " ".join(w["text"] for w in ws)
-                    if "SALDO ANTERIOR" in line_text.upper():
+                    if ANT_PAT_TEXT.search(line_text):
                         am = list(MONEY_RE.finditer(line_text))
                         if am:
                             return normalize_money(am[-1].group(0))
+        # 2) Fallback texto crudo
         for page in pdf.pages:
             txt = page.extract_text() or ""
             for raw in txt.splitlines():
                 line = " ".join(raw.split())
-                if "SALDO ANTERIOR" in line.upper():
+                if ANT_PAT_TEXT.search(line):
                     am = list(MONEY_RE.finditer(line))
                     if am:
                         return normalize_money(am[-1].group(0))
@@ -180,6 +227,39 @@ if uploaded is None:
     st.stop()
 
 data = uploaded.read()
+
+# --- Banda informativa de detección (no altera el flujo) ---
+_bank_txt = _text_from_pdf(io.BytesIO(data))
+_auto_bank_name = detect_bank_from_text(_bank_txt)
+
+# Selector manual (opcional) para forzar banco
+with st.expander("Opciones avanzadas (detección de banco)", expanded=False):
+    forced = st.selectbox(
+        "Forzar identificación del banco",
+        options=("Auto (detectar)", "Banco de Santa Fe", "Banco Macro"),
+        index=0,
+        help="Solo cambia la etiqueta informativa y el nombre de archivo. El procesamiento se mantiene igual."
+    )
+
+# Mostrar banner según auto/forzado
+if forced != "Auto (detectar)":
+    _bank_name = forced
+else:
+    _bank_name = _auto_bank_name
+
+if _bank_name == "Banco Macro":
+    st.info(f"Detectado: {_bank_name}")
+elif _bank_name == "Banco de Santa Fe":
+    st.success(f"Detectado: {_bank_name}")
+else:
+    st.warning("No se pudo identificar el banco automáticamente. Se intentará procesar.")
+
+# Slug para nombres de archivo
+_bank_slug = (
+    "macro" if _bank_name == "Banco Macro"
+    else "santafe" if _bank_name == "Banco de Santa Fe"
+    else "generico"
+)
 
 with st.spinner("Procesando PDF..."):
     df = parse_pdf(io.BytesIO(data))
@@ -217,7 +297,7 @@ df.loc[mask & (df["delta_saldo"] > 0), "credito"] = monto[mask & (df["delta_sald
 df.loc[mask & (df["delta_saldo"] < 0), "debito"]  = monto[mask & (df["delta_saldo"] < 0)]
 df["importe"] = df["debito"] - df["credito"]
 
-# ---------- CLASIFICACIÓN ----------
+# ---------- CLASIFICACIÓN (ampliada para Macro) ----------
 def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     u = (desc or "").upper()
     n = (desc_norm or "").upper()
@@ -225,28 +305,31 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if "SALDO ANTERIOR" in u or "SALDO ANTERIOR" in n:
         return "SALDO ANTERIOR"
 
-    # Impuesto ley 25413 / IMPTRANS
-    if ("LEY 25413" in u) or ("IMPTRANS" in u) or ("LEY 25413" in n) or ("IMPTRANS" in n):
+    # Impuesto ley 25413 / IMPTRANS / DBCR 25413 (Macro)
+    if ("LEY 25413" in u) or ("IMPTRANS" in u) or ("IMP.S/CREDS" in u) or ("IMPDBCR 25413" in u) or ("N/D DBCR 25413" in u) or \
+       ("LEY 25413" in n) or ("IMPTRANS" in n) or ("IMP.S/CREDS" in n) or ("IMPDBCR 25413" in n) or ("N/D DBCR 25413" in n):
         return "LEY 25413"
 
-    # SIRCREB
+    # SIRCREB (débito y N/C Macro)
     if ("SIRCREB" in u) or ("SIRCREB" in n):
         return "SIRCREB"
 
-    # Percepciones de IVA
-    if ("IVA PERC" in u) or ("IVA PERCEP" in u) or ("RG3337" in u) or ("IVA PERC" in n) or ("IVA PERCEP" in n) or ("RG3337" in n):
+    # Percepciones de IVA (RG 3337)
+    if ("IVA PERC" in u) or ("IVA PERCEP" in u) or ("RG3337" in u) or \
+       ("IVA PERC" in n) or ("IVA PERCEP" in n) or ("RG3337" in n):
         return "Percepciones de IVA"
 
-    # IVA 21% (sobre comisiones)
-    if ("IVA GRAL" in u or "IVA GRAL" in n):
+    # IVA 21% Macro: "DEBITO FISCAL IVA BASICO"
+    if ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n):
         return "IVA 21% (sobre comisiones)"
 
-    # IVA 10,5% (sobre comisiones)
-    if ("IVA RINS" in u or "IVA REDUC" in u or "IVA RINS" in n or "IVA REDUC" in n):
+    # IVA 10,5% (por si algún banco lo presenta)
+    if ("IVA RINS" in u or "IVA REDUC" in u or "IVA 10,5" in u) or ("IVA RINS" in n or "IVA REDUC" in n or "IVA 10,5" in n):
         return "IVA 10,5% (sobre comisiones)"
 
-    # Comisiones varias
-    if ("COMOPREM" in n) or ("COMVCAUT" in n) or ("COMTRSIT" in n) or ("COM.NEGO" in n) or ("CO.EXCESO" in n) or ("COM." in n):
+    # Comisiones varias (incluye Macro: "MANTENIMIENTO MENSUAL PAQUETE")
+    if ("MANTENIMIENTO MENSUAL PAQUETE" in u) or ("MANTENIMIENTO MENSUAL PAQUETE" in n) or \
+       ("COMOPREM" in n) or ("COMVCAUT" in n) or ("COMTRSIT" in n) or ("COM.NEGO" in n) or ("CO.EXCESO" in n) or ("COM." in n):
         return "Gastos por comisiones"
 
     # Débitos automáticos (seguros/servicios)
@@ -256,11 +339,8 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     # DyC / ARCA / API
     if "DYC" in n:
         return "DyC"
-    
-    # Si es un débito y dice AFIP o ARCA → "Débitos ARCA"
     if ("AFIP" in n or "ARCA" in n) and deb and deb != 0:
         return "Débitos ARCA"
-    
     if "API" in n:
         return "API"
 
@@ -321,6 +401,9 @@ saldo_final_calculado = saldo_inicial + total_creditos - total_debitos
 diferencia = saldo_final_calculado - saldo_final_visto
 cuadra = abs(diferencia) < 0.01
 
+# Sufijo opcional con fecha de cierre para los archivos
+date_suffix = f"_{fecha_cierre.strftime('%Y%m%d')}" if pd.notna(fecha_cierre) else ""
+
 # Encabezado
 st.subheader("Resumen del período")
 c1, c2, c3 = st.columns(3)
@@ -351,7 +434,7 @@ st.subheader("Resumen Operativo: Registración Módulo IVA")
 iva21_mask  = df_sorted["Clasificación"].eq("IVA 21% (sobre comisiones)")
 iva105_mask = df_sorted["Clasificación"].eq("IVA 10,5% (sobre comisiones)")
 iva21  = float(df_sorted.loc[iva21_mask,  "debito"].sum())
-iva105 = float(df_sorted.loc[iva105_mask, "debito"].sum())
+iva105 = float(df_sorted.loc[df_sorted["Clasificación"].eq("IVA 10,5% (sobre comisiones)"), "debito"].sum())
 net21  = round(iva21  / 0.21,  2) if iva21  else 0.0
 net105 = round(iva105 / 0.105, 2) if iva105 else 0.0
 
@@ -405,7 +488,7 @@ try:
     st.download_button(
         "📥 Descargar Excel",
         data=output.getvalue(),
-        file_name="resumen_bancario.xlsx",
+        file_name=f"resumen_bancario_{_bank_slug}{date_suffix}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
@@ -414,7 +497,7 @@ except Exception:
     st.download_button(
         "📥 Descargar CSV (fallback)",
         data=csv_bytes,
-        file_name="resumen_bancario.csv",
+        file_name=f"resumen_bancario_{_bank_slug}{date_suffix}.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -457,7 +540,7 @@ if REPORTLAB_OK:
         st.download_button(
             "📄 Descargar PDF – Resumen Operativo (IVA)",
             data=pdf_buf.getvalue(),
-            file_name="Resumen_Operativo_IVA.pdf",
+            file_name=f"Resumen_Operativo_IVA_{_bank_slug}{date_suffix}.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
@@ -465,6 +548,7 @@ if REPORTLAB_OK:
         st.info(f"No se pudo generar el PDF del Resumen Operativo: {e}")
 else:
     st.caption("Para descargar el PDF del Resumen Operativo instalá reportlab en requirements.txt")
+
 
 
 
