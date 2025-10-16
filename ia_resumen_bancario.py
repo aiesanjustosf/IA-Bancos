@@ -53,7 +53,6 @@ NON_MOV_PAT    = re.compile(r"(INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S|TOTAL\s+RE
 INFO_HEADER    = re.compile(r"INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S", re.IGNORECASE)
 
 # ---- Banco de Santa Fe (Consolidado de cuentas) ----
-# ejemplos: "Cuenta Corriente Pesos Nro. 1646/00"  | "Caja de Ahorro Pesos Nro. 12345/01"
 SF_ACC_LINE_RE = re.compile(
     r"\b(Cuenta\s+Corriente\s+Pesos|Cuenta\s+Corriente\s+En\s+D[óo]lares|Caja\s+de\s+Ahorro\s+Pesos|Caja\s+de\s+Ahorro\s+En\s+D[óo]lares)\s+Nro\.?\s*([0-9][0-9./-]*)",
     re.IGNORECASE
@@ -367,33 +366,59 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     u = (desc or "").upper()
     n = (desc_norm or "").upper()
 
+    # Saldos
     if "SALDO ANTERIOR" in u or "SALDO ANTERIOR" in n:
         return "SALDO ANTERIOR"
 
+    # Impuesto a los débitos y créditos bancarios
     if ("LEY 25413" in u) or ("IMPTRANS" in u) or ("IMP.S/CREDS" in u) or ("IMPDBCR 25413" in u) or ("N/D DBCR 25413" in u) or \
        ("LEY 25413" in n) or ("IMPTRANS" in n) or ("IMP.S/CREDS" in n) or ("IMPDBCR 25413" in n) or ("N/D DBCR 25413" in n):
         return "LEY 25413"
 
+    # SIRCREB
     if ("SIRCREB" in u) or ("SIRCREB" in n):
         return "SIRCREB"
 
-    if ("IVA PERC" in u) or ("IVA PERCEP" in u) or ("RG3337" in u) or ("IVA PERC" in n) or ("IVA PERCEP" in n) or ("RG3337" in n):
+    # Percepciones / Retenciones IVA (RG 3337 / RG 2408)
+    if (
+        ("IVA PERC" in u) or ("IVA PERCEP" in u) or ("RG3337" in u) or
+        ("IVA PERC" in n) or ("IVA PERCEP" in n) or ("RG3337" in n) or
+        (("RETEN" in u or "RETENC" in u) and (("I.V.A" in u) or ("IVA" in u)) and (("RG.2408" in u) or ("RG 2408" in u) or ("RG2408" in u))) or
+        (("RETEN" in n or "RETENC" in n) and (("I.V.A" in n) or ("IVA" in n)) and (("RG.2408" in n) or ("RG 2408" in n) or ("RG2408" in n)))
+    ):
         return "Percepciones de IVA"
 
-    # BNA usa "I.V.A. BASE" para el impuesto
+    # IVA sobre comisiones (BNA usa "I.V.A. BASE")
     if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n):
         return "IVA 21% (sobre comisiones)"
 
     if ("IVA RINS" in u or "IVA REDUC" in u) or ("IVA RINS" in n or "IVA REDUC" in n) or ("IVA 10,5" in u) or ("IVA 10,5" in n):
         return "IVA 10,5% (sobre comisiones)"
 
+    # Plazo Fijo (según signo)
+    if ("PLAZO FIJO" in u) or ("PLAZO FIJO" in n) or ("P.FIJO" in u) or ("P.FIJO" in n) or ("P FIJO" in u) or ("P FIJO" in n) or ("PFIJO" in u) or ("PFIJO" in n):
+        if cre and cre != 0:
+            return "Acreditación Plazo Fijo"
+        if deb and deb != 0:
+            return "Débito Plazo Fijo"
+        # si no se pudo inferir por signo, dejamos genérico:
+        return "Plazo Fijo"
+
+    # Comisiones explícitas pedidas (COMIS.TRANSF y COMIS.COMPENSACION)
+    if ("COMIS.TRANSF" in u) or ("COMIS.TRANSF" in n) or ("COMIS TRANSF" in u) or ("COMIS TRANSF" in n) or \
+       ("COMIS.COMPENSACION" in u) or ("COMIS.COMPENSACION" in n) or ("COMIS COMPENSACION" in u) or ("COMIS COMPENSACION" in n):
+        return "Gastos por comisiones"
+
+    # Otras comisiones habituales
     if ("MANTENIMIENTO MENSUAL PAQUETE" in u) or ("MANTENIMIENTO MENSUAL PAQUETE" in n) or \
        ("COMOPREM" in n) or ("COMVCAUT" in n) or ("COMTRSIT" in n) or ("COM.NEGO" in n) or ("CO.EXCESO" in n) or ("COM." in n):
         return "Gastos por comisiones"
 
+    # Débitos automáticos / Seguros
     if ("DB-SNP" in n) or ("DEB.AUT" in n) or ("DEB.AUTOM" in n) or ("SEGUROS" in n) or ("GTOS SEG" in n):
         return "Débito automático"
 
+    # Varias
     if "DYC" in n: return "DyC"
     if ("AFIP" in n or "ARCA" in n) and deb and deb != 0: return "Débitos ARCA"
     if "API" in n: return "API"
@@ -550,7 +575,7 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
     with n3: st.metric("Bruto 10,5%", f"$ {fmt_ar(net105 + iva105)}")
 
     o1, o2, o3 = st.columns(3)
-    with o1: st.metric("Percepciones de IVA (RG 3337)", f"$ {fmt_ar(percep_iva)}")
+    with o1: st.metric("Percepciones de IVA (RG 3337 / RG 2408)", f"$ {fmt_ar(percep_iva)}")
     with o2: st.metric("Ley 25.413", f"$ {fmt_ar(ley_25413)}")
     with o3: st.metric("SIRCREB", f"$ {fmt_ar(sircreb)}")
 
@@ -615,7 +640,7 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
                 ["Neto Comisiones 10,5%", fmt_ar(net105)],
                 ["IVA 10,5%",             fmt_ar(iva105)],
                 ["Bruto 10,5%",           fmt_ar(net105 + iva105)],
-                ["Percepciones de IVA (RG 3337)", fmt_ar(percep_iva)],
+                ["Percepciones de IVA (RG 3337 / RG 2408)", fmt_ar(percep_iva)],
                 ["Ley 25.413",            fmt_ar(ley_25413)],
                 ["SIRCREB",               fmt_ar(sircreb)],
                 ["TOTAL",                 fmt_ar(total_operativo)],
@@ -763,7 +788,7 @@ elif _bank_name == "Banco de la Nación Argentina":
     render_account_report(_bank_slug, titulo, nro, acc_id, all_lines)
 
 else:
-    # Desconocido: procesar genérico
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
+
 
