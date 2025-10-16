@@ -39,12 +39,19 @@ MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
 LONG_INT_RE = re.compile(r"\b\d{6,}\b")
 
 # ====== PATRONES ESPECÍFICOS MACRO ======
+# Formato exacto de número de cuenta: X-XXX-XXXXXXXXXX-X
+ACCOUNT_TOKEN_RE = re.compile(r"\b\d-\d{3}-\d{10}-\d\b")
+
 # Líneas especiales Macro (saldos)
 SALDO_ANT_PREFIX   = re.compile(r"^SALDO\s+U?LTIMO\s+EXTRACTO\s+AL", re.IGNORECASE)
 SALDO_FINAL_PREFIX = re.compile(r"^SALDO\s+FINAL\s+AL\s+D[ÍI]A",     re.IGNORECASE)
 
+# Encabezado por página “CUENTA … NRO.: <token>”
+RE_MACRO_ACC_START = re.compile(r"^CUENTA\s+(.+)$", re.IGNORECASE)
+RE_MACRO_ACC_NRO   = re.compile(rf"N[ROº°\.]*\s*:?\s*({ACCOUNT_TOKEN_RE.pattern})", re.IGNORECASE)
+
 # Títulos repetidos por página (evitar como movimientos)
-PER_PAGE_TITLE_PAT = re.compile(r"^CUENTA\s+.+N[ROº°\.]*\s*:?\s*\d+\b", re.IGNORECASE)
+PER_PAGE_TITLE_PAT = re.compile(rf"^CUENTA\s+.+N[ROº°\.]*\s*:?\s*({ACCOUNT_TOKEN_RE.pattern})", re.IGNORECASE)
 
 # Encabezados de columnas (evitar como movimientos)
 HEADER_ROW_PAT = re.compile(
@@ -148,10 +155,7 @@ def detect_bank_from_text(txt: str) -> str:
         return "Banco de Santa Fe"
     return "Banco no identificado"
 
-# ---------- Macro: segmentación por cuentas (ID = NÚMERO DE CUENTA) ----------
-RE_MACRO_ACC_START = re.compile(r"^CUENTA\s+(.+)$", re.IGNORECASE)     # línea que arranca con "CUENTA ..."
-RE_MACRO_ACC_NRO   = re.compile(r"N[ROº°\.]*\s*:?\s*(\d+)", re.IGNORECASE)  # NRO/N°/Nº/Nro: 123
-
+# ---------- extracción de líneas ----------
 def extract_all_lines(file_like):
     out = []
     with pdfplumber.open(file_like) as pdf:
@@ -163,23 +167,80 @@ def extract_all_lines(file_like):
             out.extend([(pi, l) for l in combined if l.strip()])
     return out
 
+# ---------- leer “Información de su/s Cuenta/s” y armar whitelist ----------
+INFO_HEADER  = re.compile(r"INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S", re.IGNORECASE)
+
+def macro_extract_account_whitelist(file_like) -> dict:
+    """
+    Devuelve dict nro->{'titulo','moneda','sucursal'} a partir de la tabla
+    'INFORMACIÓN DE SU/S CUENTA/S' (si existe). Usa el formato exacto X-XXX-XXXXXXXXXX-X.
+    """
+    info = {}
+    all_lines = extract_all_lines(file_like)
+    in_table = False
+    last_tipo = None
+    for _, ln in all_lines:
+        if INFO_HEADER.search(ln):
+            in_table = True
+            continue
+        if in_table:
+            # Detectar token de cuenta exacto
+            m_token = ACCOUNT_TOKEN_RE.search(ln)
+            if m_token:
+                cuenta_token = m_token.group(0)
+                u = ln.upper()
+                # Moneda (heurística)
+                if "DOLARES" in u or "DÓLARES" in u:
+                    moneda = "DOLARES"
+                elif "PESOS" in u:
+                    moneda = "PESOS"
+                else:
+                    moneda = ""
+                # Sucursal (número aislado antes de moneda, si aparece)
+                suc = ""
+                suc_match = re.search(r"\s(\d{2,3})\s+(DOLARES|DÓLARES|PESOS)\b", u)
+                if suc_match:
+                    suc = suc_match.group(1)
+                # Tipo (preferimos exactos)
+                if "CUENTA CORRIENTE ESPECIAL EN DOLARES" in u or "CUENTA CORRIENTE ESPECIAL EN DÓLARES" in u:
+                    tipo = "CUENTA CORRIENTE ESPECIAL EN DOLARES"
+                elif "CUENTA CORRIENTE ESPECIAL EN PESOS" in u:
+                    tipo = "CUENTA CORRIENTE ESPECIAL EN PESOS"
+                elif "CUENTA CORRIENTE BANCARIA" in u:
+                    tipo = "CUENTA CORRIENTE BANCARIA"
+                else:
+                    tipo = last_tipo or "CUENTA"
+                info[cuenta_token] = {"titulo": tipo, "moneda": moneda, "sucursal": suc}
+                last_tipo = tipo
+            else:
+                # Heurística de fin de tabla: si aparece un encabezado de cuenta de desarrollo
+                if ln.strip().startswith("CUENTA ") and "NRO" in ln.upper():
+                    break
+    return info
+
 def _normalize_title_from_pending(pending_title: str) -> str:
     t = pending_title.upper()
-    if "CAJA DE AHORRO" in t:
-        return "CAJA DE AHORRO"
+    if "CORRIENTE" in t and "ESPECIAL" in t and "DOLAR" in t:
+        return "CUENTA CORRIENTE ESPECIAL EN DOLARES"
     if "CORRIENTE" in t and "ESPECIAL" in t:
-        return "CUENTA CORRIENTE ESPECIAL"
+        return "CUENTA CORRIENTE ESPECIAL EN PESOS"
     if "CORRIENTE" in t:
         return "CUENTA CORRIENTE BANCARIA"
+    if "CAJA DE AHORRO" in t:
+        return "CAJA DE AHORRO"
     return "CUENTA"
 
+# ---------- Macro: segmentación por cuentas (ID = NÚMERO COMPLETO) ----------
 def macro_split_account_blocks(file_like):
     """
     Devuelve bloques por cuenta Macro (SIN duplicar):
       [{'titulo','nro','lines','pages','acc_id'}]
-    - 'acc_id' = nro de cuenta (str)
-    - si el título se repite en cada hoja NO se crean bloques nuevos
+    - 'acc_id' = número de cuenta COMPLETO (X-XXX-XXXXXXXXXX-X).
+    - Usa una whitelist de “Información de su/s Cuenta/s” si está disponible.
     """
+    whitelist = macro_extract_account_whitelist(file_like)  # dict nro -> meta
+    white_set = set(whitelist.keys())
+
     all_lines = extract_all_lines(file_like)   # [(page, line)]
     accounts = {}                              # nro -> dict
     order = []                                 # orden de primera aparición
@@ -187,17 +248,24 @@ def macro_split_account_blocks(file_like):
     pending_title = None
 
     for (pi, ln) in all_lines:
+        # 1) ¿Comienza un bloque con "CUENTA ..."?
         m_title = RE_MACRO_ACC_START.match(ln)
         if m_title:
             pending_title = "CUENTA " + m_title.group(1).strip()
-            # no cambiamos de cuenta hasta ver NRO
             continue
 
+        # 2) ¿Viene NRO con el formato exacto?
         if pending_title:
             m_nro = RE_MACRO_ACC_NRO.search(ln)
             if m_nro:
                 nro = m_nro.group(1)
-                titulo = _normalize_title_from_pending(pending_title)
+                # Validar contra whitelist si existe
+                if white_set and (nro not in white_set):
+                    # Si no está en la tabla, ignoramos para evitar "nros" falsos
+                    pending_title = None
+                    current_nro = None
+                    continue
+                titulo = whitelist.get(nro, {}).get("titulo") or _normalize_title_from_pending(pending_title)
                 if nro not in accounts:
                     accounts[nro] = {
                         "titulo": titulo,
@@ -208,16 +276,16 @@ def macro_split_account_blocks(file_like):
                     }
                     order.append(nro)
                 else:
-                    # actualizar titulo si aún no lo teníamos claro
+                    accounts[nro]["pages"][1] = max(accounts[nro]["pages"][1], pi)
+                    # actualizar título si el previo era genérico
                     if accounts[nro]["titulo"] == "CUENTA" and titulo != "CUENTA":
                         accounts[nro]["titulo"] = titulo
-                    accounts[nro]["pages"][1] = max(accounts[nro]["pages"][1], pi)
                 current_nro = nro
                 pending_title = None
                 continue
-            # si no hay NRO, todavía no sabemos a qué cuenta asignar
+            # si aún no aparece el NRO, seguimos escaneando
 
-        # Si ya estamos dentro de una cuenta, acumulamos líneas y páginas
+        # 3) Acumular contenido dentro de la cuenta activa
         if current_nro is not None:
             acc = accounts[current_nro]
             acc["lines"].append(ln)
@@ -656,7 +724,7 @@ _bank_slug = ("macro" if _bank_name == "Banco Macro"
 
 # --- Flujo por banco ---
 if _bank_name == "Banco Macro":
-    blocks = macro_split_account_blocks(io.BytesIO(data))  # acc_id = nro de cuenta
+    blocks = macro_split_account_blocks(io.BytesIO(data))  # acc_id = nro completo X-XXX-XXXXXXXXXX-X
     if not blocks:
         st.warning("No se detectaron encabezados de cuenta en Macro. Se intentará procesar todo el PDF (podría mezclar cuentas).")
         _lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
@@ -669,6 +737,7 @@ else:
     # Santa Fe u otro: flujo clásico
     lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", lines)
+
 
 
 
