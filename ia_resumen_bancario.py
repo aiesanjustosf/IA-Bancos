@@ -256,8 +256,11 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     # DyC / ARCA / API
     if "DYC" in n:
         return "DyC"
-    if "ARCA" in n:
-        return "ARCA"
+    
+    # Si es un débito y dice AFIP o ARCA → "Débitos ARCA"
+    if ("AFIP" in n or "ARCA" in n) and deb and deb != 0:
+        return "Débitos ARCA"
+    
     if "API" in n:
         return "API"
 
