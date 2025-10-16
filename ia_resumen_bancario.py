@@ -53,7 +53,6 @@ NON_MOV_PAT    = re.compile(r"(INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S|TOTAL\s+RE
 INFO_HEADER    = re.compile(r"INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S", re.IGNORECASE)
 
 # ---- Banco de Santa Fe (Consolidado de cuentas) ----
-# ejemplos: "Cuenta Corriente Pesos Nro. 1646/00"  | "Caja de Ahorro Pesos Nro. 12345/01"
 SF_ACC_LINE_RE = re.compile(
     r"\b(Cuenta\s+Corriente\s+Pesos|Cuenta\s+Corriente\s+En\s+D[óo]lares|Caja\s+de\s+Ahorro\s+Pesos|Caja\s+de\s+Ahorro\s+En\s+D[óo]lares)\s+Nro\.?\s*([0-9][0-9./-]*)",
     re.IGNORECASE
@@ -459,7 +458,14 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     return "Otros"
 
 # ---------- Helper de UI por cuenta ----------
-def render_account_report(banco_slug: str, account_title: str, account_number: str, acc_id: str, lines: list[str]):
+def render_account_report(
+    banco_slug: str,
+    account_title: str,
+    account_number: str,
+    acc_id: str,
+    lines: list[str],
+    bna_extras: dict | None = None   # <-- NUEVO: extras BNA integrados al resumen operativo
+):
     st.markdown("---")
     st.subheader(f"{account_title} · Nro {account_number}")
 
@@ -554,12 +560,7 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
     if pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
-    # Tabla
-    st.caption("Detalle de movimientos")
-    styled = df_sorted.style.format({c: fmt_ar for c in ["debito","credito","importe","saldo"]}, na_rep="—")
-    st.dataframe(styled, use_container_width=True)
-
-    # IVA
+    # ===== Resumen Operativo (IVA + Otros) =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
     iva21_mask  = df_sorted["Clasificación"].eq("IVA 21% (sobre comisiones)")
     iva105_mask = df_sorted["Clasificación"].eq("IVA 10,5% (sobre comisiones)")
@@ -571,6 +572,16 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
     ley_25413  = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25413"),          "debito"].sum())
     sircreb    = float(df_sorted.loc[df_sorted["Clasificación"].eq("SIRCREB"),            "debito"].sum())
 
+    # --- NUEVO: extras BNA integrados (solo si hay y si es Nación) ---
+    intereses_bna = comision_bna = sellados_bna = iva_base_bna = seguro_bna = 0.0
+    if (banco_slug == "nacion") and bna_extras:
+        intereses_bna = float(bna_extras.get("INTERESES", 0.0) or 0.0)
+        comision_bna  = float(bna_extras.get("COMISION",  0.0) or 0.0)
+        sellados_bna  = float(bna_extras.get("SELLADOS",  0.0) or 0.0)
+        iva_base_bna  = float(bna_extras.get("I.V.A. BASE", 0.0) or 0.0)
+        seguro_bna    = float(bna_extras.get("SEGURO DE VIDA", 0.0) or 0.0)
+
+    # Métricas IVA
     m1, m2, m3 = st.columns(3)
     with m1: st.metric("Neto Comisiones 21%", f"$ {fmt_ar(net21)}")
     with m2: st.metric("IVA 21%", f"$ {fmt_ar(iva21)}")
@@ -586,8 +597,25 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
     with o2: st.metric("Ley 25.413", f"$ {fmt_ar(ley_25413)}")
     with o3: st.metric("SIRCREB", f"$ {fmt_ar(sircreb)}")
 
-    total_operativo = net21 + iva21 + net105 + iva105 + percep_iva + ley_25413 + sircreb
+    # Métricas Extras BNA dentro del Resumen Operativo
+    if banco_slug == "nacion" and (intereses_bna or comision_bna or sellados_bna or iva_base_bna or seguro_bna):
+        e1, e2, e3, e4, e5 = st.columns(5)
+        with e1: st.metric("Intereses (BNA)",  f"$ {fmt_ar(intereses_bna)}")
+        with e2: st.metric("Comisión (BNA)",   f"$ {fmt_ar(comision_bna)}")
+        with e3: st.metric("Sellados (BNA)",   f"$ {fmt_ar(sellados_bna)}")
+        with e4: st.metric("I.V.A. BASE (BNA)",f"$ {fmt_ar(iva_base_bna)}")
+        with e5: st.metric("Seguro de vida",   f"$ {fmt_ar(seguro_bna)}")
+
+    total_operativo = (
+        net21 + iva21 + net105 + iva105 + percep_iva + ley_25413 + sircreb
+        + intereses_bna + comision_bna + sellados_bna + iva_base_bna + seguro_bna
+    )
     st.metric("Total Resumen Operativo", f"$ {fmt_ar(total_operativo)}")
+
+    # Tabla
+    st.caption("Detalle de movimientos")
+    styled = df_sorted.style.format({c: fmt_ar for c in ["debito","credito","importe","saldo"]}, na_rep="—")
+    st.dataframe(styled, use_container_width=True)
 
     # Descargas
     st.caption("Descargar")
@@ -650,8 +678,18 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
                 ["Percepciones de IVA (RG 3337 / RG 2408)", fmt_ar(percep_iva)],
                 ["Ley 25.413",            fmt_ar(ley_25413)],
                 ["SIRCREB",               fmt_ar(sircreb)],
-                ["TOTAL",                 fmt_ar(total_operativo)],
             ]
+            # NUEVO: anexar extras BNA al PDF del Resumen Operativo
+            if banco_slug == "nacion" and (intereses_bna or comision_bna or sellados_bna or iva_base_bna or seguro_bna):
+                datos.extend([
+                    ["Intereses (BNA)",   fmt_ar(intereses_bna)],
+                    ["Comisión (BNA)",    fmt_ar(comision_bna)],
+                    ["Sellados (BNA)",    fmt_ar(sellados_bna)],
+                    ["I.V.A. BASE (BNA)", fmt_ar(iva_base_bna)],
+                    ["Seguro de vida",    fmt_ar(seguro_bna)],
+                ])
+            datos.append(["TOTAL", fmt_ar(total_operativo)])
+
             tbl = Table(datos, colWidths=[300, 120])
             tbl.setStyle(TableStyle([
                 ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
@@ -802,6 +840,7 @@ elif _bank_name == "Banco de la Nación Argentina":
     titulo = "CUENTA (BNA)"
     nro = meta.get("account_number") or "s/n"
     acc_id = f"bna-{re.sub(r'[^0-9A-Za-z]+', '_', nro)}"
+
     # Meta visible
     col1, col2, col3 = st.columns(3)
     if meta.get("period_start") and meta.get("period_end"):
@@ -811,23 +850,13 @@ elif _bank_name == "Banco de la Nación Argentina":
     if meta.get("cbu"):
         with col3: st.caption(f"CBU: {meta['cbu']}")
 
-    # Gastos finales (si existen)
+    # Extras BNA -> integrados al Resumen Operativo
     txt_full = _text_from_pdf(io.BytesIO(data))
-    gastos = bna_extract_gastos_finales(txt_full)
-    if gastos:
-        st.caption("Detalle de liquidación (BNA)")
-        g1, g2, g3, g4, g5 = st.columns(5)
-        with g1: st.metric("Intereses", f"$ {fmt_ar(gastos.get('INTERESES'))}")
-        with g2: st.metric("Comisión", f"$ {fmt_ar(gastos.get('COMISION'))}")
-        with g3: st.metric("Sellados", f"$ {fmt_ar(gastos.get('SELLADOS'))}")
-        with g4: st.metric("I.V.A. BASE", f"$ {fmt_ar(gastos.get('I.V.A. BASE'))}")
-        with g5: st.metric("Seguro de vida", f"$ {fmt_ar(gastos.get('SEGURO DE VIDA'))}")
+    bna_extras = bna_extract_gastos_finales(txt_full)
 
-    render_account_report(_bank_slug, titulo, nro, acc_id, all_lines)
+    render_account_report(_bank_slug, titulo, nro, acc_id, all_lines, bna_extras=bna_extras)
 
 else:
     # Desconocido: procesar genérico
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
-
-
