@@ -222,9 +222,9 @@ df.loc[mask & (df["delta_saldo"] > 0), "credito"] = monto[mask & (df["delta_sald
 df.loc[mask & (df["delta_saldo"] < 0), "debito"]  = monto[mask & (df["delta_saldo"] < 0)]
 df["importe"] = df["debito"] - df["credito"]
 
-# ---------- CLASIFICACIÓN ----------
-def clasificar(desc_norm: str, deb: float, cre: float) -> str:
-    u = (desc_norm or "").upper()
+# ---------- CLASIFICACIÓN (ACTUALIZADO) ----------
+def clasificar(desc: str, deb: float, cre: float) -> str:
+    u = (desc or "").upper()
 
     if "SALDO ANTERIOR" in u:
         return "SALDO ANTERIOR"
@@ -242,19 +242,15 @@ def clasificar(desc_norm: str, deb: float, cre: float) -> str:
         return "Percepciones de IVA"
 
     # IVA general / reducido (sobre comisiones)
-    if "IVA GRAL" in u or "IVA GENERAL" in u or "IVA GRA." in u:
-        return "IVA 21% (sobre comisiones)"
-    if "IVA RINS" in u or "IVA REDUC" in u or "IVA RED." in u:
-        return "IVA 10,5% (sobre comisiones)"
+    if "IVA GRAL" in u or "IVA RINS" in u or "IVA REDUC" in u:
+        return "IVA (sobre comisiones)"
 
-    # Comisiones varias (base)
-    if ("COM" in u or "COM." in u or "COMIS" in u or "COMTRSIT" in u
-        or "COM.NEGO" in u or "COMVCAUT" in u or "CO.EXCESO" in u
-        or "GESTION COBRO" in u or "CO.EXCESO FUERA CALI" in u):
-        return "Gastos por comisiones (base)"
+    # Comisiones varias
+    if "COMOPREM" in u or "COMVCAUT" in u or "COMTRSIT" in u or "COM.NEGO" in u or "CO.EXCESO" in u:
+        return "Gastos por comisiones"
 
     # Débitos automáticos (seguros/servicios)
-    if "DB-SNP" in u or "DEB.AUT" in u or "DEB.AUTOM" in u or " SEGU" in u:
+    if "DB-SNP" in u or "DEB.AUT" in u or "DEB.AUTOM" in u or "SEGUROS" in u or "GTOS SEG" in u:
         return "Débito automático"
 
     # DyC / ARCA / API
@@ -268,24 +264,34 @@ def clasificar(desc_norm: str, deb: float, cre: float) -> str:
     # Préstamos
     if "DEB.CUOTA PRESTAMO" in u or ("PRESTAMO" in u and "DEB." in u):
         return "Cuota de préstamo"
-    if "CR.PREST" in u or "CREDITO PRESTAMOS" in u:
-        return "Crédito de préstamo"
+    if "CR.PREST" in u or "CREDITO PRESTAMOS" in u or "CRÉDITO PRÉSTAMOS" in u:
+        return "Acreditación Préstamos"
 
     # Cheques 48hs
     if "CH 48 HS" in u or "CH.48 HS" in u:
         return "Cheques 48 hs"
 
+    # =================== CRÉDITOS ESPECÍFICOS (NUEVO) ===================
+    # Acreditaciones tarjetas (Cabal/otros): PAGO COMERC, CR-CABAL, etc.
+    if ("PAGO COMERC" in u) or ("CR-CABAL" in u) or ("CR CABAL" in u) or ("CR TARJ" in u):
+        return "Acreditaciones Tarjetas de Crédito/Débito"
+
+    # Depósitos en efectivo (CR-DEPEF, DEPOSITO EFECTIVO)
+    if ("CR-DEPEF" in u) or ("CR DEPEF" in u) or ("DEPOSITO EFECTIVO" in u) or ("DEP.EFECTIVO" in u):
+        return "Depósito en Efectivo"
+
     # Transferencias
-    if ("CR-TRSFE" in u or "TRANSF RECIB" in u) and cre and cre != 0:
+    if ("CR-TRSFE" in u or "TRANSF RECIB" in u or "TRANLINK" in u) and cre and cre != 0:
         return "Transferencia de terceros recibida"
     if (("DB-TRSFE" in u) or ("TRSFE-ET" in u) or ("TRSFE-IT" in u)) and deb and deb != 0:
         return "Transferencia a terceros realizada"
     if "DTNCTAPR" in u or "ENTRE CTA" in u or "CTA PROPIA" in u:
         return "Transferencia entre cuentas propias"
 
-    # Negociados / acreditaciones
+    # Negociados / acreditaciones de valores
     if "NEG.CONT" in u or "NEGOCIADOS" in u:
         return "Acreditación de valores"
+    # ====================================================================
 
     # Fallback por signo
     if cre and cre != 0:
@@ -293,11 +299,6 @@ def clasificar(desc_norm: str, deb: float, cre: float) -> str:
     if deb and deb != 0:
         return "Débito"
     return "Otros"
-
-df["Clasificación"] = df.apply(
-    lambda r: clasificar(str(r.get("desc_norm","")), r.get("debito",0.0), r.get("credito",0.0)),
-    axis=1
-)
 # -------------------------------------------
 
 # --- cabecera / totales / conciliación ---
