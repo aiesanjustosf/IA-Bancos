@@ -328,7 +328,10 @@ c4, c5, c6 = st.columns(3)
 with c4: st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final_visto)}")
 with c5: st.metric("Saldo final calculado", f"$ {fmt_ar(saldo_final_calculado)}")
 with c6: st.metric("Diferencia", f"$ {fmt_ar(diferencia)}")
-st.success("✅ Conciliado.") if cuadra else st.error("❌ No cuadra la conciliación.")
+if cuadra:
+    st.success("Conciliado.")
+else:
+    st.error("No cuadra la conciliación.")
 
 if pd.notna(fecha_cierre):
     st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
