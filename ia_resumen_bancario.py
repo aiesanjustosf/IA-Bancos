@@ -76,6 +76,9 @@ BNA_GASTOS_RE = re.compile(
     re.IGNORECASE
 )
 
+# ---- NUEVO: Santa Fe - "SALDO ULTIMO RESUMEN" sin fecha ----
+SF_SALDO_ULT_RE = re.compile(r"SALDO\s+U?LTIMO\s+RESUMEN", re.IGNORECASE)
+
 # --- utils ---
 def normalize_money(tok: str) -> float:
     if not tok:
@@ -345,7 +348,7 @@ def find_saldo_final_from_lines(lines):
     return pd.NaT, np.nan
 
 def find_saldo_anterior_from_lines(lines):
-    # Macro (expreso)
+    # 1) Macro (expreso con fecha): "SALDO ULTIMO EXTRACTO AL dd/mm/aaaa ... <importe>"
     for ln in lines:
         if SALDO_ANT_PREFIX.match(ln):
             d = DATE_RE.search(ln)
@@ -353,15 +356,16 @@ def find_saldo_anterior_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if not np.isnan(saldo):
                     return saldo
-    # Genérico (BNA y otros)
+
+    # 2) Genérico: "SALDO ANTERIOR" (con o sin fecha) con un solo importe en la línea
     for ln in lines:
         U = ln.upper()
-        if "SALDO ANTERIOR" in U:
-            if _only_one_amount(ln):
-                saldo = _first_amount_value(ln)
-                if not np.isnan(saldo):
-                    return saldo
-    # Macro variantes
+        if "SALDO ANTERIOR" in U and _only_one_amount(ln):
+            saldo = _first_amount_value(ln)
+            if not np.isnan(saldo):
+                return saldo
+
+    # 3) Macro variantes: "SALDO ULTIMO/ÚLTIMO EXTRACTO" (con fecha)
     for ln in lines:
         U = ln.upper()
         if "SALDO ULTIMO EXTRACTO" in U or "SALDO ÚLTIMO EXTRACTO" in U:
@@ -370,6 +374,25 @@ def find_saldo_anterior_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if not np.isnan(saldo):
                     return saldo
+
+    # 4) NUEVO: Santa Fe — "SALDO ULTIMO RESUMEN" sin fecha (importe en columna SALDO)
+    for i, ln in enumerate(lines):
+        if SF_SALDO_ULT_RE.search(ln):
+            # mismo renglón
+            if _only_one_amount(ln):
+                v = _first_amount_value(ln)
+                if not np.isnan(v):
+                    return v
+            # hasta 2 renglones siguientes (por si el extractor separa columnas)
+            for j in (i+1, i+2):
+                if 0 <= j < len(lines):
+                    ln2 = lines[j]
+                    if _only_one_amount(ln2):
+                        v2 = _first_amount_value(ln2)
+                        if not np.isnan(v2):
+                            return v2
+            break  # encontrado el bloque, no seguimos scrolleando
+
     return np.nan
 
 # ---------- Clasificación ----------
@@ -464,7 +487,7 @@ def render_account_report(
     account_number: str,
     acc_id: str,
     lines: list[str],
-    bna_extras: dict | None = None   # <-- NUEVO: extras BNA integrados al resumen operativo
+    bna_extras: dict | None = None   # extras BNA integrados al resumen operativo
 ):
     st.markdown("---")
     st.subheader(f"{account_title} · Nro {account_number}")
@@ -572,7 +595,7 @@ def render_account_report(
     ley_25413  = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25413"),          "debito"].sum())
     sircreb    = float(df_sorted.loc[df_sorted["Clasificación"].eq("SIRCREB"),            "debito"].sum())
 
-    # --- NUEVO: extras BNA integrados (solo si hay y si es Nación) ---
+    # Extras BNA integrados (solo si hay y si es Nación)
     intereses_bna = comision_bna = sellados_bna = iva_base_bna = seguro_bna = 0.0
     if (banco_slug == "nacion") and bna_extras:
         intereses_bna = float(bna_extras.get("INTERESES", 0.0) or 0.0)
@@ -679,7 +702,7 @@ def render_account_report(
                 ["Ley 25.413",            fmt_ar(ley_25413)],
                 ["SIRCREB",               fmt_ar(sircreb)],
             ]
-            # NUEVO: anexar extras BNA al PDF del Resumen Operativo
+            # Extras BNA al PDF del Resumen Operativo
             if banco_slug == "nacion" and (intereses_bna or comision_bna or sellados_bna or iva_base_bna or seguro_bna):
                 datos.extend([
                     ["Intereses (BNA)",   fmt_ar(intereses_bna)],
