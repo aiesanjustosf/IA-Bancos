@@ -33,7 +33,7 @@ try:
 except Exception:
     REPORTLAB_OK = False
 
-# --- regex ---
+# --- regex base ---
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{2,4}\b")  # dd/mm/aa o dd/mm/aaaa
 MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
 LONG_INT_RE = re.compile(r"\b\d{6,}\b")
@@ -83,7 +83,7 @@ def lines_from_words(page, ytol=2.0):
     return [" ".join(l.split()) for l in lines]
 
 def normalize_desc(desc: str) -> str:
-    """Estandariza descripciones: quita prefijos, enteros largos y normaliza espacios."""
+    """Estandariza descripciones: quita prefijos y referencias largas, normaliza espacios."""
     if not desc:
         return ""
     u = desc.upper()
@@ -98,7 +98,7 @@ def normalize_desc(desc: str) -> str:
 # ---------- Detección de banco (banner informativo) ----------
 BANK_MACRO_HINTS = (
     "BANCO MACRO",
-    "CUENTA CORRIENTE BANCARIA NRO",
+    "CUENTA CORRIENTE BANCARIA",
     "SALDO ULTIMO EXTRACTO AL",
     "DEBITO FISCAL IVA BASICO",
     "N/D DBCR 25413",
@@ -128,11 +128,9 @@ def detect_bank_from_text(txt: str) -> str:
         return "Banco de Santa Fe"
     return "Banco no identificado"
 
-# ---------- Macro: segmentación por cuentas ----------
-RE_MACRO_ACC_HDR = re.compile(
-    r"^(CUENTA\s+(CORRIENTE\s+BANCARIA|CAJA\s+DE\s+AHORRO(?:\s+EN\s+\w+)?|UNIC[AA]|\w+)\s+NRO\.?:\s*)(\d+)",
-    re.IGNORECASE
-)
+# ---------- Macro: segmentación por cuentas (robusta a 1/2 líneas) ----------
+RE_MACRO_ACC_START = re.compile(r"^CUENTA\s+(.+)$", re.IGNORECASE)     # línea que arranca con "CUENTA ..."
+RE_MACRO_ACC_NRO   = re.compile(r"N[ROº°\.]*\s*:?\s*(\d+)", re.IGNORECASE)  # NRO/N°/Nº/Nro: 123
 
 def extract_all_lines(file_like):
     out = []
@@ -147,48 +145,85 @@ def extract_all_lines(file_like):
 
 def macro_split_account_blocks(file_like):
     """
-    Devuelve una lista de bloques por cuenta en Macro:
-    [{'titulo': 'CUENTA CORRIENTE BANCARIA', 'nro': '123456', 'lines': [str, ...], 'pages': (p_ini, p_fin)}]
+    Devuelve bloques por cuenta Macro.
+    Cada bloque: {'titulo','nro','lines','pages','acc_id'}
+    Soporta encabezados en 1 o 2 líneas (título y NRO separados).
     """
     all_lines = extract_all_lines(file_like)
     blocks = []
     cur = None
     p_start = None
+    pending_title = None
+
+    def close_current(pi):
+        nonlocal cur
+        if cur is not None and cur["pages"][1] is None:
+            cur["pages"] = (cur["pages"][0], pi)
+        return None
+
     for (pi, ln) in all_lines:
-        m = RE_MACRO_ACC_HDR.search(ln)
-        if m:
-            if cur is not None:
-                blocks[-1]["pages"] = (p_start, blocks[-1]["pages"][1] or (pi if pi >= p_start else p_start))
-            titulo_raw = m.group(1)
-            nro = m.group(3)
-            titulo = (
-                "CUENTA CORRIENTE BANCARIA" if "CORRIENTE" in titulo_raw.upper()
-                else "CAJA DE AHORRO"       if "CAJA DE AHORRO" in titulo_raw.upper()
-                else "CUENTA"
-            )
-            cur = {"titulo": titulo, "nro": nro, "lines": [], "pages": (pi, None)}
-            blocks.append(cur)
-            p_start = pi
+        m_title = RE_MACRO_ACC_START.match(ln)
+        if m_title:
+            # Nuevo título: cerramos el bloque previo (si lo había)
+            cur = close_current(pi)
+            pending_title = ("CUENTA " + m_title.group(1).strip())
+            continue
+
+        if pending_title:
+            m_nro = RE_MACRO_ACC_NRO.search(ln)
+            if m_nro:
+                nro = m_nro.group(1)
+                t_norm = pending_title.upper()
+                if "CAJA DE AHORRO" in t_norm:
+                    titulo = "CAJA DE AHORRO"
+                elif "CORRIENTE" in t_norm and "ESPECIAL" in t_norm:
+                    titulo = "CUENTA CORRIENTE ESPECIAL"
+                elif "CORRIENTE" in t_norm:
+                    titulo = "CUENTA CORRIENTE BANCARIA"
+                else:
+                    titulo = "CUENTA"
+                acc_id = f"{titulo.lower().replace(' ', '-')}-{nro}"
+                cur = {"titulo": titulo, "nro": nro, "lines": [], "pages": (pi, None), "acc_id": acc_id}
+                blocks.append(cur)
+                p_start = pi
+                pending_title = None
+                continue
+            # si no hay NRO aún, seguimos; no abrimos bloque hasta tener NRO
+
         if cur is not None:
             cur["lines"].append(ln)
+
+    # cerrar último bloque al final del documento
     if blocks:
         last = blocks[-1]
         if last["pages"][1] is None:
             last["pages"] = (last["pages"][0], all_lines[-1][0])
+
     return blocks
 
-# ---------- Parsing genérico desde líneas ----------
+# ---------- Parsing desde líneas ----------
+# Evitar líneas de cabecera/totales que no son movimientos
+NON_MOV_PAT = re.compile(
+    r"(INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S|SALDO\s+FINAL\s+AL|TOTAL\s+RESUMEN\s+OPERATIVO|RESUMEN\s+DEL\s+PER[IÍ]ODO)",
+    re.IGNORECASE
+)
+
 def parse_lines(lines) -> pd.DataFrame:
     rows = []
     for ln in lines:
+        if NON_MOV_PAT.search(ln):
+            continue
         am = list(MONEY_RE.finditer(ln))
         if len(am) < 2:
             continue
-        saldo   = normalize_money(am[-1].group(0))
-        importe = normalize_money(am[-2].group(0))
         d = DATE_RE.search(ln)
         if not d:
             continue
+        # La fecha debe ocurrir antes del primer importe de la línea
+        if d.end() >= am[0].start():
+            continue
+        saldo   = normalize_money(am[-1].group(0))
+        importe = normalize_money(am[-2].group(0))
         first_money = am[0]
         desc = ln[d.end(): first_money.start()].strip()
         rows.append({
@@ -197,7 +232,7 @@ def parse_lines(lines) -> pd.DataFrame:
             "desc_norm": normalize_desc(desc),
             "debito": 0.0,
             "credito": 0.0,
-            "importe": importe,  # magnitud; el signo lo da el delta
+            "importe": importe,
             "saldo": saldo,
             "pagina": 0,
             "orden": 1
@@ -257,7 +292,7 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if ("IVA RINS" in u or "IVA REDUC" in u or "IVA 10,5" in u) or ("IVA RINS" in n or "IVA REDUC" in n or "IVA 10,5" in n):
         return "IVA 10,5% (sobre comisiones)"
 
-    # Comisiones (incluye Macro: mantenimiento paquete)
+    # Comisiones (incluye mantenimiento paquete)
     if ("MANTENIMIENTO MENSUAL PAQUETE" in u) or ("MANTENIMIENTO MENSUAL PAQUETE" in n) or \
        ("COMOPREM" in n) or ("COMVCAUT" in n) or ("COMTRSIT" in n) or ("COM.NEGO" in n) or ("CO.EXCESO" in n) or ("COM." in n):
         return "Gastos por comisiones"
@@ -311,8 +346,8 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
         return "Débito"
     return "Otros"
 
-# ---------- Helpers de UI por cuenta ----------
-def render_account_report(banco_slug: str, account_title: str, account_number: str, lines: list[str]):
+# ---------- Helper de UI por cuenta ----------
+def render_account_report(banco_slug: str, account_title: str, account_number: str, acc_id: str, lines: list[str]):
     st.markdown("---")
     st.subheader(f"{account_title} · Nro {account_number}")
 
@@ -323,10 +358,9 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
 
     if df.empty:
         st.info("Sin Movimientos")
-        # Descargas no aplican si no hay grilla, pero podríamos exportar un PDF/Excel vacío si quisieras.
         return
 
-    # Insertar saldo anterior como primera fila (si disponible)
+    # Insertar saldo anterior como primera fila (si existe)
     if not np.isnan(saldo_anterior):
         first_date = df["fecha"].dropna().min()
         if pd.notna(first_date):
@@ -429,7 +463,7 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
     total_operativo = net21 + iva21 + net105 + iva105 + percep_iva + ley_25413 + sircreb
     st.metric("Total Resumen Operativo", f"$ {fmt_ar(total_operativo)}")
 
-    # Descargas
+    # Descargas (keys únicos por cuenta para evitar DuplicateWidgetID)
     st.caption("Descargar")
     try:
         import xlsxwriter
@@ -458,6 +492,7 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
             file_name=f"resumen_bancario_{banco_slug}{acc_suffix}{date_suffix}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
+            key=f"dl_xlsx_{acc_id}",
         )
     except Exception:
         csv_bytes = df_sorted.to_csv(index=False).encode("utf-8-sig")
@@ -467,6 +502,7 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
             file_name=f"resumen_bancario_{banco_slug}{acc_suffix}{date_suffix}.csv",
             mime="text/csv",
             use_container_width=True,
+            key=f"dl_csv_{acc_id}",
         )
 
     if REPORTLAB_OK:
@@ -509,6 +545,7 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
                 file_name=f"Resumen_Operativo_IVA_{banco_slug}{acc_suffix}{date_suffix}.pdf",
                 mime="application/pdf",
                 use_container_width=True,
+                key=f"dl_pdf_{acc_id}",
             )
         except Exception as e:
             st.info(f"No se pudo generar el PDF del Resumen Operativo: {e}")
@@ -548,25 +585,19 @@ _bank_slug = ("macro" if _bank_name == "Banco Macro"
 
 # --- Flujo por banco ---
 if _bank_name == "Banco Macro":
-    # 1) Partir el PDF en cuentas (no mezclar)
     blocks = macro_split_account_blocks(io.BytesIO(data))
     if not blocks:
         st.warning("No se detectaron encabezados de cuenta en Macro. Se intentará procesar todo el PDF (podría mezclar cuentas).")
-        # Procesar como una cuenta genérica
         _lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
-        render_account_report(_bank_slug, "CUENTA (PDF completo)", "s/n", _lines)
+        render_account_report(_bank_slug, "CUENTA (PDF completo)", "s/n", "macro-pdf-completo", _lines)
     else:
-        # 2) Mostrar INFORMACIÓN DE SU/S CUENTA/S (cuántas)
         st.caption(f"Información de su/s Cuenta/s: {len(blocks)} cuenta(s) detectada(s).")
-        # 3) Correr la mecánica para CADA cuenta
         for b in blocks:
-            render_account_report(_bank_slug, b["titulo"], b["nro"], b["lines"])
-
+            render_account_report(_bank_slug, b["titulo"], b["nro"], b["acc_id"], b["lines"])
 else:
-    # Santa Fe u otro: flujo clásico con todo el PDF como una sola cuenta
-    # (si algún día hubiese múltiples, se puede replicar el enfoque de Macro).
+    # Santa Fe u otro: flujo clásico
     lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
-    render_account_report(_bank_slug, "CUENTA", "s/n", lines)
+    render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", lines)
 
 
 
