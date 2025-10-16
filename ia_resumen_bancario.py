@@ -668,3 +668,4 @@ if _bank_name == "Banco Macro":
 else:
     lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", lines)
+
