@@ -38,6 +38,26 @@ DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{2,4}\b")  # dd/mm/aa o dd/mm/aaaa
 MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
 LONG_INT_RE = re.compile(r"\b\d{6,}\b")
 
+# ====== PATRONES ESPECÍFICOS MACRO ======
+# Líneas especiales Macro (saldos)
+SALDO_ANT_PREFIX   = re.compile(r"^SALDO\s+U?LTIMO\s+EXTRACTO\s+AL", re.IGNORECASE)
+SALDO_FINAL_PREFIX = re.compile(r"^SALDO\s+FINAL\s+AL\s+D[ÍI]A",     re.IGNORECASE)
+
+# Títulos repetidos por página (evitar como movimientos)
+PER_PAGE_TITLE_PAT = re.compile(r"^CUENTA\s+.+N[ROº°\.]*\s*:?\s*\d+\b", re.IGNORECASE)
+
+# Encabezados de columnas (evitar como movimientos)
+HEADER_ROW_PAT = re.compile(
+    r"^(FECHA\s+DESCRIPC(?:I[ÓO]N|ION)|FECHA\s+CONCEPTO|FECHA\s+DETALLE).*(SALDO|D[ÉE]BITO|CR[ÉE]DITO)",
+    re.IGNORECASE
+)
+
+# Cabeceras/totales generales (evitar como movimientos)
+NON_MOV_PAT = re.compile(
+    r"(INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S|TOTAL\s+RESUMEN\s+OPERATIVO|RESUMEN\s+DEL\s+PER[IÍ]ODO)",
+    re.IGNORECASE
+)
+
 # --- utils ---
 def normalize_money(tok: str) -> float:
     if not tok:
@@ -152,7 +172,6 @@ def macro_split_account_blocks(file_like):
     all_lines = extract_all_lines(file_like)
     blocks = []
     cur = None
-    p_start = None
     pending_title = None
 
     def close_current(pi):
@@ -185,7 +204,6 @@ def macro_split_account_blocks(file_like):
                 acc_id = f"{titulo.lower().replace(' ', '-')}-{nro}"
                 cur = {"titulo": titulo, "nro": nro, "lines": [], "pages": (pi, None), "acc_id": acc_id}
                 blocks.append(cur)
-                p_start = pi
                 pending_title = None
                 continue
             # si no hay NRO aún, seguimos; no abrimos bloque hasta tener NRO
@@ -202,30 +220,36 @@ def macro_split_account_blocks(file_like):
     return blocks
 
 # ---------- Parsing desde líneas ----------
-# Evitar líneas de cabecera/totales que no son movimientos
-NON_MOV_PAT = re.compile(
-    r"(INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S|SALDO\s+FINAL\s+AL|TOTAL\s+RESUMEN\s+OPERATIVO|RESUMEN\s+DEL\s+PER[IÍ]ODO)",
-    re.IGNORECASE
-)
-
 def parse_lines(lines) -> pd.DataFrame:
+    """
+    Regla de oro para movimientos:
+    - Debe haber FECHA y al menos 2 importes (importe+saldo).
+    - Se ignoran títulos por página, encabezados y totales/cabeceras.
+    """
     rows = []
     for ln in lines:
-        if NON_MOV_PAT.search(ln):
+        if not ln.strip():
             continue
+        if PER_PAGE_TITLE_PAT.search(ln) or HEADER_ROW_PAT.search(ln) or NON_MOV_PAT.search(ln):
+            continue
+
         am = list(MONEY_RE.finditer(ln))
         if len(am) < 2:
             continue
+
         d = DATE_RE.search(ln)
         if not d:
             continue
+
         # La fecha debe ocurrir antes del primer importe de la línea
         if d.end() >= am[0].start():
             continue
+
         saldo   = normalize_money(am[-1].group(0))
         importe = normalize_money(am[-2].group(0))
         first_money = am[0]
         desc = ln[d.end(): first_money.start()].strip()
+
         rows.append({
             "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
             "descripcion": desc,
@@ -240,26 +264,60 @@ def parse_lines(lines) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 # ---------- Saldos en líneas (por bloque) ----------
-FINAL_PAT = re.compile(r"(SALDO\s+FINAL\s+AL\s+D[ÍI]A|SALDO\s+AL|Saldo\s+al)", re.IGNORECASE)
-ANT_PAT_TEXT = re.compile(r"(SALDO\s+ANTERIOR|SALDO\s+ULTIMO\s+EXTRACTO\s+AL)", re.IGNORECASE)
+def _only_one_amount(line: str) -> bool:
+    """True si la línea tiene exactamente un importe."""
+    return len(list(MONEY_RE.finditer(line))) == 1
+
+def _first_amount_value(line: str) -> float:
+    m = MONEY_RE.search(line)
+    return normalize_money(m.group(0)) if m else np.nan
 
 def find_saldo_final_from_lines(lines):
+    """
+    Saldo final Macro:
+    - Línea que COMIENZA con 'SALDO FINAL AL DIA' + fecha
+    - Exactamente 1 importe en la línea (el saldo)
+    """
     for ln in reversed(lines):
-        if FINAL_PAT.search(ln):
+        if SALDO_FINAL_PREFIX.match(ln):
             d = DATE_RE.search(ln)
-            am = list(MONEY_RE.finditer(ln))
-            if d and am:
+            if d and _only_one_amount(ln):
                 fecha = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
-                saldo = normalize_money(am[-1].group(0))
-                return fecha, saldo
+                saldo = _first_amount_value(ln)
+                if pd.notna(fecha) and not np.isnan(saldo):
+                    return fecha, saldo
+    # Fallback (por si viene con tilde/espaciado raro)
+    for ln in reversed(lines):
+        if "SALDO FINAL" in ln.upper():
+            d = DATE_RE.search(ln)
+            if d and _only_one_amount(ln):
+                fecha = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
+                saldo = _first_amount_value(ln)
+                if pd.notna(fecha) and not np.isnan(saldo):
+                    return fecha, saldo
     return pd.NaT, np.nan
 
 def find_saldo_anterior_from_lines(lines):
+    """
+    Saldo anterior Macro:
+    - Línea que COMIENZA con 'SALDO ULTIMO EXTRACTO AL' + fecha
+    - Exactamente 1 importe en la línea (el saldo anterior)
+    """
     for ln in lines:
-        if ANT_PAT_TEXT.search(ln):
-            am = list(MONEY_RE.finditer(ln))
-            if am:
-                return normalize_money(am[-1].group(0))
+        if SALDO_ANT_PREFIX.match(ln):
+            d = DATE_RE.search(ln)
+            if d and _only_one_amount(ln):
+                saldo = _first_amount_value(ln)
+                if not np.isnan(saldo):
+                    return saldo
+    # Fallback (por si hay variantes de acentuación)
+    for ln in lines:
+        if "SALDO ULTIMO EXTRACTO" in ln.upper() or "SALDO ÚLTIMO EXTRACTO" in ln.upper():
+            d = DATE_RE.search(ln)
+            if d and _only_one_amount(ln):
+                saldo = _first_amount_value(ln)
+                if not np.isnan(saldo):
+                    return saldo
     return np.nan
 
 # ---------- Clasificación ----------
