@@ -59,6 +59,14 @@ SF_ACC_LINE_RE = re.compile(
     re.IGNORECASE
 )
 
+# ---- Banco Nación (BNA) ----
+BNA_NAME_HINT = "BANCO DE LA NACION ARGENTINA"
+BNA_PERIODO_RE = re.compile(r"PERIODO:\s*(\d{2}/\d{2}/\d{4})\s*AL\s*(\d{2}/\d{2}/\d{4})", re.IGNORECASE)
+BNA_CUENTA_CBU_RE = re.compile(
+    r"NRO\.\s*CUENTA\s+SUCURSAL\s+CLAVE\s+BANCARIA\s+UNIFORME\s+\(CBU\)\s*[\r\n]+(\d+)\s+\d+\s+(\d{22})",
+    re.IGNORECASE
+)
+
 # --- utils ---
 def normalize_money(tok: str) -> float:
     if not tok:
@@ -118,6 +126,7 @@ def normalize_desc(desc: str) -> str:
 # ---------- Detección de banco (solo banner) ----------
 BANK_MACRO_HINTS = ("BANCO MACRO","CUENTA CORRIENTE BANCARIA","SALDO ULTIMO EXTRACTO AL","DEBITO FISCAL IVA BASICO","N/D DBCR 25413")
 BANK_SANTAFE_HINTS = ("BANCO DE SANTA FE","NUEVO BANCO DE SANTA FE","SALDO ANTERIOR","IMPTRANS","IVA GRAL")
+BANK_NACION_HINTS = (BNA_NAME_HINT, "SALDO ANTERIOR", "SALDO FINAL", "I.V.A. BASE", "COMIS.")
 
 def _text_from_pdf(file_like) -> str:
     try:
@@ -130,8 +139,10 @@ def detect_bank_from_text(txt: str) -> str:
     U = (txt or "").upper()
     score_macro = sum(1 for k in BANK_MACRO_HINTS if k in U)
     score_sf    = sum(1 for k in BANK_SANTAFE_HINTS if k in U)
-    if score_macro > score_sf and score_macro > 0: return "Banco Macro"
-    if score_sf > score_macro and score_sf > 0:     return "Banco de Santa Fe"
+    score_bna   = sum(1 for k in BANK_NACION_HINTS if k in U)
+    if score_macro >= score_sf and score_macro >= score_bna and score_macro > 0: return "Banco Macro"
+    if score_sf >= score_macro and score_sf >= score_bna and score_sf > 0:       return "Banco de Santa Fe"
+    if score_bna >= score_macro and score_bna >= score_sf and score_bna > 0:     return "Banco de la Nación Argentina"
     return "Banco no identificado"
 
 # ---------- extracción de líneas ----------
@@ -324,6 +335,7 @@ def find_saldo_final_from_lines(lines):
     return pd.NaT, np.nan
 
 def find_saldo_anterior_from_lines(lines):
+    # Macro (expreso)
     for ln in lines:
         if SALDO_ANT_PREFIX.match(ln):
             d = DATE_RE.search(ln)
@@ -331,6 +343,15 @@ def find_saldo_anterior_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if not np.isnan(saldo):
                     return saldo
+    # Genérico (BNA y otros)
+    for ln in lines:
+        U = ln.upper()
+        if "SALDO ANTERIOR" in U:
+            if _only_one_amount(ln):
+                saldo = _first_amount_value(ln)
+                if not np.isnan(saldo):
+                    return saldo
+    # Macro variantes
     for ln in lines:
         U = ln.upper()
         if "SALDO ULTIMO EXTRACTO" in U or "SALDO ÚLTIMO EXTRACTO" in U:
@@ -359,7 +380,8 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if ("IVA PERC" in u) or ("IVA PERCEP" in u) or ("RG3337" in u) or ("IVA PERC" in n) or ("IVA PERCEP" in n) or ("RG3337" in n):
         return "Percepciones de IVA"
 
-    if ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n):
+    # BNA usa "I.V.A. BASE" para el impuesto
+    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n):
         return "IVA 21% (sobre comisiones)"
 
     if ("IVA RINS" in u or "IVA REDUC" in u) or ("IVA RINS" in n or "IVA REDUC" in n) or ("IVA 10,5" in u) or ("IVA 10,5" in n):
@@ -645,6 +667,22 @@ def santafe_extract_accounts(file_like):
             uniq.append(it)
     return uniq
 
+# ---------- Banco Nación: extraer Cuenta/CBU/Período ----------
+def bna_extract_meta(file_like):
+    """
+    Lee el texto completo y devuelve dict con:
+    {'account_number': str|None, 'cbu': str|None, 'period_start': str|None, 'period_end': str|None}
+    """
+    txt = _text_from_pdf(file_like)
+    acc = cbu = pstart = pend = None
+    mper = BNA_PERIODO_RE.search(txt)
+    if mper:
+        pstart, pend = mper.group(1), mper.group(2)
+    macc = BNA_CUENTA_CBU_RE.search(txt)
+    if macc:
+        acc, cbu = macc.group(1), macc.group(2)
+    return {"account_number": acc, "cbu": cbu, "period_start": pstart, "period_end": pend}
+
 # ---------- UI principal ----------
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
 if uploaded is None:
@@ -659,7 +697,7 @@ _auto_bank_name = detect_bank_from_text(_bank_txt)
 with st.expander("Opciones avanzadas (detección de banco)", expanded=False):
     forced = st.selectbox(
         "Forzar identificación del banco",
-        options=("Auto (detectar)", "Banco de Santa Fe", "Banco Macro"),
+        options=("Auto (detectar)", "Banco de Santa Fe", "Banco Macro", "Banco de la Nación Argentina"),
         index=0,
         help="Solo cambia la etiqueta informativa y el nombre de archivo."
     )
@@ -670,11 +708,14 @@ if _bank_name == "Banco Macro":
     st.info(f"Detectado: {_bank_name}")
 elif _bank_name == "Banco de Santa Fe":
     st.success(f"Detectado: {_bank_name}")
+elif _bank_name == "Banco de la Nación Argentina":
+    st.success(f"Detectado: {_bank_name}")
 else:
     st.warning("No se pudo identificar el banco automáticamente. Se intentará procesar.")
 
 _bank_slug = ("macro" if _bank_name == "Banco Macro"
               else "santafe" if _bank_name == "Banco de Santa Fe"
+              else "nacion" if _bank_name == "Banco de la Nación Argentina"
               else "generico")
 
 # --- Flujo por banco ---
@@ -689,22 +730,40 @@ if _bank_name == "Banco Macro":
         for b in blocks:
             render_account_report(_bank_slug, b["titulo"], b["nro"], b["acc_id"], b["lines"])
 
-else:
-    # Banco de Santa Fe (u otro)
+elif _bank_name == "Banco de Santa Fe":
     sf_accounts = santafe_extract_accounts(io.BytesIO(data))
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
 
     if sf_accounts:
         st.caption(f"Consolidado de cuentas: {len(sf_accounts)} detectada(s).")
-        # Si hay varias, procesamos el PDF completo para cada una (no hay bloques por sección)
-        # pero mostramos el número y título correctos del consolidado
-        # (en muchos PDF Santa Fe el desarrollo es único).
         for i, acc in enumerate(sf_accounts, start=1):
             title = acc["title"]
             nro   = acc["nro"]
             acc_id = f"santafe-{re.sub(r'[^0-9A-Za-z]+', '_', nro)}"
             render_account_report(_bank_slug, title, nro, acc_id, all_lines)
             if i < len(sf_accounts):
-                st.markdown("")  # separador visual
+                st.markdown("")
     else:
         render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
+
+elif _bank_name == "Banco de la Nación Argentina":
+    meta = bna_extract_meta(io.BytesIO(data))
+    all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
+    titulo = "CUENTA (BNA)"
+    nro = meta.get("account_number") or "s/n"
+    acc_id = f"bna-{re.sub(r'[^0-9A-Za-z]+', '_', nro)}"
+    # Mostrar breve meta si está disponible
+    col1, col2, col3 = st.columns(3)
+    if meta.get("period_start") and meta.get("period_end"):
+        with col1: st.caption(f"Período: {meta['period_start']} al {meta['period_end']}")
+    if meta.get("account_number"):
+        with col2: st.caption(f"Nro. de cuenta: {meta['account_number']}")
+    if meta.get("cbu"):
+        with col3: st.caption(f"CBU: {meta['cbu']}")
+    render_account_report(_bank_slug, titulo, nro, acc_id, all_lines)
+
+else:
+    # Desconocido: procesar genérico
+    all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
+    render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
+
