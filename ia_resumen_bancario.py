@@ -148,7 +148,7 @@ def detect_bank_from_text(txt: str) -> str:
         return "Banco de Santa Fe"
     return "Banco no identificado"
 
-# ---------- Macro: segmentación por cuentas (robusta a 1/2 líneas) ----------
+# ---------- Macro: segmentación por cuentas (ID = NÚMERO DE CUENTA) ----------
 RE_MACRO_ACC_START = re.compile(r"^CUENTA\s+(.+)$", re.IGNORECASE)     # línea que arranca con "CUENTA ..."
 RE_MACRO_ACC_NRO   = re.compile(r"N[ROº°\.]*\s*:?\s*(\d+)", re.IGNORECASE)  # NRO/N°/Nº/Nro: 123
 
@@ -163,60 +163,72 @@ def extract_all_lines(file_like):
             out.extend([(pi, l) for l in combined if l.strip()])
     return out
 
+def _normalize_title_from_pending(pending_title: str) -> str:
+    t = pending_title.upper()
+    if "CAJA DE AHORRO" in t:
+        return "CAJA DE AHORRO"
+    if "CORRIENTE" in t and "ESPECIAL" in t:
+        return "CUENTA CORRIENTE ESPECIAL"
+    if "CORRIENTE" in t:
+        return "CUENTA CORRIENTE BANCARIA"
+    return "CUENTA"
+
 def macro_split_account_blocks(file_like):
     """
-    Devuelve bloques por cuenta Macro.
-    Cada bloque: {'titulo','nro','lines','pages','acc_id'}
-    Soporta encabezados en 1 o 2 líneas (título y NRO separados).
+    Devuelve bloques por cuenta Macro (SIN duplicar):
+      [{'titulo','nro','lines','pages','acc_id'}]
+    - 'acc_id' = nro de cuenta (str)
+    - si el título se repite en cada hoja NO se crean bloques nuevos
     """
-    all_lines = extract_all_lines(file_like)
-    blocks = []
-    cur = None
+    all_lines = extract_all_lines(file_like)   # [(page, line)]
+    accounts = {}                              # nro -> dict
+    order = []                                 # orden de primera aparición
+    current_nro = None
     pending_title = None
-
-    def close_current(pi):
-        nonlocal cur
-        if cur is not None and cur["pages"][1] is None:
-            cur["pages"] = (cur["pages"][0], pi)
-        return None
 
     for (pi, ln) in all_lines:
         m_title = RE_MACRO_ACC_START.match(ln)
         if m_title:
-            # Nuevo título: cerramos el bloque previo (si lo había)
-            cur = close_current(pi)
-            pending_title = ("CUENTA " + m_title.group(1).strip())
+            pending_title = "CUENTA " + m_title.group(1).strip()
+            # no cambiamos de cuenta hasta ver NRO
             continue
 
         if pending_title:
             m_nro = RE_MACRO_ACC_NRO.search(ln)
             if m_nro:
                 nro = m_nro.group(1)
-                t_norm = pending_title.upper()
-                if "CAJA DE AHORRO" in t_norm:
-                    titulo = "CAJA DE AHORRO"
-                elif "CORRIENTE" in t_norm and "ESPECIAL" in t_norm:
-                    titulo = "CUENTA CORRIENTE ESPECIAL"
-                elif "CORRIENTE" in t_norm:
-                    titulo = "CUENTA CORRIENTE BANCARIA"
+                titulo = _normalize_title_from_pending(pending_title)
+                if nro not in accounts:
+                    accounts[nro] = {
+                        "titulo": titulo,
+                        "nro": nro,
+                        "lines": [],
+                        "pages": [pi, pi],  # [min_page, max_page]
+                        "acc_id": nro       # ID = número de cuenta
+                    }
+                    order.append(nro)
                 else:
-                    titulo = "CUENTA"
-                acc_id = f"{titulo.lower().replace(' ', '-')}-{nro}"
-                cur = {"titulo": titulo, "nro": nro, "lines": [], "pages": (pi, None), "acc_id": acc_id}
-                blocks.append(cur)
+                    # actualizar titulo si aún no lo teníamos claro
+                    if accounts[nro]["titulo"] == "CUENTA" and titulo != "CUENTA":
+                        accounts[nro]["titulo"] = titulo
+                    accounts[nro]["pages"][1] = max(accounts[nro]["pages"][1], pi)
+                current_nro = nro
                 pending_title = None
                 continue
-            # si no hay NRO aún, seguimos; no abrimos bloque hasta tener NRO
+            # si no hay NRO, todavía no sabemos a qué cuenta asignar
 
-        if cur is not None:
-            cur["lines"].append(ln)
+        # Si ya estamos dentro de una cuenta, acumulamos líneas y páginas
+        if current_nro is not None:
+            acc = accounts[current_nro]
+            acc["lines"].append(ln)
+            acc["pages"][1] = max(acc["pages"][1], pi)
 
-    # cerrar último bloque al final del documento
-    if blocks:
-        last = blocks[-1]
-        if last["pages"][1] is None:
-            last["pages"] = (last["pages"][0], all_lines[-1][0])
-
+    # construir lista en orden de aparición
+    blocks = []
+    for nro in order:
+        acc = accounts[nro]
+        acc["pages"] = tuple(acc["pages"])
+        blocks.append(acc)
     return blocks
 
 # ---------- Parsing desde líneas ----------
@@ -286,7 +298,7 @@ def find_saldo_final_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if pd.notna(fecha) and not np.isnan(saldo):
                     return fecha, saldo
-    # Fallback (por si viene con tilde/espaciado raro)
+    # Fallback más laxo
     for ln in reversed(lines):
         if "SALDO FINAL" in ln.upper():
             d = DATE_RE.search(ln)
@@ -310,9 +322,10 @@ def find_saldo_anterior_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if not np.isnan(saldo):
                     return saldo
-    # Fallback (por si hay variantes de acentuación)
+    # Fallback por variantes de acentuación
     for ln in lines:
-        if "SALDO ULTIMO EXTRACTO" in ln.upper() or "SALDO ÚLTIMO EXTRACTO" in ln.upper():
+        U = ln.upper()
+        if "SALDO ULTIMO EXTRACTO" in U or "SALDO ÚLTIMO EXTRACTO" in U:
             d = DATE_RE.search(ln)
             if d and _only_one_amount(ln):
                 saldo = _first_amount_value(ln)
@@ -347,7 +360,7 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
         return "IVA 21% (sobre comisiones)"
 
     # IVA 10,5%
-    if ("IVA RINS" in u or "IVA REDUC" in u or "IVA 10,5" in u) or ("IVA RINS" in n or "IVA REDUC" in n or "IVA 10,5" in n):
+    if ("IVA RINS" in u or "IVA REDUC" in u) or ("IVA RINS" in n or "IVA REDUC" in n) or ("IVA 10,5" in u) or ("IVA 10,5" in n):
         return "IVA 10,5% (sobre comisiones)"
 
     # Comisiones (incluye mantenimiento paquete)
@@ -643,7 +656,7 @@ _bank_slug = ("macro" if _bank_name == "Banco Macro"
 
 # --- Flujo por banco ---
 if _bank_name == "Banco Macro":
-    blocks = macro_split_account_blocks(io.BytesIO(data))
+    blocks = macro_split_account_blocks(io.BytesIO(data))  # acc_id = nro de cuenta
     if not blocks:
         st.warning("No se detectaron encabezados de cuenta en Macro. Se intentará procesar todo el PDF (podría mezclar cuentas).")
         _lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
