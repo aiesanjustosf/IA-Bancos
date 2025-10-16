@@ -53,6 +53,7 @@ NON_MOV_PAT    = re.compile(r"(INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S|TOTAL\s+RE
 INFO_HEADER    = re.compile(r"INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S", re.IGNORECASE)
 
 # ---- Banco de Santa Fe (Consolidado de cuentas) ----
+# ejemplos: "Cuenta Corriente Pesos Nro. 1646/00"  | "Caja de Ahorro Pesos Nro. 12345/01"
 SF_ACC_LINE_RE = re.compile(
     r"\b(Cuenta\s+Corriente\s+Pesos|Cuenta\s+Corriente\s+En\s+D[óo]lares|Caja\s+de\s+Ahorro\s+Pesos|Caja\s+de\s+Ahorro\s+En\s+D[óo]lares)\s+Nro\.?\s*([0-9][0-9./-]*)",
     re.IGNORECASE
@@ -63,6 +64,16 @@ BNA_NAME_HINT = "BANCO DE LA NACION ARGENTINA"
 BNA_PERIODO_RE = re.compile(r"PERIODO:\s*(\d{2}/\d{2}/\d{4})\s*AL\s*(\d{2}/\d{2}/\d{4})", re.IGNORECASE)
 BNA_CUENTA_CBU_RE = re.compile(
     r"NRO\.\s*CUENTA\s+SUCURSAL\s+CLAVE\s+BANCARIA\s+UNIFORME\s+\(CBU\)\s*[\r\n]+(\d+)\s+\d+\s+(\d{22})",
+    re.IGNORECASE
+)
+# Captura número de cuenta luego de "NRO. CUENTA SUCURSAL" (variante sin CBU en la misma caja)
+BNA_ACC_ONLY_RE = re.compile(
+    r"NRO\.\s*CUENTA\s+SUCURSAL\s*[:\-]?\s*[\r\n ]+(\d{6,})",
+    re.IGNORECASE
+)
+# Bloque de gastos finales post “SALDO FINAL”
+BNA_GASTOS_RE = re.compile(
+    r"-\s*(INTERESES|COMISION|SELLADOS|I\.V\.A\.?\s*BASE|SEGURO\s+DE\s+VIDA)\s*\$\s*([0-9\.\s]+,\d{2})",
     re.IGNORECASE
 )
 
@@ -278,6 +289,7 @@ def macro_split_account_blocks(file_like):
 # ---------- Parsing movimientos ----------
 def parse_lines(lines) -> pd.DataFrame:
     rows = []
+    seq = 0  # preserva orden exacto de aparición
     for ln in lines:
         if not ln.strip():
             continue
@@ -293,16 +305,17 @@ def parse_lines(lines) -> pd.DataFrame:
         importe = normalize_money(am[-2].group(0))
         first_money = am[0]
         desc = ln[d.end(): first_money.start()].strip()
+        seq += 1
         rows.append({
             "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
             "descripcion": desc,
             "desc_norm": normalize_desc(desc),
             "debito": 0.0,
             "credito": 0.0,
-            "importe": importe,
+            "importe": importe,      # informativo; conciliamos por Δ saldo
             "saldo": saldo,
             "pagina": 0,
-            "orden": 1
+            "orden": seq
         })
     return pd.DataFrame(rows)
 
@@ -315,6 +328,7 @@ def _first_amount_value(line: str) -> float:
     return normalize_money(m.group(0)) if m else np.nan
 
 def find_saldo_final_from_lines(lines):
+    # 1) Macro/otros con formato expreso
     for ln in reversed(lines):
         if SALDO_FINAL_PREFIX.match(ln):
             d = DATE_RE.search(ln)
@@ -323,14 +337,12 @@ def find_saldo_final_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if pd.notna(fecha) and not np.isnan(saldo):
                     return fecha, saldo
+    # 2) BNA: "SALDO FINAL <importe>" sin fecha
     for ln in reversed(lines):
-        if "SALDO FINAL" in ln.upper():
-            d = DATE_RE.search(ln)
-            if d and _only_one_amount(ln):
-                fecha = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
-                saldo = _first_amount_value(ln)
-                if pd.notna(fecha) and not np.isnan(saldo):
-                    return fecha, saldo
+        if "SALDO FINAL" in ln.upper() and _only_one_amount(ln):
+            saldo = _first_amount_value(ln)
+            if not np.isnan(saldo):
+                return pd.NaT, saldo
     return pd.NaT, np.nan
 
 def find_saldo_anterior_from_lines(lines):
@@ -401,10 +413,9 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
             return "Acreditación Plazo Fijo"
         if deb and deb != 0:
             return "Débito Plazo Fijo"
-        # si no se pudo inferir por signo, dejamos genérico:
         return "Plazo Fijo"
 
-    # Comisiones explícitas pedidas (COMIS.TRANSF y COMIS.COMPENSACION)
+    # Comisiones solicitadas explícitamente
     if ("COMIS.TRANSF" in u) or ("COMIS.TRANSF" in n) or ("COMIS TRANSF" in u) or ("COMIS TRANSF" in n) or \
        ("COMIS.COMPENSACION" in u) or ("COMIS.COMPENSACION" in n) or ("COMIS COMPENSACION" in u) or ("COMIS COMPENSACION" in n):
         return "Gastos por comisiones"
@@ -501,16 +512,12 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
         }])
         df = pd.concat([apertura, df], ignore_index=True)
 
-    # Débito/Crédito por delta de saldo
+    # Débito/Crédito por delta de saldo (robusto para BNA)
     df = df.sort_values(["fecha", "orden"]).reset_index(drop=True)
     df["delta_saldo"] = df["saldo"].diff()
-    df["debito"]  = 0.0
-    df["credito"] = 0.0
-    monto = df["importe"].abs()
-    mask = df["delta_saldo"].notna()
-    df.loc[mask & (df["delta_saldo"] > 0), "credito"] = monto[mask & (df["delta_saldo"] > 0)]
-    df.loc[mask & (df["delta_saldo"] < 0), "debito"]  = monto[mask & (df["delta_saldo"] < 0)]
-    df["importe"] = df["debito"] - df["credito"]
+    df["debito"]  = np.where(df["delta_saldo"] < 0, -df["delta_saldo"], 0.0)
+    df["credito"] = np.where(df["delta_saldo"] > 0,  df["delta_saldo"], 0.0)
+    df["importe"] = df["debito"] - df["credito"]  # signo contable
 
     # Clasificación
     df["Clasificación"] = df.apply(
@@ -692,20 +699,38 @@ def santafe_extract_accounts(file_like):
             uniq.append(it)
     return uniq
 
-# ---------- Banco Nación: extraer Cuenta/CBU/Período ----------
+# ---------- Banco Nación: meta (Cuenta/CBU/Período) + gastos finales ----------
+def bna_extract_gastos_finales(txt: str) -> dict:
+    out = {}
+    for m in BNA_GASTOS_RE.finditer(txt or ""):
+        etiqueta = m.group(1).upper()
+        importe = normalize_money(m.group(2))
+        if "I.V.A" in etiqueta or "IVA" in etiqueta:
+            etiqueta = "I.V.A. BASE"
+        out[etiqueta] = float(importe) if importe is not None else np.nan
+    return out
+
 def bna_extract_meta(file_like):
     """
     Lee el texto completo y devuelve dict con:
     {'account_number': str|None, 'cbu': str|None, 'period_start': str|None, 'period_end': str|None}
+    - Soporta caja larga (Cuenta+CBU) y variante corta de "NRO. CUENTA SUCURSAL"
     """
     txt = _text_from_pdf(file_like)
     acc = cbu = pstart = pend = None
+
     mper = BNA_PERIODO_RE.search(txt)
     if mper:
         pstart, pend = mper.group(1), mper.group(2)
+
     macc = BNA_CUENTA_CBU_RE.search(txt)
     if macc:
         acc, cbu = macc.group(1), macc.group(2)
+    else:
+        monly = BNA_ACC_ONLY_RE.search(txt)
+        if monly:
+            acc = monly.group(1)
+
     return {"account_number": acc, "cbu": cbu, "period_start": pstart, "period_end": pend}
 
 # ---------- UI principal ----------
@@ -777,7 +802,7 @@ elif _bank_name == "Banco de la Nación Argentina":
     titulo = "CUENTA (BNA)"
     nro = meta.get("account_number") or "s/n"
     acc_id = f"bna-{re.sub(r'[^0-9A-Za-z]+', '_', nro)}"
-    # Mostrar breve meta si está disponible
+    # Meta visible
     col1, col2, col3 = st.columns(3)
     if meta.get("period_start") and meta.get("period_end"):
         with col1: st.caption(f"Período: {meta['period_start']} al {meta['period_end']}")
@@ -785,9 +810,23 @@ elif _bank_name == "Banco de la Nación Argentina":
         with col2: st.caption(f"Nro. de cuenta: {meta['account_number']}")
     if meta.get("cbu"):
         with col3: st.caption(f"CBU: {meta['cbu']}")
+
+    # Gastos finales (si existen)
+    txt_full = _text_from_pdf(io.BytesIO(data))
+    gastos = bna_extract_gastos_finales(txt_full)
+    if gastos:
+        st.caption("Detalle de liquidación (BNA)")
+        g1, g2, g3, g4, g5 = st.columns(5)
+        with g1: st.metric("Intereses", f"$ {fmt_ar(gastos.get('INTERESES'))}")
+        with g2: st.metric("Comisión", f"$ {fmt_ar(gastos.get('COMISION'))}")
+        with g3: st.metric("Sellados", f"$ {fmt_ar(gastos.get('SELLADOS'))}")
+        with g4: st.metric("I.V.A. BASE", f"$ {fmt_ar(gastos.get('I.V.A. BASE'))}")
+        with g5: st.metric("Seguro de vida", f"$ {fmt_ar(gastos.get('SEGURO DE VIDA'))}")
+
     render_account_report(_bank_slug, titulo, nro, acc_id, all_lines)
 
 else:
+    # Desconocido: procesar genérico
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
 
