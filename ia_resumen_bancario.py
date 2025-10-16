@@ -39,12 +39,12 @@ MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
 LONG_INT_RE = re.compile(r"\b\d{6,}\b")
 
 # ====== PATRONES ESPECÍFICOS MACRO ======
-# Guiones (ASCII -, hyphen, no-break, figure, en/em dash, minus)
+# Guiones posibles (-, hyphen, no-break, figure, en/em dash, minus)
 HYPH = r"[-\u2010\u2011\u2012\u2013\u2014\u2212]"
-# Formato exacto X-XXX-XXXXXXXXXX-X permitiendo espacios alrededor de guiones
+# Formato exacto X-XXX-XXXXXXXXXX-X (admite espacios alrededor de guiones)
 ACCOUNT_TOKEN_RE = re.compile(rf"\b\d\s*{HYPH}\s*\d{{3}}\s*{HYPH}\s*\d{{10}}\s*{HYPH}\s*\d\b")
 
-# Líneas de saldos (Macro)
+# Líneas de saldos Macro (un solo importe en la línea)
 SALDO_ANT_PREFIX   = re.compile(r"^SALDO\s+U?LTIMO\s+EXTRACTO\s+AL", re.IGNORECASE)
 SALDO_FINAL_PREFIX = re.compile(r"^SALDO\s+FINAL\s+AL\s+D[ÍI]A",     re.IGNORECASE)
 
@@ -147,6 +147,10 @@ def extract_all_lines(file_like):
     return out
 
 # ---------- “Información de su/s Cuenta/s” (whitelist) ----------
+def _normalize_account_token(tok: str) -> str:
+    # normaliza todos los guiones “raros” y espacios a '-'
+    return re.sub(rf"\s*{HYPH}\s*", "-", tok)
+
 def macro_extract_account_whitelist(file_like) -> dict:
     info = {}
     all_lines = extract_all_lines(file_like)
@@ -176,10 +180,6 @@ def macro_extract_account_whitelist(file_like) -> dict:
                     break
     return info
 
-def _normalize_account_token(tok: str) -> str:
-    # normaliza todos los guiones “raros” y espacios a '-'
-    return re.sub(rf"\s*{HYPH}\s*", "-", tok)
-
 def _normalize_title_from_pending(pending_title: str) -> str:
     t = pending_title.upper()
     if "CORRIENTE" in t and "ESPECIAL" in t and ("DOLAR" in t or "DÓLAR" in t): return "CUENTA CORRIENTE ESPECIAL EN DOLARES"
@@ -188,13 +188,14 @@ def _normalize_title_from_pending(pending_title: str) -> str:
     if "CAJA DE AHORRO" in t:                                                  return "CAJA DE AHORRO"
     return "CUENTA"
 
-# ---------- Macro: segmentación por cuentas (ID = NÚMERO COMPLETO) ----------
+# ---------- Macro: segmentación por cuentas (ID = número completo) ----------
 def macro_split_account_blocks(file_like):
     """
     Detecta bloques por cuenta con:
-      - 'CUENTA …' + 'NRO' (misma o siguientes 3 líneas) + número X-XXX-XXXXXXXXXX-X
+      - 'CUENTA …' + 'NRO' (misma o siguientes 12 líneas) + número X-XXX-XXXXXXXXXX-X
+      - o número en la MISMA LÍNEA DEL TÍTULO
       - Fallback: si existe whitelist, primera aparición del token crea bloque
-    ID = número de cuenta completo
+    ID = número de cuenta completo (X-XXX-XXXXXXXXXX-X)
     """
     whitelist = macro_extract_account_whitelist(file_like)
     white_set = set(whitelist.keys())
@@ -203,7 +204,7 @@ def macro_split_account_blocks(file_like):
     accounts, order = {}, []
     current_nro = None
     pending_title = None
-    expect_token_in = 0  # contador: esperamos token en las próximas N líneas
+    expect_token_in = 0  # N líneas por delante en las que acepto el token
 
     def open_block(nro: str, pi: int, titulo_hint: str | None):
         nonlocal accounts, order, current_nro
@@ -222,39 +223,31 @@ def macro_split_account_blocks(file_like):
         m_title = RE_MACRO_ACC_START.match(ln)
         if m_title:
             pending_title = "CUENTA " + m_title.group(1).strip()
-            expect_token_in = 0
+            expect_token_in = 12  # ventana amplia
+            # Si en la misma línea está NRO + token, lo tomo ya
+            m_same_line = RE_MACRO_ACC_NRO.search(ln) or ACCOUNT_TOKEN_RE.search(ln)
+            if m_same_line:
+                nro = _normalize_account_token(m_same_line.group(1) if m_same_line.re is RE_MACRO_ACC_NRO else m_same_line.group(0))
+                if (not white_set) or (nro in white_set):
+                    open_block(nro, pi, pending_title)
+                    pending_title = None
+                    expect_token_in = 0
             continue
 
-        # 2) Tras un título, intento capturar NRO + token (misma línea)
-        if pending_title:
-            m_same = RE_MACRO_ACC_NRO.search(ln)
-            if m_same:
-                nro = _normalize_account_token(m_same.group(1))
-                if (not white_set) or (nro in white_set):
-                    open_block(nro, pi, pending_title)
-                pending_title = None
-                expect_token_in = 0
-                continue
-
-            # ¿aparece la palabra NRO? entonces espero token en próximas 3 líneas
-            if RE_HAS_NRO.search(ln):
-                expect_token_in = 3
-                continue
-
-            # ¿aparece ya el token en esta misma línea sin “NRO”?
-            m_tok = ACCOUNT_TOKEN_RE.search(ln)
-            if m_tok:
-                nro = _normalize_account_token(m_tok.group(0))
-                if (not white_set) or (nro in white_set):
-                    open_block(nro, pi, pending_title)
-                pending_title = None
-                expect_token_in = 0
-                continue
-
-        # 3) Si vimos “NRO” antes, acepto token en las próximas 3 líneas
-        if expect_token_in > 0:
-            m_tok = ACCOUNT_TOKEN_RE.search(ln)
+        # 2) Si venía título, busco token (con o sin “NRO”) en ventana
+        if pending_title and expect_token_in > 0:
             expect_token_in -= 1
+            # NRO + token en misma línea
+            m_nro = RE_MACRO_ACC_NRO.search(ln)
+            if m_nro:
+                nro = _normalize_account_token(m_nro.group(1))
+                if (not white_set) or (nro in white_set):
+                    open_block(nro, pi, pending_title)
+                pending_title = None
+                expect_token_in = 0
+                continue
+            # token solo
+            m_tok = ACCOUNT_TOKEN_RE.search(ln)
             if m_tok:
                 nro = _normalize_account_token(m_tok.group(0))
                 if (not white_set) or (nro in white_set):
@@ -262,8 +255,12 @@ def macro_split_account_blocks(file_like):
                 pending_title = None
                 expect_token_in = 0
                 continue
+            # si aparece la palabra NRO, mantengo la ventana abierta
+            if RE_HAS_NRO.search(ln):
+                expect_token_in = max(expect_token_in, 12)
+                continue
 
-        # 4) Fallback: si hay whitelist y aparece un token whitelisted, abro bloque
+        # 3) Fallback: si hay whitelist y aparece un token whitelisted, abro bloque
         if (not pending_title) and white_set:
             m_fallback = ACCOUNT_TOKEN_RE.search(ln)
             if m_fallback:
@@ -271,7 +268,7 @@ def macro_split_account_blocks(file_like):
                 if nro in white_set and current_nro != nro:
                     open_block(nro, pi, None)
 
-        # 5) Acumular líneas dentro del bloque activo
+        # 4) Acumular líneas dentro del bloque activo
         if current_nro is not None:
             acc = accounts[current_nro]
             acc["lines"].append(ln)
@@ -488,7 +485,15 @@ def render_account_report(banco_slug: str, account_title: str, account_number: s
     with c4: st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final_visto)}")
     with c5: st.metric("Saldo final calculado", f"$ {fmt_ar(saldo_final_calculado)}")
     with c6: st.metric("Diferencia", f"$ {fmt_ar(diferencia)}")
-    st.success("Conciliado.") if cuadra else st.error("No cuadra la conciliación.")
+
+    try:
+        if cuadra:
+            st.success("Conciliado.")
+        else:
+            st.error("No cuadra la conciliación.")
+    except Exception:
+        st.write("Conciliación:", "OK" if cuadra else "No cuadra")
+
     if pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
