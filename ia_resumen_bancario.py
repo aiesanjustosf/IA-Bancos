@@ -1120,6 +1120,3 @@ else:
     # Desconocido: procesar genérico
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
-
-
-
