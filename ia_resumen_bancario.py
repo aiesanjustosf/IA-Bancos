@@ -91,7 +91,7 @@ CREDI_CBU_RE   = re.compile(r"CBU\s+de\s+su\s+cuenta:\s*([0-9]{7,9})\s*([0-9]{13
 CREDI_TITLE_RE = re.compile(r"^\s*Cuenta\s+.+?\s+Cta\.", re.IGNORECASE)
 SALDO_FINAL_AL_PREFIX = re.compile(r"^SALDO\s+AL\s+\d{1,2}/\d{2}/\d{2,4}", re.IGNORECASE)
 
-# Percepciones IVA RG 2408 explícitas (pedido)
+# Percepciones IVA RG 2408 explícitas
 RE_PERCEP_RG2408 = re.compile(r"PERCEPCI[ÓO]N\s+IVA\s+RG\.?\s*2408", re.IGNORECASE)
 
 # --- utils ---
@@ -120,8 +120,9 @@ def lines_from_text(page):
     txt = page.extract_text() or ""
     return [" ".join(l.split()) for l in txt.splitlines()]
 
+# === RESTAURADO: líneas como string (para Macro / Santa Fe / Nación) ===
 def lines_from_words(page, ytol=2.0):
-    words = page.extract_words(extra_attrs=["x0", "x1", "top"])
+    words = page.extract_words(extra_attrs=["x0", "top"])
     if not words:
         return []
     words.sort(key=lambda w: (round(w["top"]/ytol), w["x0"]))
@@ -131,19 +132,33 @@ def lines_from_words(page, ytol=2.0):
         if band is None or b == band:
             cur.append(w)
         else:
-            lines.append(cur)
+            lines.append(" ".join(x["text"] for x in cur))
             cur = [w]
         band = b
     if cur:
-        lines.append(cur)
-    # devolvemos lista de dicts por línea
+        lines.append(" ".join(x["text"] for x in cur))
+    return [" ".join(l.split()) for l in lines]
+
+# === SOLO CREDICOOP: líneas XY (lista de palabras con x0/x1/top) ===
+def credicoop_lines_words_xy(page, ytol=2.0):
+    words = page.extract_words(extra_attrs=["x0", "x1", "top"])
+    if not words:
+        return []
+    groups = {}
+    for w in words:
+        band = round(w["top"]/ytol)
+        groups.setdefault(band, []).append(w)
     out = []
-    for ln in lines:
-        out.append(ln)
+    for band in sorted(groups.keys()):
+        out.append(sorted(groups[band], key=lambda x: x["x0"]))
     return out
 
 def text_join(words_line: List[dict]) -> str:
     return " ".join(w["text"] for w in words_line)
+
+SPACED_CAPS_RE = re.compile(r'((?:[A-ZÁÉÍÓÚÜÑ]\s)+[A-ZÁÉÍÓÚÜÑ])')
+def _unspread_caps(s: str) -> str:
+    return SPACED_CAPS_RE.sub(lambda m: m.group(0).replace(" ", ""), s)
 
 def normalize_desc(desc: str) -> str:
     if not desc:
@@ -196,7 +211,7 @@ def extract_all_lines(file_like):
                     out.append((pi, s))
     return out
 
-# ---------- Helper Macro (igual que antes) ----------
+# ---------- Helper Macro ----------
 def _normalize_account_token(tok: str) -> str:
     return re.sub(rf"\s*{HYPH}\s*", "-", tok)
 
@@ -237,7 +252,7 @@ def _normalize_title_from_pending(pending_title: str) -> str:
     if "CAJA DE AHORRO" in t:                                                  return "CAJA DE AHORRO"
     return "CUENTA"
 
-# ---------- Macro: segmentación por cuentas (igual que antes) ----------
+# ---------- Macro: segmentación por cuentas ----------
 def macro_split_account_blocks(file_like):
     whitelist = macro_extract_account_whitelist(file_like)
     white_set = set(whitelist.keys())
@@ -347,7 +362,7 @@ def parse_lines(lines) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
-# ---------- Saldos (genéricos + Credicoop SALDO AL / SALDO ANTERIOR) ----------
+# ---------- Saldos ----------
 def _only_one_amount(line: str) -> bool:
     return len(list(MONEY_RE.finditer(line))) == 1
 
@@ -501,215 +516,131 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if deb and deb != 0: return "Débito"
     return "Otros"
 
-# ---------- Credicoop: parser por coordenadas (sin depender del saldo impreso) ----------
-SPACED_CAPS_RE = re.compile(r'((?:[A-ZÁÉÍÓÚÜÑ]\s)+[A-ZÁÉÍÓÚÜÑ])')
-def _unspread_caps(s: str) -> str:
-    return SPACED_CAPS_RE.sub(lambda m: m.group(0).replace(" ", ""), s)
+# ---------- Credicoop: parser por XY (encapsulado) ----------
+_MONEY_CH = set("0123456789.,-")
+_MONEY_RE_CRED = re.compile(r'(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2}-?')
 
-CREDI_SECTION_HINTS = ("TRANSFERENCIAS", "PAGOS", "ACREDITACIONES", "RESUMEN", "TOTALES")
+def _parse_credicoop_line(tokens: list[str]):
+    joined = "".join(tokens)
+    m = re.match(r'^(\d{2}/\d{2}/\d{2})', joined)
+    if not m:
+        return None
+    fecha = m.group(1)
+    rest = joined[m.end():]
+    mcomb = re.match(r'(\d{4,7})', rest)
+    combte = mcomb.group(1) if mcomb else None
+    i = len(tokens) - 1
+    tail = []
+    while i >= 0 and tokens[i] in _MONEY_CH:
+        tail.append(tokens[i]); i -= 1
+    if not tail:
+        return None
+    importe_str = "".join(reversed(tail))
+    if not _MONEY_RE_CRED.fullmatch(importe_str):
+        return None
+    desc = "".join(tokens[:i+1])
+    desc = desc[m.end():]
+    if combte:
+        desc = desc[len(combte):]
+    return fecha, combte, desc.strip(), importe_str
 
-def _is_header_or_section_text(txt: str) -> bool:
-    U = _unspread_caps(txt.upper())
-    # Encabezado típico: FECHA COMBTE DESCRIPCION DEBITO CREDITO SALDO
-    if ("FECHA" in U and "DESCRIP" in U and ("DEBITO" in U or "DÉBITO" in U) and "CREDITO" in U and "SALDO" in U):
-        return True
-    # Secciones sin importes
-    if any(h in U for h in CREDI_SECTION_HINTS):
-        if not DATE_RE.search(U) and len(list(MONEY_RE.finditer(U))) == 0:
-            return True
-    return False
-
-def _cluster_centers(xs: List[float], tol: float = 25.0) -> List[float]:
-    """Agrupa posiciones X por cercanía y devuelve centros (medianas) ordenados."""
-    xs = sorted(xs)
-    if not xs:
-        return []
-    clusters = [[xs[0]]]
-    for x in xs[1:]:
-        if abs(x - clusters[-1][-1]) <= tol:
-            clusters[-1].append(x)
-        else:
-            clusters.append([x])
-    centers = [float(np.median(c)) for c in clusters]
-    return centers
-
-def _pick_three_columns(all_amount_x: List[float]) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    """
-    Devuelve (x_debito, x_credito, x_saldo) asumiendo orden visual: DEBITO < CREDITO < SALDO.
-    Si hay menos de 3 clusters, completa con None.
-    """
-    centers = _cluster_centers(all_amount_x, tol=25.0)
-    centers = sorted(centers)
-    if len(centers) >= 3:
-        return centers[-3], centers[-2], centers[-1]
-    if len(centers) == 2:
-        return centers[0], centers[1], None
-    if len(centers) == 1:
-        return centers[0], None, None
-    return None, None, None
+def _normalize_money_ar(tok: str) -> float:
+    if not tok: return np.nan
+    tok = tok.strip().replace("−","-")
+    neg = tok.endswith("-")
+    tok = tok.rstrip("-")
+    if "," not in tok: return np.nan
+    main, frac = tok.rsplit(",", 1)
+    main = main.replace(".","").replace(" ","")
+    try:
+        val = float(f"{main}.{frac}")
+        return -val if neg else val
+    except Exception:
+        return np.nan
 
 def credicoop_extract_meta(file_like):
     txt = _text_from_pdf(file_like)
-    title = None
-    acc = None
-    cbu = None
+    title = None; acc = None; cbu = None
     for line in (txt or "").splitlines():
         if CREDI_TITLE_RE.search(line or ""):
-            title = " ".join(line.strip().split())
-            break
+            title = " ".join(line.strip().split()); break
     macc = CREDI_ACC_RE.search(txt or "")
-    if macc:
-        acc = macc.group(1).strip()
-    mcb = CREDI_CBU_RE.search(txt or "")
-    if mcb:
-        cbu = (mcb.group(1) + mcb.group(2)).replace(" ", "")
+    if macc: acc = macc.group(1).strip()
+    mcb  = CREDI_CBU_RE.search(txt or "")
+    if mcb: cbu = (mcb.group(1) + mcb.group(2)).replace(" ","")
     return {"title": title or "CUENTA (Credicoop)", "account_number": acc, "cbu": cbu}
 
-def credicoop_parse_records_xy(file_like) -> tuple[pd.DataFrame, Optional[pd.Timestamp], Optional[float], Optional[float]]:
-    """
-    Lee por coordenadas:
-    - identifica columnas DEBITO/CREDITO/SALDO por X,
-    - 1 fecha = inicio de movimiento, líneas siguientes = continuación de descripción,
-    - saldo se GENERA a partir de 'SALDO ANTERIOR' (si no está, queda NaN y no concilia).
-    Devuelve: (df, fecha_cierre_pdf, saldo_final_impreso, saldo_anterior_impreso)
-    """
+def credicoop_parse_records_xy(file_like):
     fecha_cierre_pdf = None
     saldo_final_impreso = None
     saldo_anterior_impreso = None
 
+    all_text_lines = []
+    rows = []
+
     with pdfplumber.open(file_like) as pdf:
-        # 1) juntar palabras por página
-        pages_words = []
-        all_amount_x = []
-        all_text_lines = []  # para buscar SALDO AL y SALDO ANTERIOR
         for p in pdf.pages:
-            words = p.extract_words(extra_attrs=["x0", "x1", "top"])
-            # construir líneas por top
-            lines = lines_from_words(p, ytol=2.0)
-            pages_words.append(lines)
-            # para clustering de columnas: x0 de montos en cada línea
-            for ln in lines:
-                txt = text_join(ln)
-                all_text_lines.append(" ".join(_unspread_caps(txt).split()))
-                for w in ln:
-                    if MONEY_RE.fullmatch(w["text"]):
-                        all_amount_x.append((w["x0"] + w["x1"]) / 2.0)
-
-        # 2) columnas por X (orden: debito < credito < saldo)
-        xs = [x for x in (pos for pos in (x for x in [c for c in [xx for xx in [xx for xx in []]]]))]  # dummy no usado
-        x_deb, x_cre, x_saldo = _pick_three_columns([x for x in all_amount_x])
-
-        # 3) “SALDO AL …” (cierre) y “SALDO ANTERIOR” para apertura
-        #    -> buscamos en los textos planos para no pelear con coordenadas
-        fecha_cierre_pdf, saldo_final_impreso = find_saldo_final_from_lines(all_text_lines)
-        saldo_anterior_impreso = find_saldo_anterior_from_lines(all_text_lines)
-        saldo_anterior_val = float(saldo_anterior_impreso) if saldo_anterior_impreso is not None and not np.isnan(saldo_anterior_impreso) else None
-
-        # 4) parse por “fecha = inicio”
-        rows = []
-        current = None
-
-        def flush():
-            nonlocal current, rows
-            if current:
-                current["fecha"] = pd.to_datetime(current.get("fecha"), dayfirst=True, errors="coerce")
-                current["orden"] = len(rows) + 1
-                rows.append(current)
-                current = None
-
-        # tolerancia para asignar a columna
-        def which_col(xmid: float) -> str | None:
-            cand = []
-            if x_deb is not None:
-                cand.append(("debito", abs(xmid - x_deb)))
-            if x_cre is not None:
-                cand.append(("credito", abs(xmid - x_cre)))
-            if x_saldo is not None:
-                cand.append(("saldo", abs(xmid - x_saldo)))
-            if not cand:
-                return None
-            cand.sort(key=lambda t: t[1])
-            # Si se fue demasiado lejos, lo ignoramos
-            if cand[0][1] > 60.0:
-                return None
-            return cand[0][0]
-
-        for lines in pages_words:
-            for ln in lines:
-                txt = " ".join(_unspread_caps(w["text"]) for w in ln)
-                txt_norm = " ".join(txt.split())
-                if _is_header_or_section_text(txt_norm):
+            for ln_words in credicoop_lines_words_xy(p, ytol=2.0):
+                compact = _unspread_caps(" ".join(w["text"] for w in ln_words))
+                compact = " ".join(compact.split())
+                if ("FECHA" in compact and "DESCRIP" in compact and "DEBITO" in compact and "CREDITO" in compact):
+                    continue
+                if any(k in compact for k in ("TRANSFERENCIAS","PAGOS","ACREDITACIONES","RESUMEN","TOTALES")) \
+                   and not DATE_RE.search(compact):
                     continue
 
-                # ¿Fecha al inicio? => arranca registro
-                mdate = re.match(r"^\s*(\d{1,2}/\d{2}/\d{2,4})\b", txt_norm)
-                if mdate:
-                    flush()
-                    current = {"fecha": mdate.group(1), "combte": None, "descripcion": "", "debito": 0.0, "credito": 0.0, "saldo_impreso": np.nan}
-                    # COMBTE inmediato (4-6 dígitos) si aparece tras la fecha
-                    rest = txt_norm[mdate.end():].lstrip()
-                    mcomb = re.match(r"^(\d{4,6})\b", rest)
-                    if mcomb:
-                        current["combte"] = mcomb.group(1)
+                tokens = [w["text"] for w in ln_words]
+                parsed = _parse_credicoop_line(tokens)
+                if parsed:
+                    fecha, combte, desc, importe_str = parsed
+                    importe = float(_normalize_money_ar(importe_str))
 
-                    # Recolectar importes por columna y armar descripción sin colas de importes
-                    # Encontramos todos los montos de la línea con su x
-                    amounts_on_line = []
-                    for w in ln:
-                        if MONEY_RE.fullmatch(w["text"]):
-                            xmid = (w["x0"] + w["x1"]) / 2.0
-                            col = which_col(xmid)
-                            val = normalize_money(w["text"])
-                            amounts_on_line.append((col, val, w["x0"]))
-                    # asignar
-                    for col, val, _ in amounts_on_line:
-                        if col == "debito" and val is not None and not np.isnan(val):
-                            current["debito"] = float(abs(val))  # siempre positivo; signo se maneja al calcular saldo
-                        elif col == "credito" and val is not None and not np.isnan(val):
-                            current["credito"] = float(abs(val))
-                        elif col == "saldo" and val is not None and not np.isnan(val):
-                            current["saldo_impreso"] = float(val)
+                    U = desc.upper().replace(" ", "")
+                    debit_kw  = ("COMPRA","DEBITOINMEDIATO","DEBIN","IMPUESTO","IVA","COMISION","SERVICIO","SEGURO","PAGO",
+                                 "TRANSF.INMEDIATAE/CTAS.DISTTIT.O/BCO","TRANSFERENCIAE/CTAS.DIST","ARCA","AFIP")
+                    credit_kw = ("TRANSFERENCIASRECIBIDAS","TRANSF.RECIB","ACREDIT","DEPOSITO","CREDITO","CRÉDITO")
 
-                    # descripción = línea sin los importes del final (tomamos texto crudo)
-                    # Heurística simple: quitamos tokens que son montos
-                    desc_tokens = [w["text"] for w in ln if not MONEY_RE.fullmatch(w["text"])]
-                    current["descripcion"] = " ".join(desc_tokens).strip()
+                    if any(k in U for k in credit_kw):
+                        debito, credito = 0.0, importe
+                    elif any(k in U for k in debit_kw):
+                        debito, credito = importe, 0.0
+                    else:
+                        debito, credito = importe, 0.0
 
-                else:
-                    # Línea de continuación: se agrega a la descripción
-                    if current:
-                        current["descripcion"] = (current["descripcion"] + " " + txt_norm).strip()
+                    rows.append({
+                        "fecha": pd.to_datetime(fecha, format="%d/%m/%y", errors="coerce"),
+                        "combte": combte,
+                        "descripcion": desc,
+                        "debito": debito,
+                        "credito": credito,
+                        "importe": importe,
+                    })
 
-        flush()
-        df = pd.DataFrame(rows)
+                all_text_lines.append(" ".join("".join(w["text"] for w in ln_words).split()))
 
-    # Limpieza y generación de saldo
+    fecha_cierre_pdf, saldo_final_impreso = find_saldo_final_from_lines(all_text_lines)
+    saldo_anterior_impreso = find_saldo_anterior_from_lines(all_text_lines)
+
+    df = pd.DataFrame(rows)
     if df.empty:
-        return pd.DataFrame(columns=["fecha","combte","descripcion","debito","credito","saldo","saldo_impreso","orden"]), fecha_cierre_pdf, saldo_final_impreso, saldo_anterior_impreso
+        return df, fecha_cierre_pdf, saldo_final_impreso, saldo_anterior_impreso
 
     df["descripcion"] = df["descripcion"].str.replace(r"\s+", " ", regex=True).str.strip()
-    df["desc_norm"] = df["descripcion"].map(normalize_desc)
+    df["desc_norm"]   = df["descripcion"].map(normalize_desc)
+    df = df.sort_values(["fecha"]).reset_index(drop=True)
 
-    # Generar saldo: saldo[i] = saldo[i-1] + crédito[i] - débito[i]
-    if saldo_anterior_val is None:
-        # no hay saldo anterior => no conciliamos, pero generamos saldo relativo desde 0 para que se vea el correr
-        running = 0.0
-        saldos = []
-        for _, r in df.sort_values(["fecha","orden"]).iterrows():
-            running = running + float(r.get("credito",0.0)) - float(r.get("debito",0.0))
-            saldos.append(running)
-        df = df.sort_values(["fecha","orden"]).reset_index(drop=True)
-        df["saldo"] = saldos
-        df["_apertura_info"] = "Sin 'Saldo Anterior' en PDF"
+    if saldo_anterior_impreso is not None and not np.isnan(saldo_anterior_impreso):
+        running = float(saldo_anterior_impreso)
+        df["_apertura_info"] = f"Saldo anterior: {fmt_ar(running)}"
     else:
-        running = float(saldo_anterior_val)
-        saldos = []
-        for _, r in df.sort_values(["fecha","orden"]).iterrows():
-            running = running + float(r.get("credito",0.0)) - float(r.get("debito",0.0))
-            saldos.append(running)
-        df = df.sort_values(["fecha","orden"]).reset_index(drop=True)
-        df["saldo"] = saldos
-        df["_apertura_info"] = f"Saldo anterior: {fmt_ar(saldo_anterior_val)}"
+        running = 0.0
+        df["_apertura_info"] = "Sin 'Saldo Anterior' en PDF"
+
+    saldos = []
+    for _, r in df.iterrows():
+        running = running + float(r.get("credito",0.0)) - float(r.get("debito",0.0))
+        saldos.append(running)
+    df["saldo"] = saldos
 
     return df, fecha_cierre_pdf, saldo_final_impreso, saldo_anterior_impreso
 
@@ -732,23 +663,24 @@ def render_account_report_df(
         st.info("Sin movimientos.")
         return
 
-    # Orden + clasificación
-    df = df.sort_values(["fecha", "orden"]).reset_index(drop=True)
-    df["importe"] = df["debito"] * 1.0  # solo para mostrar; la “magnitud” del movimiento
+    df = df.sort_values(["fecha", "orden"] if "orden" in df.columns else ["fecha"]).reset_index(drop=True)
+    if "importe" not in df.columns:
+        df["importe"] = df["debito"].fillna(0.0)
+
     df["Clasificación"] = df.apply(
         lambda r: clasificar(str(r.get("descripcion","")), str(r.get("desc_norm","")), r.get("debito",0.0), r.get("credito",0.0)),
         axis=1
     )
 
-    # Totales y conciliación
     total_debitos = float(df["debito"].sum())
     total_creditos = float(df["credito"].sum())
 
-    # Saldo inicial = 'Saldo Anterior' si existe
     if saldo_anterior_pdf is not None and not np.isnan(saldo_anterior_pdf):
         saldo_inicial = float(saldo_anterior_pdf)
     else:
-        saldo_inicial = float(df["saldo"].iloc[0] - df["credito"].iloc[0] + df["debito"].iloc[0])  # fallback aproximado
+        # aproximado si no vino el saldo anterior
+        saldo_inicial = float((df["saldo"].iloc[0] if "saldo" in df.columns else 0.0)
+                              - df["credito"].iloc[0] + df["debito"].iloc[0])
 
     saldo_final_calculado = float(saldo_inicial + total_creditos - total_debitos)
     if saldo_final_pdf is not None and not np.isnan(saldo_final_pdf):
@@ -756,11 +688,10 @@ def render_account_report_df(
         diferencia = saldo_final_calculado - saldo_final_visto
         cuadra = abs(diferencia) < 0.01
     else:
-        saldo_final_visto = float(df["saldo"].iloc[-1])
+        saldo_final_visto = float(df["saldo"].iloc[-1]) if "saldo" in df.columns else saldo_final_calculado
         diferencia = 0.0
-        cuadra = True  # no tenemos contra qué comparar
+        cuadra = True
 
-    # Resumen visual
     st.caption("Resumen del período")
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("Saldo inicial", f"$ {fmt_ar(saldo_inicial)}")
@@ -806,11 +737,13 @@ def render_account_report_df(
 
     # Tabla
     st.caption("Detalle de movimientos")
-    show_cols = ["fecha","combte","descripcion","debito","credito","saldo","saldo_impreso","Clasificación"]
+    show_cols = ["fecha","combte","descripcion","debito","credito","saldo","Clasificación"]
+    if "saldo_impreso" in df.columns:
+        show_cols.insert(6, "saldo_impreso")
     for c in show_cols:
         if c not in df.columns:
             df[c] = np.nan
-    styled = df[show_cols].style.format({c: fmt_ar for c in ["debito","credito","saldo","saldo_impreso"]}, na_rep="—")
+    styled = df[show_cols].style.format({c: fmt_ar for c in ["debito","credito","saldo","saldo_impreso"] if c in df.columns}, na_rep="—")
     st.dataframe(styled, use_container_width=True)
 
     # Descargas
@@ -1062,4 +995,5 @@ else:
     fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(all_lines)
     df = parse_lines(all_lines)
     render_account_report_df(_bank_slug, "CUENTA", "s/n", "generica-unica", df, fecha_cierre, saldo_final_pdf)
+
 
