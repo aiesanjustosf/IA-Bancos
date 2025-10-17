@@ -3,6 +3,8 @@
 
 import io, re
 from pathlib import Path
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -485,28 +487,26 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if deb and deb != 0: return "Débito"
     return "Otros"
 
-# ---------- RENDER a partir de DF (nuevo helper para Credicoop) ----------
+# ---------- RENDER a partir de DF (usado por Credicoop y demás) ----------
 def render_account_report_df(
     banco_slug: str,
     account_title: str,
     account_number: str,
     acc_id: str,
     df: pd.DataFrame,
-    fecha_cierre: pd.Timestamp | pd.NaT,
-    saldo_final_pdf: float | float,
+    fecha_cierre: Optional[pd.Timestamp],
+    saldo_final_pdf: Optional[float],
     bna_extras: dict | None = None
 ):
     st.markdown("---")
     st.subheader(f"{account_title} · Nro {account_number}")
 
-    saldo_anterior = df["saldo"].iloc[0] if not df.empty else np.nan
-
-    # Sin movimientos (solo saldo)
+    # Sin movimientos
     if df.empty:
-        total_debitos = 0.0
-        total_creditos = 0.0
+        saldo_anterior = np.nan
+        total_debitos = total_creditos = 0.0
         saldo_inicial = 0.0 if np.isnan(saldo_anterior) else float(saldo_anterior)
-        saldo_final_visto = saldo_inicial if np.isnan(saldo_final_pdf) else float(saldo_final_pdf)
+        saldo_final_visto = saldo_inicial if saldo_final_pdf is None or np.isnan(saldo_final_pdf) else float(saldo_final_pdf)
         saldo_final_calculado = saldo_inicial + total_creditos - total_debitos
         diferencia = saldo_final_calculado - saldo_final_visto
         cuadra = abs(diferencia) < 0.01
@@ -535,7 +535,8 @@ def render_account_report_df(
     df["debito"]  = np.where(df["delta_saldo"] < 0, -df["delta_saldo"], 0.0)
     df["credito"] = np.where(df["delta_saldo"] > 0,  df["delta_saldo"], 0.0)
     df["importe"] = df["debito"] - df["credito"]
-    df["desc_norm"] = df["descripcion"].map(normalize_desc)
+    if "desc_norm" not in df.columns:
+        df["desc_norm"] = df["descripcion"].map(normalize_desc)
 
     # Clasificación
     df["Clasificación"] = df.apply(
@@ -544,11 +545,14 @@ def render_account_report_df(
     )
 
     # Totales / conciliación
-    df_sorted = df.drop(columns=["orden"]).reset_index(drop=True)
+    df_sorted = df.reset_index(drop=True)
     saldo_inicial = float(df_sorted.loc[0, "saldo"])
     total_debitos = float(df_sorted["debito"].sum())
     total_creditos = float(df_sorted["credito"].sum())
-    saldo_final_visto = float(df_sorted["saldo"].iloc[-1]) if np.isnan(saldo_final_pdf) else float(saldo_final_pdf)
+    if saldo_final_pdf is None or np.isnan(saldo_final_pdf):
+        saldo_final_visto = float(df_sorted["saldo"].iloc[-1])
+    else:
+        saldo_final_visto = float(saldo_final_pdf)
     saldo_final_calculado = saldo_inicial + total_creditos - total_debitos
     diferencia = saldo_final_calculado - saldo_final_visto
     cuadra = abs(diferencia) < 0.01
@@ -663,6 +667,7 @@ def render_account_report_df(
             elems = []
             elems.append(Paragraph("Resumen Operativo: Registración Módulo IVA", styles["Title"]))
             elems.append(Spacer(1, 8))
+            total_operativo = net21 + iva21 + net105 + iva105 + percep_iva + ley_25413 + sircreb + intereses_bna + comision_bna + sellados_bna + iva_base_bna + seguro_bna
             datos = [
                 ["Concepto", "Importe"],
                 ["Neto Comisiones 21%",  fmt_ar(net21)],
@@ -683,8 +688,7 @@ def render_account_report_df(
                     ["I.V.A. BASE (BNA)", fmt_ar(iva_base_bna)],
                     ["Seguro de vida",    fmt_ar(seguro_bna)],
                 ])
-            datos.append(["TOTAL", fmt_ar(net21 + iva21 + net105 + iva105 + percep_iva + ley_25413 + sircreb +
-                                          intereses_bna + comision_bna + sellados_bna + iva_base_bna + seguro_bna)])
+            datos.append(["TOTAL", fmt_ar(total_operativo)])
             tbl = Table(datos, colWidths=[300, 120])
             tbl.setStyle(TableStyle([
                 ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
@@ -758,7 +762,6 @@ SPACED_CAPS_RE = re.compile(r'((?:[A-ZÁÉÍÓÚÜÑ]\s)+[A-ZÁÉÍÓÚÜÑ])')
 def _unspread_caps(s: str) -> str:
     return SPACED_CAPS_RE.sub(lambda m: m.group(0).replace(" ", ""), s)
 
-CREDI_HEADER_HINTS = ("FECHA", "COMBTE", "DESCRIPCIÓN", "DESCRIPCION", "DEBITO", "CRÉDITO", "CREDITO", "SALDO")
 CREDI_SECTION_HINTS = ("TRANSFERENCIAS", "PAGOS", "ACREDITACIONES", "RESUMEN", "TOTALES")
 
 def _is_header_or_section(line: str) -> bool:
@@ -766,8 +769,6 @@ def _is_header_or_section(line: str) -> bool:
     if all(h in U for h in ("FECHA","DESCRIP", "SALDO")):
         return True
     if any(h in U for h in CREDI_SECTION_HINTS):
-        # Evitar cortar descripciones reales con la palabra "PAGOS ..." etc.
-        # Definimos encabezado si NO contiene fecha ni montos
         if not DATE_RE.search(U) and len(list(MONEY_RE.finditer(U))) == 0:
             return True
     return False
@@ -790,7 +791,7 @@ def credicoop_extract_meta(file_like):
     return {"title": title or "CUENTA (Credicoop)", "account_number": acc, "cbu": cbu}
 
 def credicoop_extract_lines(file_like):
-    """Lineas ya normalizadas para Credicoop: colapso de encabezados espaciados y filtro de ruidos."""
+    """Líneas normalizadas: colapso de encabezados espaciados y filtro de ruidos."""
     out = []
     with pdfplumber.open(file_like) as pdf:
         for pi, p in enumerate(pdf.pages, start=1):
@@ -807,22 +808,21 @@ def credicoop_extract_lines(file_like):
                 out.append((pi, s))
     return out
 
-def credicoop_parse_records(file_like) -> tuple[pd.DataFrame, pd.Timestamp, float]:
-    """Devuelve DF con columnas: fecha, descripcion, saldo, orden (y opcionalmente combte, importe_linea).
-       También devuelve (fecha_cierre_pdf, saldo_final_pdf) si se encuentra 'SALDO AL dd/mm/aa'.
+def credicoop_parse_records(file_like) -> tuple[pd.DataFrame, Optional[pd.Timestamp], Optional[float]]:
+    """
+    Devuelve DF con columnas: fecha, combte, descripcion, saldo, importe_linea, desc_norm, orden.
+    Además devuelve (fecha_cierre_pdf, saldo_final_pdf) si se encuentra 'SALDO AL dd/mm/aa'.
     """
     lines = [l for _, l in credicoop_extract_lines(file_like)]
     # Buscar 'SALDO AL dd/mm/aa'
     fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(lines)
 
     rows = []
-    seq = 0
     cur = None  # registro en construcción
 
     def flush():
         nonlocal cur, rows
         if cur:
-            # completar tipos
             cur["fecha"] = pd.to_datetime(cur.get("fecha"), dayfirst=True, errors="coerce")
             cur["orden"] = len(rows) + 1
             rows.append(cur)
@@ -832,53 +832,45 @@ def credicoop_parse_records(file_like) -> tuple[pd.DataFrame, pd.Timestamp, floa
         # ¿Inicia movimiento? => fecha al inicio
         mdate_start = re.match(r"^\s*(\d{1,2}/\d{2}/\d{2,4})\b", ln)
         if mdate_start:
-            # volcar el anterior
             flush()
             fecha = mdate_start.group(1)
 
-            # capturar COMBTE si el siguiente token es un entero de 4-6 dígitos
             rest = ln[mdate_start.end():].lstrip()
             mcombte = re.match(r"^(\d{4,6})\b", rest)
             combte = mcombte.group(1) if mcombte else None
-            desc_start = rest[mcombte.end():].strip() if mcombte else rest
 
-            # montos en la línea de inicio
+            # importes
             am = list(MONEY_RE.finditer(ln))
             saldo_line = normalize_money(am[-1].group(0)) if len(am) >= 1 else np.nan
             importe_linea = normalize_money(am[-2].group(0)) if len(am) >= 2 else 0.0
 
-            # descripción sin los importes del final
-            first_money = am[0].start() if am else len(ln)
-            desc = ln[mdate_start.end(): first_money].strip()
+            # descripción (sin los importes finales)
+            first_money_pos = am[0].start() if am else len(ln)
+            desc = ln[mdate_start.end(): first_money_pos].strip()
 
             cur = {
                 "fecha": fecha,
                 "combte": combte,
-                "descripcion": desc if desc else desc_start,
+                "descripcion": desc if desc else rest,
                 "saldo": saldo_line,
-                "importe_linea": importe_linea,  # referencial (no decide déb/cred)
+                "importe_linea": importe_linea,
             }
         else:
-            # línea de continuación: concatena a la descripción
+            # continuación de descripción
             if cur:
                 cur["descripcion"] = (cur.get("descripcion","") + " " + ln).strip()
-            else:
-                # línea suelta: ignorar (no debería ocurrir si PDF está prolijo)
-                pass
 
     flush()
 
     df = pd.DataFrame(rows)
     if not df.empty:
-        # limpieza final
         df["descripcion"] = df["descripcion"].str.replace(r"\s+", " ", regex=True).str.strip()
         df["desc_norm"] = df["descripcion"].map(normalize_desc)
-        if "importe_linea" not in df.columns:
-            df["importe_linea"] = 0.0
     else:
         df = pd.DataFrame(columns=["fecha","combte","descripcion","saldo","importe_linea","desc_norm","orden"])
 
-    return df, fecha_cierre, float(saldo_final_pdf) if not np.isnan(saldo_final_pdf) else np.nan
+    saldo_final_pdf_out = float(saldo_final_pdf) if saldo_final_pdf is not None and not np.isnan(saldo_final_pdf) else None
+    return df, fecha_cierre, saldo_final_pdf_out
 
 # ---------- UI principal ----------
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
@@ -923,17 +915,10 @@ if _bank_name == "Banco Macro":
     if not blocks:
         st.warning("No se detectaron encabezados de cuenta en Macro. Se intentará procesar todo el PDF (podría mezclar cuentas).")
         _lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
-        # Reutilizamos el render clásico
-        # (la lógica de Macro usa parse_lines y Δ de saldo)
-        def _render_generic():
-            fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(_lines)
-            # Emulamos render usando la función existente con líneas
-            # (para no duplicar lógica)
-            # Para no tocar el original, hacemos una copia inline
-            df = parse_lines(_lines)
-            render_account_report_df(_bank_slug, "CUENTA (PDF completo)", "s/n", "macro-pdf-completo",
-                                     df, fecha_cierre, saldo_final_pdf, bna_extras=None)
-        _render_generic()
+        fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(_lines)
+        df = parse_lines(_lines)
+        render_account_report_df(_bank_slug, "CUENTA (PDF completo)", "s/n", "macro-pdf-completo",
+                                 df, fecha_cierre, saldo_final_pdf, bna_extras=None)
     else:
         st.caption(f"Información de su/s Cuenta/s: {len(blocks)} cuenta(s) detectada(s).")
         for b in blocks:
@@ -1003,5 +988,3 @@ else:
     fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(all_lines)
     df = parse_lines(all_lines)
     render_account_report_df(_bank_slug, "CUENTA", "s/n", "generica-unica", df, fecha_cierre, saldo_final_pdf)
-
-
