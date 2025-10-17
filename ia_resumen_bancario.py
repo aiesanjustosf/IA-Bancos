@@ -79,8 +79,9 @@ BNA_GASTOS_RE = re.compile(
 # ---- NUEVO: Santa Fe - "SALDO ULTIMO RESUMEN" sin fecha ----
 SF_SALDO_ULT_RE = re.compile(r"SALDO\s+U?LTIMO\s+RESUMEN", re.IGNORECASE)
 
-# ---- NUEVO: CREDICOOP (solo hints para detectar) ----
+# ---- NUEVO: CREDICOOP (hints + 'SALDO AL ...') ----
 CREDICOOP_HINTS = ("BANCO CREDICOOP", "CREDICOOP COOPERATIVO", "IMPUESTO LEY 25.413", "I.V.A.", "CTA.")
+CREDICOOP_SALDO_AL_RE = re.compile(r"SALDO\s+AL\s+(\d{2}/\d{2}/\d{2,4})", re.IGNORECASE)
 
 # --- utils ---
 def _rewind(f):
@@ -575,18 +576,22 @@ def credicoop_parse_from_lines(file_like):
     saldo_anterior = np.nan
     fecha_cierre, saldo_final_pdf = pd.NaT, np.nan
 
-    # detectar saldos anterior/final
-    for ln in lines:
-        U = ln.upper()
-        if "SALDO ANTERIOR" in U and _only_one_amount(ln):
-            v = _first_amount_value(ln)
-            if not np.isnan(v): saldo_anterior = v
+    # detectar "SALDO AL ..." (pie del extracto)
     for ln in reversed(lines):
-        if SALDO_FINAL_PREFIX.match(ln) and _only_one_amount(ln):
-            d = DATE_RE.search(ln)
-            if d:
-                fecha_cierre = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
-                saldo_final_pdf = _first_amount_value(ln)
+        m_final = CREDICOOP_SALDO_AL_RE.search(ln)
+        if m_final:
+            fecha_cierre = pd.to_datetime(m_final.group(1), dayfirst=True, errors="coerce")
+            ams = list(MONEY_RE.finditer(ln))
+            if ams:
+                saldo_final_pdf = normalize_money(ams[-1].group(0))
+            break
+
+    # detectar "SALDO ANTERIOR" (si viniera con importe aislado)
+    for ln in lines:
+        if "SALDO ANTERIOR" in ln.upper() and _only_one_amount(ln):
+            v = _first_amount_value(ln)
+            if not np.isnan(v):
+                saldo_anterior = v
                 break
 
     # recorrer grilla
