@@ -515,7 +515,8 @@ def credicoop_extract_meta(file_like):
             title = " ".join(line.split()); break
     return {"title": title or "CUENTA (Credicoop)", "cbu": cbu, "account_number": acc}
 
-DATE_START = re.compile(r'^\s*(\d{1,2}/\d{2}/\d{4})\b')
+DATE_START = re.compile(r'^\s*(\d{1,2}/\d{2}/\d{2,4})\b')
+
 
 def credicoop_parse_from_lines(file_like):
     """
