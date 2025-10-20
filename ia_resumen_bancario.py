@@ -65,7 +65,12 @@ BNA_CUENTA_CBU_RE = re.compile(
     r"NRO\.\s*CUENTA\s+SUCURSAL\s+CLAVE\s+BANCARIA\s+UNIFORME\s+\(CBU\)\s*[\r\n]+(\d+)\s+\d+\s+(\d{22})",
     re.IGNORECASE
 )
-BNA_ACC_ONLY_RE = re.compile(r"NRO\.\s*CUENTA\s+SUCURSAL\s*[:\-]?\s*[\r\n ]+(\d{6,})", re.IGNORECASE)
+# Captura número de cuenta luego de "NRO. CUENTA SUCURSAL" (variante sin CBU en la misma caja)
+BNA_ACC_ONLY_RE = re.compile(
+    r"NRO\.\s*CUENTA\s+SUCURSAL\s*[:\-]?\s*[\r\n ]+(\d{6,})",
+    re.IGNORECASE
+)
+# Bloque de gastos finales post “SALDO FINAL”
 BNA_GASTOS_RE = re.compile(
     r"-\s*(INTERESES|COMISION|SELLADOS|I\.V\.A\.?\s*BASE|SEGURO\s+DE\s+VIDA)\s*\$\s*([0-9\.\s]+,\d{2})",
     re.IGNORECASE
@@ -74,13 +79,15 @@ BNA_GASTOS_RE = re.compile(
 # ---- NUEVO: Santa Fe - "SALDO ULTIMO RESUMEN" sin fecha ----
 SF_SALDO_ULT_RE = re.compile(r"SALDO\s+U?LTIMO\s+RESUMEN", re.IGNORECASE)
 
-# ---- NUEVO: CREDICOOP (solo hints para detectar) ----
-CREDICOOP_HINTS = ("BANCO CREDICOOP", "CREDICOOP COOPERATIVO", "IMPUESTO LEY 25.413", "I.V.A.", "CTA.")
+# ---- NUEVO: CREDICOOP (hints) ----
+CREDICOOP_HINTS = ("BANCO CREDICOOP", "CREDICOOP COOPERATIVO", "IMPUESTO LEY 25.413", "I.V.A.", "CTA.", "SALDO AL")
 
 # --- utils ---
 def _rewind(f):
-    try: f.seek(0)
-    except Exception: pass
+    try:
+        f.seek(0)
+    except Exception:
+        pass
     return f
 
 def normalize_money(tok: str) -> float:
@@ -334,12 +341,11 @@ def _first_amount_value(line: str) -> float:
     m = MONEY_RE.search(line)
     return normalize_money(m.group(0)) if m else np.nan
 
-# helper para Credicoop (descartar aclaraciones)
-DATE_START = re.compile(r'^\s*(\d{1,2}/\d{2}/\d{4})\b')
-def _has_money(s: str) -> bool:
-    return bool(MONEY_RE.search(s or ""))
+def _has_money(line: str) -> bool:
+    return bool(MONEY_RE.search(line or ""))
 
 def find_saldo_final_from_lines(lines):
+    # 1) Macro/otros con formato expreso
     for ln in reversed(lines):
         if SALDO_FINAL_PREFIX.match(ln):
             d = DATE_RE.search(ln)
@@ -348,6 +354,7 @@ def find_saldo_final_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if pd.notna(fecha) and not np.isnan(saldo):
                     return fecha, saldo
+    # 2) BNA: "SALDO FINAL" sin fecha
     for ln in reversed(lines):
         if "SALDO FINAL" in ln.upper() and _only_one_amount(ln):
             saldo = _first_amount_value(ln)
@@ -356,6 +363,7 @@ def find_saldo_final_from_lines(lines):
     return pd.NaT, np.nan
 
 def find_saldo_anterior_from_lines(lines):
+    # 1) Macro (expreso con fecha)
     for ln in lines:
         if SALDO_ANT_PREFIX.match(ln):
             d = DATE_RE.search(ln)
@@ -363,12 +371,14 @@ def find_saldo_anterior_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if not np.isnan(saldo):
                     return saldo
+    # 2) Genérico
     for ln in lines:
         U = ln.upper()
         if "SALDO ANTERIOR" in U and _only_one_amount(ln):
             saldo = _first_amount_value(ln)
             if not np.isnan(saldo):
                 return saldo
+    # 3) Macro variantes
     for ln in lines:
         U = ln.upper()
         if "SALDO ULTIMO EXTRACTO" in U or "SALDO ÚLTIMO EXTRACTO" in U:
@@ -377,6 +387,7 @@ def find_saldo_anterior_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if not np.isnan(saldo):
                     return saldo
+    # 4) Santa Fe sin fecha
     for i, ln in enumerate(lines):
         if SF_SALDO_ULT_RE.search(ln):
             if _only_one_amount(ln):
@@ -403,16 +414,20 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     u = (desc or "").upper()
     n = (desc_norm or "").upper()
 
+    # Saldos
     if "SALDO ANTERIOR" in u or "SALDO ANTERIOR" in n:
         return "SALDO ANTERIOR"
 
+    # Impuesto a los débitos y créditos bancarios
     if ("LEY 25413" in u) or ("IMPTRANS" in u) or ("IMP.S/CREDS" in u) or ("IMPDBCR 25413" in u) or ("N/D DBCR 25413" in u) or \
        ("LEY 25413" in n) or ("IMPTRANS" in n) or ("IMP.S/CREDS" in n) or ("IMPDBCR 25413" in n) or ("N/D DBCR 25413" in n):
         return "LEY 25413"
 
+    # SIRCREB
     if ("SIRCREB" in u) or ("SIRCREB" in n):
         return "SIRCREB"
 
+    # Percepciones / Retenciones IVA (RG 3337 / RG 2408)
     if RE_PERCEP_RG2408.search(u) or RE_PERCEP_RG2408.search(n) or \
        ("IVA PERC" in u) or ("IVA PERCEP" in u) or ("RG3337" in u) or \
        ("IVA PERC" in n) or ("IVA PERCEP" in n) or ("RG3337" in n) or \
@@ -420,12 +435,16 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
        (("RETEN" in n or "RETENC" in n) and (("I.V.A" in n) or ("IVA" in n)) and (("RG.2408" in n) or ("RG 2408" in n) or ("RG2408" in n))):
         return "Percepciones de IVA"
 
-    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) or \
-       ("I.V.A" in u and "DÉBITO FISCAL" in u) or ("I.V.A" in n and "DEBITO FISCAL" in n):
+    # IVA sobre comisiones (incluye variantes Credicoop: "I.V.A. - Debito Fiscal 21%")
+    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or \
+       ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) or \
+       (("I.V.A" in u or "IVA" in u) and ("DEBITO FISCAL" in u or "DÉBITO FISCAL" in u)) or \
+       (("I.V.A" in n or "IVA" in n) and ("DEBITO FISCAL" in n or "DÉBITO FISCAL" in n)):
         if "10,5" in u or "10,5" in n or "10.5" in u or "10.5" in n:
             return "IVA 10,5% (sobre comisiones)"
         return "IVA 21% (sobre comisiones)"
 
+    # Plazo Fijo (según signo)
     if ("PLAZO FIJO" in u) or ("PLAZO FIJO" in n) or ("P.FIJO" in u) or ("P.FIJO" in n) or ("P FIJO" in u) or ("P FIJO" in n) or ("PFIJO" in u) or ("PFIJO" in n):
         if cre and cre != 0:
             return "Acreditación Plazo Fijo"
@@ -433,14 +452,17 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
             return "Débito Plazo Fijo"
         return "Plazo Fijo"
 
+    # Comisiones
     if ("MANTENIMIENTO MENSUAL PAQUETE" in u) or ("MANTENIMIENTO MENSUAL PAQUETE" in n) or \
        ("COMOPREM" in n) or ("COMVCAUT" in n) or ("COMTRSIT" in n) or ("COM.NEGO" in n) or ("CO.EXCESO" in n) or ("COM." in n) or \
        ("GASTOS" in u) or ("GASTOS" in n) or ("SERVICIO" in u) or ("SERVICIO" in n) or ("COMISION" in u) or ("COMISION" in n):
         return "Gastos por comisiones"
 
+    # Débitos automáticos / Seguros
     if ("DB-SNP" in n) or ("DEB.AUT" in n) or ("DEB.AUTOM" in n) or ("SEGUROS" in n) or ("GTOS SEG" in n) or ("DEBITO INMEDIATO" in u) or ("DEBIN" in u):
         return "Débito automático"
 
+    # Varias
     if "DYC" in n: return "DyC"
     if ("AFIP" in n or "ARCA" in n) and deb and deb != 0: return "Débitos ARCA"
     if "API" in n: return "API"
@@ -478,6 +500,7 @@ def santafe_extract_accounts(file_like):
             title = " ".join(m.group(1).split())
             nro   = m.group(2).strip()
             items.append({"title": title.title(), "nro": nro})
+    # quitar duplicados preservando orden
     seen = set()
     uniq = []
     for it in items:
@@ -501,9 +524,11 @@ def bna_extract_gastos_finales(txt: str) -> dict:
 def bna_extract_meta(file_like):
     txt = _text_from_pdf(file_like)
     acc = cbu = pstart = pend = None
+
     mper = BNA_PERIODO_RE.search(txt)
     if mper:
         pstart, pend = mper.group(1), mper.group(2)
+
     macc = BNA_CUENTA_CBU_RE.search(txt)
     if macc:
         acc, cbu = macc.group(1), macc.group(2)
@@ -511,9 +536,12 @@ def bna_extract_meta(file_like):
         monly = BNA_ACC_ONLY_RE.search(txt)
         if monly:
             acc = monly.group(1)
+
     return {"account_number": acc, "cbu": cbu, "period_start": pstart, "period_end": pend}
 
 # ---------- NUEVO: CREDICOOP — meta + parser por LÍNEAS ----------
+DATE_START = re.compile(r'^\s*(\d{1,2}/\d{2}/\d{4})\b')
+
 def credicoop_extract_meta(file_like):
     txt = _text_from_pdf(file_like)
     title = None; cbu = None; acc = None
@@ -530,12 +558,11 @@ def credicoop_parse_from_lines(file_like):
     """
     Parser robusto por líneas para Credicoop.
     - 1 fecha => 1 movimiento
+    - La descripción puede ocupar la siguiente línea
+    - Renglones sin fecha **y** sin importes = aclaraciones -> se descartan
     - El monto más a la derecha es SALDO (si está); si no, se reconstruye (crédito suma, débito resta)
-    - Discard: renglones 'aclaratorios' SIN fecha y SIN importes (no se agregan a la descripción)
-    - Si NO hay fecha pero SÍ hay importes => se adjunta a la descripción (cortes de línea raros)
     """
     lines = [l for _, l in extract_all_lines(_rewind(file_like))]
-
     rows = []
     last_idx = None
     saldo_anterior = np.nan
@@ -543,13 +570,10 @@ def credicoop_parse_from_lines(file_like):
 
     # detectar saldos anterior/final
     for ln in lines:
-        U = (ln or "").upper()
+        U = ln.upper()
         if "SALDO ANTERIOR" in U and _only_one_amount(ln):
             v = _first_amount_value(ln)
-            if not np.isnan(v):
-                saldo_anterior = v
-                break
-
+            if not np.isnan(v): saldo_anterior = v
     for ln in reversed(lines):
         if SALDO_FINAL_PREFIX.match(ln) and _only_one_amount(ln):
             d = DATE_RE.search(ln)
@@ -562,19 +586,19 @@ def credicoop_parse_from_lines(file_like):
     for ln in lines:
         m = DATE_START.match(ln)
         if m:
-            # Nueva fila de movimiento
+            # inicio de movimiento
             fecha = pd.to_datetime(m.group(1), dayfirst=True, errors="coerce")
-            tail = (ln[m.end():] or "").strip()
+            tail = ln[m.end():].strip()
 
-            # COMBTE (opcional) al principio
+            # COMBTE puede o no estar (3+ dígitos)
             m2 = re.match(r'^(\d{3,})?\s*(.*)$', tail)
             combte = (m2.group(1) or "").strip() if m2 else ""
             rem = (m2.group(2) if m2 else tail).strip()
 
-            # Importes (al final): [debito] [credito] [saldo]
             ams = list(MONEY_RE.finditer(rem))
             deb = cre = sal = np.nan
             desc = rem
+
             if len(ams) >= 3:
                 deb = normalize_money(ams[-3].group(0))
                 cre = normalize_money(ams[-2].group(0))
@@ -585,8 +609,12 @@ def credicoop_parse_from_lines(file_like):
                 cre = normalize_money(ams[-1].group(0))
                 desc = rem[:ams[-2].start()].strip()
             elif len(ams) == 1:
-                deb = normalize_money(ams[0].group(0))
-                desc = rem[:ams[0].start()].strip()
+                # corte raro: un solo importe en la línea (ej. débito o crédito)
+                # dejamos el saldo para reconstrucción y completamos importes si se detecta en línea siguiente
+                val = normalize_money(ams[-1].group(0))
+                # asumimos que si hay 1 importe y no es extremo derecho, es parte de deb/cre
+                deb = val; cre = 0.0
+                desc = rem[:ams[-1].start()].strip()
 
             rows.append({
                 "fecha": fecha,
@@ -596,49 +624,81 @@ def credicoop_parse_from_lines(file_like):
                 "credito": float(cre) if pd.notna(cre) else 0.0,
                 "saldo": float(sal) if pd.notna(sal) else np.nan,
             })
-            last_idx = len(rows) - 1
-
+            last_idx = len(rows)-1
         else:
-            # Línea de continuación o aclaración
-            if last_idx is None:
+            # continuación: si no hay fecha…
+            if not ln.strip():
                 continue
-            # SIN fecha y SIN importes => descartar (aclaración)
-            # SIN fecha pero CON importes => anexar a descripción
-            if not _has_money(ln):
+            # …y no hay importes -> aclaración => descartar
+            if not _has_money(ln) and not DATE_RE.search(ln):
                 continue
-            else:
-                rows[last_idx]["descripcion"] = (
-                    rows[last_idx]["descripcion"] + " " + ln.strip()
-                ).strip()
+            # …si hay importes pero no fecha -> anexar a la descripción y capturar importes si faltaban
+            if last_idx is not None:
+                cur = rows[last_idx]
+                cur_desc = cur.get("descripcion","").strip()
+                ams2 = list(MONEY_RE.finditer(ln))
+                if ams2:
+                    # si el movimiento previo no tenía importes completos, intentamos completar
+                    if (cur.get("debito",0.0) == 0.0 and cur.get("credito",0.0) == 0.0) or np.isnan(cur.get("saldo", np.nan)):
+                        # heurística: si hay 2 importes => deb/cre; si hay 3 => deb/cre/saldo
+                        if len(ams2) >= 3:
+                            cur["debito"] = normalize_money(ams2[-3].group(0))
+                            cur["credito"] = normalize_money(ams2[-2].group(0))
+                            cur["saldo"] = normalize_money(ams2[-1].group(0))
+                            extra_desc = ln[:ams2[-3].start()].strip()
+                        elif len(ams2) == 2:
+                            cur["debito"] = normalize_money(ams2[-2].group(0))
+                            cur["credito"] = normalize_money(ams2[-1].group(0))
+                            extra_desc = ln[:ams2[-2].start()].strip()
+                        else:
+                            # 1 importe aislado: lo consideramos débito (y saldo se reconstruye)
+                            cur["debito"] = normalize_money(ams2[-1].group(0))
+                            extra_desc = ln[:ams2[-1].start()].strip()
+                        cur["descripcion"] = (" ".join([cur_desc, extra_desc]).strip()) if extra_desc else cur_desc
+                    else:
+                        # ya tenía importes -> solo anexar texto antes del primer importe
+                        first_i = ams2[0].start()
+                        extra_desc = ln[:first_i].strip()
+                        if extra_desc:
+                            cur["descripcion"] = (" ".join([cur_desc, extra_desc]).strip())
+                else:
+                    # sin importes pero con algo parecido a fecha interna -> también anexar texto antes de importes inexistentes
+                    cur["descripcion"] = (" ".join([cur.get("descripcion",""), ln.strip()])).strip()
 
     df = pd.DataFrame(rows)
     if df.empty:
         return df, fecha_cierre, saldo_final_pdf, saldo_anterior
 
-    # completar saldos faltantes por running
+    # normalizar desc
+    df["desc_norm"] = df["descripcion"].map(normalize_desc)
+
+    # completar saldos faltantes por corrida (si hay “Saldo Anterior”, arrancamos de ahí)
     if not np.isnan(saldo_anterior):
         running = float(saldo_anterior)
     else:
+        # si el primer renglón trae saldo, inferimos el anterior
         first = df.iloc[0]
-        running = float(first["saldo"]) - float(first["credito"]) + float(first["debito"]) \
-                  if pd.notna(first.get("saldo", np.nan)) else 0.0
+        if pd.notna(first.get("saldo", np.nan)):
+            running = float(first["saldo"]) - float(first.get("credito",0.0)) + float(first.get("debito",0.0))
+        else:
+            running = 0.0
 
     sal_calc = []
     for _, r in df.iterrows():
-        if pd.isna(r["saldo"]):
-            running = running + float(r["credito"]) - float(r["debito"])
+        if pd.isna(r["saldo"]) or r["saldo"] == 0.0:
+            running = running + float(r.get("credito",0.0)) - float(r.get("debito",0.0))
         else:
             running = float(r["saldo"])
         sal_calc.append(running)
     df["saldo"] = sal_calc
 
+    # saldo final del PDF, si no lo encontramos, tomamos el último de corrida
     if np.isnan(saldo_final_pdf):
         saldo_final_pdf = float(df["saldo"].iloc[-1])
 
-    df["desc_norm"] = df["descripcion"].map(normalize_desc)
     return df, fecha_cierre, saldo_final_pdf, saldo_anterior
 
-# ---------- Helper de UI por cuenta ----------
+# ---------- Helper de UI por cuenta (GENÉRICO) ----------
 def render_account_report(
     banco_slug: str,
     account_title: str,
@@ -654,7 +714,7 @@ def render_account_report(
     fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(lines)
     saldo_anterior = find_saldo_anterior_from_lines(lines)
 
-    # Sin movimientos: mostrar saldos y conciliación
+    # Sin movimientos
     if df.empty:
         total_debitos = 0.0
         total_creditos = 0.0
@@ -682,7 +742,7 @@ def render_account_report(
         st.info("Sin Movimientos")
         return
 
-    # Con movimientos: insertar SALDO ANTERIOR si existe
+    # Insertar SALDO ANTERIOR si existe
     if not np.isnan(saldo_anterior):
         first_date = df["fecha"].dropna().min()
         fecha_apertura = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59) if pd.notna(first_date) else pd.NaT
@@ -704,7 +764,7 @@ def render_account_report(
     df["delta_saldo"] = df["saldo"].diff()
     df["debito"]  = np.where(df["delta_saldo"] < 0, -df["delta_saldo"], 0.0)
     df["credito"] = np.where(df["delta_saldo"] > 0,  df["delta_saldo"], 0.0)
-    df["importe"] = df["debito"] - df["credito"]
+    df["importe"] = df["debito"] - df["credito"]  # signo contable
 
     # Clasificación
     df["Clasificación"] = df.apply(
@@ -768,6 +828,7 @@ def render_account_report(
     with o2: st.metric("Ley 25.413", f"$ {fmt_ar(ley_25413)}")
     with o3: st.metric("SIRCREB", f"$ {fmt_ar(sircreb)}")
 
+    # Tabla
     st.caption("Detalle de movimientos")
     styled = df_sorted.style.format({c: fmt_ar for c in ["debito","credito","importe","saldo"]}, na_rep="—")
     st.dataframe(styled, use_container_width=True)
@@ -933,6 +994,7 @@ elif _bank_name == "Banco de la Nación Argentina":
     nro = meta.get("account_number") or "s/n"
     acc_id = f"bna-{re.sub(r'[^0-9A-Za-z]+', '_', nro)}"
 
+    # Meta visible
     col1, col2, col3 = st.columns(3)
     if meta.get("period_start") and meta.get("period_end"):
         with col1: st.caption(f"Período: {meta['period_start']} al {meta['period_end']}")
@@ -941,12 +1003,14 @@ elif _bank_name == "Banco de la Nación Argentina":
     if meta.get("cbu"):
         with col3: st.caption(f"CBU: {meta['cbu']}")
 
+    # Extras BNA -> Resumen Operativo
     txt_full = _text_from_pdf(io.BytesIO(data))
     bna_extras = bna_extract_gastos_finales(txt_full)
 
     render_account_report(_bank_slug, titulo, nro, acc_id, all_lines, bna_extras=bna_extras)
 
 elif _bank_name == "Banco Credicoop":
+    # SOLO Credicoop por líneas (aislado)
     meta = credicoop_extract_meta(io.BytesIO(data))
     dfc, fecha_cierre, saldo_final_pdf, saldo_anterior_pdf = credicoop_parse_from_lines(io.BytesIO(data))
 
@@ -963,6 +1027,7 @@ elif _bank_name == "Banco Credicoop":
     if dfc.empty:
         st.info("Sin movimientos.")
     else:
+        # Clasificación + métricas
         dfc["Clasificación"] = dfc.apply(
             lambda r: clasificar(str(r.get("descripcion","")), str(r.get("desc_norm","")), r.get("debito",0.0), r.get("credito",0.0)),
             axis=1
@@ -998,6 +1063,7 @@ elif _bank_name == "Banco Credicoop":
         if pd.notna(fecha_cierre):
             st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
+        # IVA
         st.caption("Resumen Operativo: Registración Módulo IVA")
         iva21_mask  = dfc["Clasificación"].eq("IVA 21% (sobre comisiones)")
         iva105_mask = dfc["Clasificación"].eq("IVA 10,5% (sobre comisiones)")
@@ -1019,6 +1085,7 @@ elif _bank_name == "Banco Credicoop":
         with n2: st.metric("IVA 10,5%", f"$ {fmt_ar(iva105)}")
         with n3: st.metric("Bruto 10,5%", f"$ {fmt_ar(net105 + iva105)}")
 
+        # Tabla
         st.caption("Detalle de movimientos")
         show_cols = ["fecha","combte","descripcion","debito","credito","saldo","Clasificación"]
         for c in show_cols:
@@ -1027,6 +1094,7 @@ elif _bank_name == "Banco Credicoop":
         styled = dfc[show_cols].style.format({c: fmt_ar for c in ["debito","credito","saldo"]}, na_rep="—")
         st.dataframe(styled, use_container_width=True)
 
+        # Descargas
         try:
             import xlsxwriter
             output = io.BytesIO()
@@ -1067,6 +1135,7 @@ elif _bank_name == "Banco Credicoop":
             )
 
 else:
-    # Desconocido: genérico
+    # Desconocido: procesar genérico
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
+
