@@ -34,9 +34,8 @@ except Exception:
     REPORTLAB_OK = False
 
 # --- regex base ---
-DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{2,4}\b")       # dd/mm/aa o dd/mm/aaaa
-# Monto con puntos de miles y coma como decimal. Siempre 2 decimales. Posible signo al final ("-")
-MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2}-?(?!\S)')
+DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{2,4}\b")  # dd/mm/aa o dd/mm/aaaa
+MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
 LONG_INT_RE = re.compile(r"\b\d{6,}\b")
 
 # ====== PATRONES ESPECÍFICOS ======
@@ -160,7 +159,7 @@ def detect_bank_from_text(txt: str) -> str:
                key=lambda t: t[1])
     return best[0] if best[1] > 0 else "Banco no identificado"
 
-# ---------- extracción de líneas (genérico) ----------
+# ---------- extracción de líneas ----------
 def extract_all_lines(file_like):
     out = []
     with pdfplumber.open(_rewind(file_like)) as pdf:
@@ -291,7 +290,7 @@ def macro_split_account_blocks(file_like):
         blocks.append(acc)
     return blocks
 
-# ---------- Parsing genérico (p/ bancos que traen saldo por línea) ----------
+# ---------- Parsing genérico (no Credicoop) ----------
 def parse_lines(lines) -> pd.DataFrame:
     rows = []
     seq = 0
@@ -503,216 +502,165 @@ def bna_extract_meta(file_like):
             acc = monly.group(1)
     return {"account_number": acc, "cbu": cbu, "period_start": pstart, "period_end": pend}
 
-# ============================================================
-# ========== CREDICOOP: parser por columnas (pdfplumber) =====
-# ============================================================
+# ---------- Credicoop: meta + parser por columnas ----------
+def credicoop_extract_meta(file_like):
+    txt = _text_from_pdf(file_like)
+    title = None; cbu = None; acc = None
+    m_cbu = re.search(r"CBU\s*:\s*([0-9 ]{10,})", txt or "", re.IGNORECASE)
+    if m_cbu: cbu = m_cbu.group(1).replace(" ","")
+    m_acc = re.search(r"\bCta\.\s*([0-9]{1,4}(?:\.[0-9]{1,4}){2,}[0-9])\b", txt or "", re.IGNORECASE)
+    if m_acc: acc = m_acc.group(1)
+    for line in (txt or "").splitlines():
+        if "Cuenta Corriente" in line and "Resumen" in line:
+            title = " ".join(line.split()); break
+    return {"title": title or "CUENTA (Credicoop)", "cbu": cbu, "account_number": acc}
 
-DATE_START = re.compile(r'^\d{1,2}/\d{2}/\d{2,4}$')
+def _group_rows_by_y(words, ytol=2.0):
+    rows, cur, band = [], [], None
+    for w in sorted(words, key=lambda w: (round(w["top"]/ytol), w["x0"])):
+        b = round(w["top"]/ytol)
+        if band is None or b == band:
+            cur.append(w)
+        else:
+            rows.append(cur); cur = [w]
+        band = b
+    if cur: rows.append(cur)
+    return rows
 
-def _col_bounds_from_header(words):
+def _pick_text_in_range(row_words, x0, x1):
+    toks = [w["text"] for w in row_words if w["x0"] >= x0 and w["x1"] <= x1 + 0.5]
+    return " ".join(toks).strip()
+
+def credicoop_parse_from_pdf(file_like):
     """
-    Dado el set de palabras de una página, encuentra los x0 de los encabezados
-    'DEBITO', 'CREDITO' y 'SALDO' y devuelve los límites de columnas.
-    """
-    header_cands = [w for w in words if w["text"].upper() in ("DEBITO", "DÉBITO", "CREDITO", "CRÉDITO", "SALDO")]
-    if not header_cands:
-        return None
-
-    # Tomo la banda de y (fila) donde aparecen todos
-    rows = {}
-    for w in header_cands:
-        key = round(w["top"])
-        rows.setdefault(key, []).append(w)
-    # Elijo la fila con más matches
-    row = max(rows.values(), key=len)
-
-    deb = next((w for w in row if w["text"].upper() in ("DEBITO","DÉBITO")), None)
-    cre = next((w for w in row if w["text"].upper() in ("CREDITO","CRÉDITO")), None)
-    sal = next((w for w in row if w["text"].upper() == "SALDO"), None)
-    if not (deb and cre and sal):
-        return None
-
-    # Defino cortes a mitad de camino
-    x_deb = deb["x0"]
-    x_cre = cre["x0"]
-    x_sal = sal["x0"]
-    # Ordenados:
-    xs = sorted([x_deb, x_cre, x_sal])
-    # zonas: [0.. mid_deb], [deb..mid_cre], [cre..mid_sal], [sal..inf]
-    mid_deb_cre = (xs[0] + xs[1]) / 2.0
-    mid_cre_sal = (xs[1] + xs[2]) / 2.0
-
-    return {
-        "x_debito": xs[0],
-        "x_credito": xs[1],
-        "x_saldo": xs[2],
-        "cut_deb_cre": mid_deb_cre,
-        "cut_cre_sal": mid_cre_sal,
-    }
-
-def credicoop_parse_from_pages(file_like):
-    """
-    Lee el PDF por páginas con posiciones x/y y reconstruye la tabla:
-    fecha | combte | descripcion | debito | credito | saldo
-    Reglas del usuario:
-      - Montos SIEMPRE tienen 2 decimales con coma y puntos de miles.
-      - Débito y crédito NUNCA juntos.
-      - Si hay 2 importes en línea, el de más a la derecha es SALDO (subtotal de día).
-      - 'SALDO ANTERIOR' existe y su monto está en la columna SALDO.
+    Parser POSICIONAL por columnas para Credicoop.
+    - Detecta header FECHA/COMBTE/DESCRIPCION/DEBITO/CREDITO/SALDO por x.
+    - Lee montos de SU columna (no mezcla).
+    - 'SALDO ANTERIOR' se toma del campo saldo.
+    - Líneas sin fecha ni importes -> continuación de descripción anterior.
+    - Reconstruye saldo corrido cuando falte.
     """
     rows = []
     saldo_anterior = np.nan
-    fecha_cierre = pd.NaT
-    saldo_final_pdf = np.nan
+    cierre_fecha, saldo_final_pdf = pd.NaT, np.nan
 
     with pdfplumber.open(_rewind(file_like)) as pdf:
-        for page in pdf.pages:
-            words = page.extract_words(extra_attrs=["x0", "x1", "top", "bottom"])
-            if not words:
+        for p in pdf.pages:
+            words = p.extract_words(extra_attrs=["x0","x1","top","bottom"])
+            if not words: 
                 continue
 
-            bounds = _col_bounds_from_header(words)
-            if not bounds:
-                # Fallback duro (si no encuentro encabezados)
-                # No rompo el resto: sigo a la siguiente página
-                continue
-
-            # Agrupo por banda de y (renglón visual)
-            rows_by_band = {}
+            # buscar header
+            deb_x = cred_x = sal_x = None
+            desc_right = None
             for w in words:
-                band = round(w["top"])
-                rows_by_band.setdefault(band, []).append(w)
+                t = w["text"].upper()
+                if t == "DEBITO" or t == "DÉBITO": deb_x = w["x0"]
+                if t == "CREDITO" or t == "CRÉDITO": cred_x = w["x0"]
+                if t == "SALDO": sal_x = w["x0"]
+                if t == "DESCRIPCION" or t == "DESCRIPCIÓN": desc_right = w["x1"]
+            if not (deb_x and cred_x and sal_x):
+                # página sin grilla (avisos, totales)
+                continue
 
-            # recorro bandas ordenadas
-            for band in sorted(rows_by_band.keys()):
-                ws = sorted(rows_by_band[band], key=lambda w: w["x0"])
-                line_txt = " ".join(w["text"] for w in ws).strip()
-                if not line_txt:
+            # márgenes para columnas
+            # [desc|..] | debito | credito | saldo
+            deb_l, cred_l, saldo_l = deb_x - 2, cred_x - 2, sal_x - 2
+            deb_r, cred_r, saldo_r = cred_x - 5, sal_x - 5, p.width - 5
+            # área izquierda (fecha, combte, descripción)
+            left_l = 5; left_r = deb_l - 5
+
+            # agrupar renglones por Y
+            by_rows = _group_rows_by_y(words)
+
+            last_idx = None
+            for row in by_rows:
+                left_txt = _pick_text_in_range(row, left_l, left_r)
+                deb_txt  = _pick_text_in_range(row, deb_l,  deb_r)
+                cre_txt  = _pick_text_in_range(row, cred_l, cred_r)
+                sal_txt  = _pick_text_in_range(row, saldo_l, saldo_r)
+
+                left_up = left_txt.upper()
+
+                # SALDOS explícitos
+                if "SALDO ANTERIOR" in left_up and sal_txt:
+                    v = normalize_money(MONEY_RE.search(sal_txt).group(0)) if MONEY_RE.search(sal_txt) else np.nan
+                    if not np.isnan(v): saldo_anterior = v
                     continue
-
-                U = line_txt.upper()
-
-                # Detecto "SALDO FINAL ..." (guardo para validar)
-                if SALDO_FINAL_PREFIX.match(line_txt) and MONEY_RE.search(line_txt):
-                    d = DATE_RE.search(line_txt)
-                    if d:
-                        fecha_cierre = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
-                    saldo_final_pdf = _first_amount_value(line_txt)
-                    continue
-
-                # Detecto "SALDO ANTERIOR" (saldo inicial)
-                if "SALDO ANTERIOR" in U and MONEY_RE.search(line_txt):
-                    # monto debe estar en columna SALDO; si no, igual tomo el único monto
-                    m = MONEY_RE.findall(line_txt)
+                if left_up.startswith("SALDO AL") and sal_txt:
+                    m = DATE_RE.search(left_txt)
                     if m:
-                        saldo_anterior = normalize_money(m[-1])
+                        cierre_fecha = pd.to_datetime(m.group(0), dayfirst=True, errors="coerce")
+                    v = normalize_money(MONEY_RE.search(sal_txt).group(0)) if MONEY_RE.search(sal_txt) else np.nan
+                    if not np.isnan(v): saldo_final_pdf = v
                     continue
 
-                # Busco fecha al principio del renglón
-                # (pdfplumber entrega palabras separadas; la fecha suele ser el primer token)
-                first_tok = ws[0]["text"]
-                if not DATE_START.match(first_tok):
-                    # Línea sin fecha (continuación de descripción) => la pego a la última fila con fecha
-                    if rows and not any(pd.notna(v) and v != 0 for v in (rows[-1].get("debito"), rows[-1].get("credito"))):
-                        rows[-1]["descripcion"] = (rows[-1]["descripcion"] + " " + line_txt).strip()
-                    continue
+                # renglón con fecha => movimiento
+                md = DATE_RE.match(left_txt)
+                if md:
+                    fecha = pd.to_datetime(md.group(0), dayfirst=True, errors="coerce")
+                    tail  = left_txt[md.end():].strip()
 
-                # arranco movimiento
-                fecha = pd.to_datetime(first_tok, dayfirst=True, errors="coerce")
+                    # COMBTE opcional
+                    m2 = re.match(r'^(\d{3,})?\s*(.*)$', tail)
+                    combte = (m2.group(1) or "").strip() if m2 else ""
+                    desc   = (m2.group(2) if m2 else tail).strip()
 
-                # COMBTE: si el segundo token es todo dígitos (4+), lo tomo
-                combte = None
-                if len(ws) > 1 and ws[1]["text"].isdigit() and len(ws[1]["text"]) >= 4:
-                    combte = ws[1]["text"]
-                    start_desc_idx = 2
+                    deb = normalize_money(MONEY_RE.search(deb_txt).group(0)) if MONEY_RE.search(deb_txt) else np.nan
+                    cre = normalize_money(MONEY_RE.search(cre_txt).group(0)) if MONEY_RE.search(cre_txt) else np.nan
+                    sal = normalize_money(MONEY_RE.search(sal_txt).group(0)) if MONEY_RE.search(sal_txt) else np.nan
+
+                    # NUNCA ambos: si por ruido hay 2, me quedo con el que tenga texto
+                    if not np.isnan(deb) and not np.isnan(cre):
+                        # regla: si 'Pago', 'Debito', 'Comision' => débito; si 'Liquidacion', 'Acredit' => crédito
+                        key = desc.upper()
+                        prefer_deb = any(k in key for k in ("PAGO","DEBIT","COMISION","IMPUESTO","SERVICIO","PERCEPCION"))
+                        if prefer_deb: cre = np.nan
+                        else: deb = np.nan
+
+                    rows.append({
+                        "fecha": fecha,
+                        "combte": combte or None,
+                        "descripcion": desc,
+                        "debito": float(deb) if pd.notna(deb) else 0.0,
+                        "credito": float(cre) if pd.notna(cre) else 0.0,
+                        "saldo": float(sal) if pd.notna(sal) else np.nan,
+                    })
+                    last_idx = len(rows) - 1
                 else:
-                    start_desc_idx = 1
-
-                # Recorro palabras y separo por columnas según x0
-                desc_parts = []
-                deb_val = np.nan
-                cre_val = np.nan
-                sal_val = np.nan
-
-                for w in ws[start_desc_idx:]:
-                    x = w["x0"]
-                    t = w["text"]
-                    # monto?
-                    if MONEY_RE.fullmatch(t):
-                        v = normalize_money(t)
-                        # lo ubico por columna horizontal
-                        if x < bounds["cut_deb_cre"]:
-                            deb_val = v
-                        elif x < bounds["cut_cre_sal"]:
-                            cre_val = v
-                        else:
-                            sal_val = v
-                    else:
-                        # texto (números sin decimales => texto)
-                        if x < bounds["cut_deb_cre"]:      # todavía a la izquierda de débito -> descripción
-                            desc_parts.append(t)
-                        elif x < bounds["cut_cre_sal"]:    # entre débito y crédito -> igual descripción
-                            desc_parts.append(t)
-                        else:                               # antes de saldo -> también descripción
-                            desc_parts.append(t)
-
-                desc = " ".join(desc_parts).strip()
-
-                # Regla usuario: si hay 2 importes en línea, el de más a la derecha es SALDO.
-                # Con las columnas ya asignadas, eso ya quedó en 'sal_val'; debito/credito es uno solo.
-                # Si una de las dos (deb/cre) no está, completar con 0.
-                debito = float(deb_val) if pd.notna(deb_val) else 0.0
-                credito = float(cre_val) if pd.notna(cre_val) else 0.0
-                saldo = float(sal_val) if pd.notna(sal_val) else np.nan
-
-                rows.append({
-                    "fecha": fecha,
-                    "combte": combte,
-                    "descripcion": desc,
-                    "debito": debito,
-                    "credito": credito,
-                    "saldo": saldo,
-                })
+                    # continuación de descripción (sin fecha y sin importes)
+                    has_any_amount = MONEY_RE.search(deb_txt or "") or MONEY_RE.search(cre_txt or "") or MONEY_RE.search(sal_txt or "")
+                    if (not has_any_amount) and last_idx is not None:
+                        s = left_txt.strip()
+                        if s:
+                            rows[last_idx]["descripcion"] = (rows[last_idx]["descripcion"] + " " + s).strip()
 
     df = pd.DataFrame(rows)
     if df.empty:
-        return df, fecha_cierre, saldo_final_pdf, saldo_anterior
+        return df, cierre_fecha, saldo_final_pdf, saldo_anterior
 
-    # Normalizo descripción y orden
-    df["desc_norm"] = df["descripcion"].map(normalize_desc)
-    df = df.sort_values(["fecha"]).reset_index(drop=True)
-
-    # Si tengo saldo anterior => inserto fila "SALDO ANTERIOR" antes del primer día
+    # completar saldo corrido
     if not np.isnan(saldo_anterior):
-        first_date = df["fecha"].min()
-        apertura = pd.DataFrame([{
-            "fecha": (first_date - pd.Timedelta(days=1)),
-            "combte": None,
-            "descripcion": "SALDO ANTERIOR",
-            "desc_norm": "SALDO ANTERIOR",
-            "debito": 0.0,
-            "credito": 0.0,
-            "saldo": float(saldo_anterior),
-        }])
-        df = pd.concat([apertura, df], ignore_index=True)
+        running = float(saldo_anterior)
+    else:
+        first = df.iloc[0]
+        base = float(first.get("saldo", np.nan)) if pd.notna(first.get("saldo", np.nan)) else 0.0
+        running = base - float(first.get("credito",0.0)) + float(first.get("debito",0.0))
 
-    # Reconstruyo saldos faltantes: saldo_prev + crédito − débito
-    run = float(df.iloc[0]["saldo"]) if pd.notna(df.iloc[0]["saldo"]) else 0.0
-    saldos = [run]
-    for i in range(1, len(df)):
-        r = df.iloc[i]
-        if pd.notna(r["saldo"]):
-            run = float(r["saldo"])
+    sal_calc = []
+    for _, r in df.iterrows():
+        if pd.isna(r["saldo"]):
+            running = running + float(r["credito"]) - float(r["debito"])
         else:
-            run = run + float(r["credito"]) - float(r["debito"])
-        saldos.append(run)
-    df["saldo"] = saldos
+            running = float(r["saldo"])
+        sal_calc.append(running)
+    df["saldo"] = sal_calc
 
-    # Si no vino saldo_final explícito, uso el último calculado
     if np.isnan(saldo_final_pdf):
         saldo_final_pdf = float(df["saldo"].iloc[-1])
 
-    return df, fecha_cierre, saldo_final_pdf, saldo_anterior
+    df["desc_norm"] = df["descripcion"].map(normalize_desc)
+    return df, cierre_fecha, saldo_final_pdf, saldo_anterior
 
 # ---------- Helper UI por cuenta (genérico) ----------
 def render_account_report(
@@ -775,8 +723,12 @@ def render_account_report(
 
     df = df.sort_values(["fecha"]).reset_index(drop=True)
     df["delta_saldo"] = df["saldo"].diff()
-    df["debito"]  = np.where(df["delta_saldo"] < 0, -df["delta_saldo"], df["debito"])
-    df["credito"] = np.where(df["delta_saldo"] > 0,  df["delta_saldo"], df["credito"])
+    df["debito"]  = np.where(df["debito"].eq(0.0) & df["credito"].eq(0.0),
+                             np.where(df["delta_saldo"] < 0, -df["delta_saldo"], 0.0),
+                             df["debito"])
+    df["credito"] = np.where(df["debito"].eq(0.0) & df["credito"].eq(0.0),
+                             np.where(df["delta_saldo"] > 0,  df["delta_saldo"], 0.0),
+                             df["credito"])
     df["importe"] = df["debito"] - df["credito"]
 
     df["Clasificación"] = df.apply(
@@ -793,6 +745,11 @@ def render_account_report(
     diferencia = saldo_final_calculado - saldo_final_visto
     cuadra = abs(diferencia) < 0.01
 
+    date_suffix = ""
+    if isinstance(fecha_cierre, pd.Timestamp) and pd.notna(fecha_cierre):
+        date_suffix = f"_{fecha_cierre.strftime('%Y%m%d')}"
+    acc_suffix  = f"_{account_number}"
+
     st.caption("Resumen del período")
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("Saldo inicial", f"$ {fmt_ar(saldo_inicial)}")
@@ -806,9 +763,10 @@ def render_account_report(
         st.success("Conciliado.") if cuadra else st.error("No cuadra la conciliación.")
     except Exception:
         st.write("Conciliación:", "OK" if cuadra else "No cuadra")
-    if pd.notna(fecha_cierre):
+    if isinstance(fecha_cierre, pd.Timestamp) and pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
+    # ===== Resumen Operativo (IVA + Otros) =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
     iva21_mask  = df_sorted["Clasificación"].eq("IVA 21% (sobre comisiones)")
     iva105_mask = df_sorted["Clasificación"].eq("IVA 10,5% (sobre comisiones)")
@@ -835,98 +793,54 @@ def render_account_report(
     with o2: st.metric("Ley 25.413", f"$ {fmt_ar(ley_25413)}")
     with o3: st.metric("SIRCREB", f"$ {fmt_ar(sircreb)}")
 
+    # Tabla
     st.caption("Detalle de movimientos")
-    styled = df_sorted[["fecha","combte","descripcion","debito","credito","saldo","Clasificación"]].style.format(
-        {"debito": fmt_ar, "credito": fmt_ar, "saldo": fmt_ar}, na_rep="—"
-    )
+    show_cols = ["fecha","combte","descripcion","debito","credito","saldo","Clasificación"]
+    for c in show_cols:
+        if c not in df_sorted.columns:
+            df_sorted[c] = np.nan
+    styled = df_sorted[show_cols].style.format({c: fmt_ar for c in ["debito","credito","saldo"]}, na_rep="—")
     st.dataframe(styled, use_container_width=True)
 
+    # Descargas
     st.caption("Descargar")
     try:
         import xlsxwriter
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df_sorted.to_excel(writer, index=False, sheet_name="Movimientos")
+            df_sorted[show_cols].to_excel(writer, index=False, sheet_name="Movimientos")
             wb  = writer.book
             ws  = writer.sheets["Movimientos"]
             money_fmt = wb.add_format({"num_format": "#,##0.00"})
             date_fmt  = wb.add_format({"num_format": "dd/mm/yyyy"})
-            for idx, col in enumerate(df_sorted.columns, start=0):
+            for idx, col in enumerate(show_cols, start=0):
                 col_values = df_sorted[col].astype(str)
                 max_len = max(len(col), *(len(v) for v in col_values))
                 ws.set_column(idx, idx, min(max_len + 2, 40))
-            for c in ["debito","credito","importe","saldo"]:
-                if c in df_sorted.columns:
-                    j = df_sorted.columns.get_loc(c)
-                    ws.set_column(j, j, 16, money_fmt)
-            if "fecha" in df_sorted.columns:
-                j = df_sorted.columns.get_loc("fecha")
-                ws.set_column(j, j, 14, date_fmt)
+            for c in ["debito","credito","saldo"]:
+                j = show_cols.index(c)
+                ws.set_column(j, j, 16, money_fmt)
+            j = show_cols.index("fecha")
+            ws.set_column(j, j, 14, date_fmt)
 
         st.download_button(
             "📥 Descargar Excel",
             data=output.getvalue(),
-            file_name=f"resumen_bancario_{banco_slug}_{account_number}.xlsx",
+            file_name=f"resumen_bancario_{banco_slug}{acc_suffix}{date_suffix}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
             key=f"dl_xlsx_{acc_id}",
         )
     except Exception:
-        csv_bytes = df_sorted.to_csv(index=False).encode("utf-8-sig")
+        csv_bytes = df_sorted[show_cols].to_csv(index=False).encode("utf-8-sig")
         st.download_button(
             "📥 Descargar CSV (fallback)",
             data=csv_bytes,
-            file_name=f"resumen_bancario_{banco_slug}_{account_number}.csv",
+            file_name=f"resumen_bancario_{banco_slug}{acc_suffix}{date_suffix}.csv",
             mime="text/csv",
             use_container_width=True,
             key=f"dl_csv_{acc_id}",
         )
-
-    if REPORTLAB_OK:
-        try:
-            pdf_buf = io.BytesIO()
-            doc = SimpleDocTemplate(pdf_buf, pagesize=A4, title="Resumen Operativo - Registración Módulo IVA")
-            styles = getSampleStyleSheet()
-            elems = []
-            elems.append(Paragraph("Resumen Operativo: Registración Módulo IVA", styles["Title"]))
-            elems.append(Spacer(1, 8))
-            datos = [
-                ["Concepto", "Importe"],
-                ["Neto Comisiones 21%",  fmt_ar(net21)],
-                ["IVA 21%",               fmt_ar(iva21)],
-                ["Bruto 21%",             fmt_ar(net21 + iva21)],
-                ["Neto Comisiones 10,5%", fmt_ar(net105)],
-                ["IVA 10,5%",             fmt_ar(iva105)],
-                ["Bruto 10,5%",           fmt_ar(net105 + iva105)],
-                ["Percepciones de IVA (RG 3337 / RG 2408)", fmt_ar(percep_iva)],
-                ["Ley 25.413",            fmt_ar(ley_25413)],
-                ["SIRCREB",               fmt_ar(sircreb)],
-            ]
-            datos.append(["TOTAL", fmt_ar(net21 + iva21 + net105 + iva105 + percep_iva + ley_25413 + sircreb)])
-
-            tbl = Table(datos, colWidths=[300, 120])
-            tbl.setStyle(TableStyle([
-                ("BACKGROUND", (0,0), (-1,0), colors.lightgrey),
-                ("TEXTCOLOR",  (0,0), (-1,0), colors.black),
-                ("GRID",       (0,0), (-1,-1), 0.3, colors.grey),
-                ("ALIGN",      (1,1), (1,-1), "RIGHT"),
-                ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
-                ("FONTNAME",   (0,-1), (-1,-1), "Helvetica-Bold"),
-            ]))
-            elems.append(tbl)
-            elems.append(Spacer(1, 12))
-            elems.append(Paragraph("Herramienta para uso interno - AIE San Justo", styles["Normal"]))
-            doc.build(elems)
-            st.download_button(
-                "📄 Descargar PDF – Resumen Operativo (IVA)",
-                data=pdf_buf.getvalue(),
-                file_name=f"Resumen_Operativo_IVA_{banco_slug}_{account_number}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-                key=f"dl_pdf_{acc_id}",
-            )
-        except Exception as e:
-            st.info(f"No se pudo generar el PDF del Resumen Operativo: {e}")
 
 # ---------- UI principal ----------
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
@@ -1012,28 +926,28 @@ elif _bank_name == "Banco de la Nación Argentina":
     txt_full = _text_from_pdf(io.BytesIO(data))
     bna_extras = bna_extract_gastos_finales(txt_full)
 
+    all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, titulo, nro, acc_id, all_lines, bna_extras=bna_extras)
 
 elif _bank_name == "Banco Credicoop":
-    # Parser específico por columnas (NO toca el resto)
-    meta_txt = _text_from_pdf(io.BytesIO(data))
-    # meta mínima visible (si logramos encontrar algo del header de cuenta):
-    titulo = "CUENTA (Credicoop)"
-    nro = "s/n"
-    for line in (meta_txt or "").splitlines():
-        if "Cta." in line:
-            nro = line.split("Cta.")[-1].strip().split()[0]
-            break
+    meta = credicoop_extract_meta(io.BytesIO(data))
+    dfc, fecha_cierre, saldo_final_pdf, saldo_anterior_pdf = credicoop_parse_from_pdf(io.BytesIO(data))
 
-    dfc, fecha_cierre, saldo_final_pdf, saldo_anterior_pdf = credicoop_parse_from_pages(io.BytesIO(data))
+    titulo = meta.get("title") or "CUENTA (Credicoop)"
+    nro = meta.get("account_number") or "s/n"
+    acc_id = f"credicoop-{re.sub(r'[^0-9A-Za-z]+', '_', nro or 'sn')}"
 
-    acc_id = "credicoop-" + (re.sub(r'[^0-9A-Za-z]+', '_', nro) if 're' in globals() else "sn")
     st.markdown("---")
     st.subheader(f"{titulo} · Nro {nro}")
+    col1, col2 = st.columns(2)
+    with col1: st.caption(f"Nro. de cuenta: {nro}")
+    if meta.get("cbu"):
+        with col2: st.caption(f"CBU: {meta['cbu']}")
 
     if dfc.empty:
         st.info("Sin movimientos o no se pudo interpretar la tabla.")
     else:
+        # Clasificación y métricas (idéntico a genérico)
         dfc["Clasificación"] = dfc.apply(
             lambda r: clasificar(str(r.get("descripcion","")), str(r.get("desc_norm","")), r.get("debito",0.0), r.get("credito",0.0)),
             axis=1
@@ -1041,7 +955,10 @@ elif _bank_name == "Banco Credicoop":
 
         total_debitos  = float(dfc["debito"].sum())
         total_creditos = float(dfc["credito"].sum())
-        saldo_inicial  = float(dfc["saldo"].iloc[0]) if pd.notna(dfc["saldo"].iloc[0]) else float(saldo_anterior_pdf or 0.0)
+        saldo_inicial  = float(saldo_anterior_pdf) if not np.isnan(saldo_anterior_pdf) else (
+            float(dfc["saldo"].iloc[0]) - float(dfc["credito"].iloc[0]) + float(dfc["debito"].iloc[0])
+            if pd.notna(dfc["saldo"].iloc[0]) else 0.0
+        )
         saldo_final_calc = saldo_inicial + total_creditos - total_debitos
         if not np.isnan(saldo_final_pdf):
             dif = saldo_final_calc - float(saldo_final_pdf)
@@ -1064,21 +981,56 @@ elif _bank_name == "Banco Credicoop":
             st.success("Conciliado.") if cuadra else st.error("No cuadra la conciliación.")
         except Exception:
             st.write("Conciliación:", "OK" if cuadra else "No cuadra")
+        if isinstance(fecha_cierre, pd.Timestamp) and pd.notna(fecha_cierre):
+            st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
+
+        st.caption("Resumen Operativo: Registración Módulo IVA")
+        iva21_mask  = dfc["Clasificación"].eq("IVA 21% (sobre comisiones)")
+        iva105_mask = dfc["Clasificación"].eq("IVA 10,5% (sobre comisiones)")
+        iva21  = float(dfc.loc[iva21_mask,  "debito"].sum())
+        iva105 = float(dfc.loc[iva105_mask, "debito"].sum())
+        net21  = round(iva21  / 0.21,  2) if iva21  else 0.0
+        net105 = round(iva105 / 0.105, 2) if iva105 else 0.0
+        percep_iva = float(dfc.loc[dfc["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
+        ley_25413  = float(dfc.loc[dfc["Clasificación"].eq("LEY 25413"),          "debito"].sum())
+        sircreb    = float(dfc.loc[dfc["Clasificación"].eq("SIRCREB"),            "debito"].sum())
+
+        m1, m2, m3 = st.columns(3)
+        with m1: st.metric("Neto Comisiones 21%", f"$ {fmt_ar(net21)}")
+        with m2: st.metric("IVA 21%", f"$ {fmt_ar(iva21)}")
+        with m3: st.metric("Bruto 21%", f"$ {fmt_ar(net21 + iva21)}")
+
+        n1, n2, n3 = st.columns(3)
+        with n1: st.metric("Neto Comisiones 10,5%", f"$ {fmt_ar(net105)}")
+        with n2: st.metric("IVA 10,5%", f"$ {fmt_ar(iva105)}")
+        with n3: st.metric("Bruto 10,5%", f"$ {fmt_ar(net105 + iva105)}")
 
         st.caption("Detalle de movimientos")
-        cols = ["fecha","combte","descripcion","debito","credito","saldo","Clasificación"]
-        for c in cols:
+        show_cols = ["fecha","combte","descripcion","debito","credito","saldo","Clasificación"]
+        for c in show_cols:
             if c not in dfc.columns:
                 dfc[c] = np.nan
-        styled = dfc[cols].style.format({"debito": fmt_ar, "credito": fmt_ar, "saldo": fmt_ar}, na_rep="—")
+        styled = dfc[show_cols].style.format({c: fmt_ar for c in ["debito","credito","saldo"]}, na_rep="—")
         st.dataframe(styled, use_container_width=True)
 
-        # Descarga
         try:
             import xlsxwriter
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                dfc[cols].to_excel(writer, index=False, sheet_name="Movimientos")
+                dfc[show_cols].to_excel(writer, index=False, sheet_name="Movimientos")
+                wb  = writer.book
+                ws  = writer.sheets["Movimientos"]
+                money_fmt = wb.add_format({"num_format": "#,##0.00"})
+                date_fmt  = wb.add_format({"num_format": "dd/mm/yyyy"})
+                for idx, col in enumerate(show_cols, start=0):
+                    col_values = dfc[col].astype(str)
+                    max_len = max(len(col), *(len(v) for v in col_values))
+                    ws.set_column(idx, idx, min(max_len + 2, 50))
+                for c in ["debito","credito","saldo"]:
+                    j = show_cols.index(c)
+                    ws.set_column(j, j, 16, money_fmt)
+                j = show_cols.index("fecha")
+                ws.set_column(j, j, 14, date_fmt)
             st.download_button(
                 "📥 Descargar Excel",
                 data=output.getvalue(),
@@ -1088,7 +1040,7 @@ elif _bank_name == "Banco Credicoop":
                 key=f"dl_xlsx_{acc_id}",
             )
         except Exception:
-            csv_bytes = dfc[cols].to_csv(index=False).encode("utf-8-sig")
+            csv_bytes = dfc[show_cols].to_csv(index=False).encode("utf-8-sig")
             st.download_button(
                 "📥 Descargar CSV (fallback)",
                 data=csv_bytes,
