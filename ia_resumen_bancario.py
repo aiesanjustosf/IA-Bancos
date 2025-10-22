@@ -566,113 +566,6 @@ def credicoop_parse_from_words(file_like):
       - Líneas sin fecha y sin importes: se pegan a la descripción anterior.
       - El saldo corrido se reconstruye desde SALDO ANTERIOR si aparece.
     """
-  def credicoop_parse_from_text(file_like):
-    """Fallback robusto SOLO con texto plano (sin posiciones)."""
-    with pdfplumber.open(_rewind(file_like)) as pdf:
-        lines = []
-        for p in pdf.pages:
-            t = p.extract_text() or ""
-            lines += [l for l in t.splitlines() if l.strip()]
-
-    # SALDOS de cabecera/pie
-    saldo_anterior = np.nan
-    fecha_cierre = pd.NaT
-    saldo_final_pdf = np.nan
-    for ln in lines:
-        U = ln.upper()
-        if "SALDO ANTERIOR" in U and _only_one_amount(ln):
-            v = _first_amount_value(ln)
-            if not np.isnan(v): saldo_anterior = v
-        if "SALDO AL" in U and _only_one_amount(ln):
-            d = DATE_RE.search(ln)
-            if d:
-                fecha_cierre = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
-            saldo_final_pdf = _first_amount_value(ln)
-
-    rows = []
-    cur = None  # entrada en construcción
-    for ln in lines:
-        mdate = DATE_ANY.search(ln)
-        if mdate:
-            # cierro entrada anterior
-            if cur is not None:
-                rows.append(cur)
-
-            fecha = pd.to_datetime(mdate.group(0), dayfirst=True, errors="coerce")
-            tail = ln[mdate.end():].strip()
-
-            # combte opcional
-            combte = None
-            mcomb = re.match(r'\s*(\d{3,})\b', tail)
-            if mcomb:
-                combte = mcomb.group(1)
-                tail = tail[mcomb.end():].strip()
-
-            # descripción + montos en esta misma línea
-            am = list(MONEY_RE.finditer(tail))
-            desc = tail
-            mov = 0.0
-            if am:
-                # si hay >=2, el último es SALDO (se ignora) y el anterior es movimiento
-                if len(am) >= 2:
-                    mov = float(normalize_money(am[-2].group(0)))
-                    desc = tail[:am[-2].start()].strip()
-                else:
-                    mov = float(normalize_money(am[0].group(0)))
-                    desc = tail[:am[0].start()].strip()
-
-            cur = {
-                "fecha": fecha,
-                "combte": combte,
-                "descripcion": desc,
-                "debito": 0.0,
-                "credito": 0.0,
-                "_mov": mov
-            }
-        else:
-            # continuación de descripción (sin montos)
-            if cur is not None and not MONEY_RE.search(ln):
-                s = ln.strip()
-                if s:
-                    cur["descripcion"] = (cur["descripcion"] + " " + s).strip()
-
-    if cur is not None:
-        rows.append(cur)
-
-    # asigno lado por heurística (sin posiciones)
-    for r in rows:
-        mov = float(r.pop("_mov", 0.0))
-        dU = r["descripcion"].upper()
-        if mov != 0.0:
-            if any(k in dU for k in ("ACRED","CRÉDIT","CREDITO","VENCIMIENTO","RECIBID")):
-                r["credito"] = mov
-            else:
-                r["debito"] = mov
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df, fecha_cierre, saldo_final_pdf, saldo_anterior
-
-    df["desc_norm"] = df["descripcion"].map(normalize_desc)
-
-    # saldo corrido
-    running = float(saldo_anterior) if not np.isnan(saldo_anterior) else 0.0
-    saldos = []
-    for _, r in df.iterrows():
-        running = running + float(r["credito"]) - float(r["debito"])
-        saldos.append(running)
-    df["saldo"] = saldos
-
-    return df, fecha_cierre, saldo_final_pdf, saldo_anterior
-
-
-def credicoop_parse(file_like):
-    """Intenta por palabras/posiciones; si no hay movimientos, cae a texto plano."""
-    df, fc, sf, sa = credicoop_parse_from_words(_rewind(file_like))
-    if df is not None and not df.empty:
-        return df, fc, sf, sa
-    return credicoop_parse_from_text(_rewind(file_like))
-
     with pdfplumber.open(_rewind(file_like)) as pdf:
         # 1) Buscar SALDO ANTERIOR y SALDO FINAL en texto plano (encabezado/pie)
         full_text_lines = []
@@ -1118,9 +1011,9 @@ elif _bank_name == "Banco de la Nación Argentina":
     render_account_report(_bank_slug, titulo, nro, acc_id, all_lines, bna_extras=bna_extras)
 
 elif _bank_name == "Banco Credicoop":
-    # Parser específico: primero por posiciones; si no hay movimientos, fallback por texto
+    # Parser específico: columnas por posición, saldo reconstruido desde SALDO ANTERIOR
     meta = credicoop_extract_meta(io.BytesIO(data))
-    dfc, fecha_cierre, saldo_final_pdf, saldo_anterior_pdf = credicoop_parse(io.BytesIO(data))
+    dfc, fecha_cierre, saldo_final_pdf, saldo_anterior_pdf = credicoop_parse_from_words(io.BytesIO(data))
 
     titulo = meta.get("title") or "CUENTA (Credicoop)"
     nro = meta.get("account_number") or "s/n"
@@ -1144,7 +1037,6 @@ elif _bank_name == "Banco Credicoop":
         total_creditos = float(dfc["credito"].sum())
         saldo_inicial  = float(saldo_anterior_pdf) if not np.isnan(saldo_anterior_pdf) else 0.0
         saldo_final_calc = saldo_inicial + total_creditos - total_debitos
-
         if not np.isnan(saldo_final_pdf):
             dif = saldo_final_calc - float(saldo_final_pdf)
             cuadra = abs(dif) < 0.01
