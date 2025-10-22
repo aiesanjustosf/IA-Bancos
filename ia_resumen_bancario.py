@@ -564,19 +564,60 @@ def _group_lines_words(page, ytol=2.0):
         rows.append(cur)
     return rows
 
+# ===== Credicoop: parser por palabras/posiciones (robusto) =====
+DATE_START = re.compile(r'^\s*(\d{1,2}/\d{2}/\d{2,4})\b')
+ONLY_DIGITS = re.compile(r'^\d{3,}$')
+
+def _group_lines_words(page, ytol=2.0):
+    words = page.extract_words(extra_attrs=["x0","x1","top","bottom","text"])
+    if not words:
+        return []
+    words.sort(key=lambda w: (round(w["top"]/ytol), w["x0"]))
+    rows, cur, band = [], [], None
+    for w in words:
+        b = round(w["top"]/ytol)
+        if band is None or b == band:
+            cur.append(w)
+        else:
+            rows.append(cur)
+            cur = [w]
+        band = b
+    if cur:
+        rows.append(cur)
+    return rows
+
+def _kmeans_1d(xs, k):
+    xs = np.asarray(sorted(xs), dtype=float)
+    xs = xs[~np.isnan(xs)]
+    if len(xs) == 0:
+        return [], {}
+    k = min(k, len(xs))
+    centers = np.quantile(xs, np.linspace(0, 1, k))
+    for _ in range(20):
+        labels = np.argmin(np.abs(xs[:, None] - centers[None, :]), axis=1)
+        new_centers = np.array([xs[labels == i].mean() if np.any(labels == i) else centers[i]
+                                for i in range(k)])
+        if np.allclose(new_centers, centers, atol=1e-3):
+            break
+        centers = new_centers
+    centers = np.sort(centers)
+    label_map = {}
+    for val in xs:
+        lab = int(np.argmin(np.abs(centers - val)))
+        label_map[val] = lab
+    return centers.tolist(), label_map
+
 def credicoop_parse_from_words(file_like):
     """
-    - Detecta SALDO ANTERIOR explícito.
-    - Clusteriza posiciones X de importes para distinguir columnas: [Débito] [Crédito] [Saldo].
-    - Cada línea con fecha tiene a lo sumo 1 importe en (Débito o Crédito). El (Saldo) si aparece es subtotal del día.
-    - Líneas sin fecha y sin importes -> continuación de la descripción de la línea previa.
-    - Saldo se reconstruye desde el inicial.
+    Parser robusto para Credicoop:
+    - Toma SALDO ANTERIOR explícito.
+    - Detecta importes con search (tolerante a NBSP/espacios finos).
+    - Columnas por x0 (k-means). Fallback: orden de aparición (2 importes => monto + saldo).
+    - Reconstruye saldo desde SALDO ANTERIOR: saldo += crédito - débito.
+    - Líneas sin fecha/sin importes => continúan descripción anterior.
     """
     with pdfplumber.open(_rewind(file_like)) as pdf:
-        all_rows = []
-        amount_xs = []
-        raw_lines = []
-        # Buscar saldo anterior y final (en texto plano)
+        # --- leer "texto plano" para saldos del encabezado/pie
         full_text_lines = []
         for p in pdf.pages:
             t = p.extract_text() or ""
@@ -598,44 +639,43 @@ def credicoop_parse_from_words(file_like):
                     fecha_cierre = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
                     saldo_final_pdf = _first_amount_value(ln)
 
-        # Agrupar palabras por línea y recolectar X de importes
-        for pi, page in enumerate(pdf.pages, start=1):
-            rows = _group_lines_words(page, ytol=2.0)
-            for words in rows:
-                raw_lines.append(" ".join(w["text"] for w in words))
+        # --- agrupar words por línea + recolectar x0 de importes (tolerante)
+        all_rows = []
+        amount_xs = []
+        for page in pdf.pages:
+            for words in _group_lines_words(page, ytol=2.0):
+                # detectar importes con search (no fullmatch) por word
                 for w in words:
-                    if MONEY_RE.fullmatch(w["text"].strip()):
+                    raw = w["text"].replace("\u00A0", " ").replace("\u202F", " ").strip()
+                    m = MONEY_RE.search(raw)
+                    if m:
                         amount_xs.append(float(w["x0"]))
-            all_rows.extend(rows)
+                all_rows.append(words)
 
-        # Columnas: si hay muchos importes, intento 3; si no, 2
+        # columnas esperadas
         k = 3 if len(amount_xs) >= 15 else (2 if len(amount_xs) >= 3 else 1)
         centers, _ = _kmeans_1d(amount_xs, k)
         centers = sorted(centers)
-        # etiqueta por proximidad a centros
         def which_col(x0):
             if not centers:
                 return 0
             diffs = [abs(x0 - c) for c in centers]
             return int(np.argmin(diffs))
+        rightmost_col_idx = len(centers) - 1  # probable saldo
 
-        rightmost_col_idx = len(centers) - 1  # saldo (si existe)
-
+        # --- parseo línea a línea
         rows_out = []
         last_idx = None
 
         for words in all_rows:
             line_text = " ".join(w["text"] for w in words).strip()
-            has_amount = any(MONEY_RE.fullmatch(w["text"].strip()) for w in words)
+            has_amount_word = any(MONEY_RE.search(w["text"].replace("\u00A0"," ").replace("\u202F"," ")) for w in words)
 
-            # fecha al principio
-            mdate = DATE_START.match(line_text)
-            if mdate:
-                fecha = pd.to_datetime(mdate.group(1), dayfirst=True, errors="coerce")
+            md = DATE_START.match(line_text)
+            if md:
+                fecha = pd.to_datetime(md.group(1), dayfirst=True, errors="coerce")
 
-                # después de la fecha puede venir COMBTE (número) y luego descripción
-                # reconstruyo tokens desde las words (evita romper con espacios múltiples)
-                # busco índice de palabra que contiene la fecha
+                # localizar índice de la palabra fecha
                 di = None
                 for i, w in enumerate(words):
                     if DATE_RE.fullmatch(w["text"]):
@@ -643,59 +683,75 @@ def credicoop_parse_from_words(file_like):
                 j = di + 1 if di is not None else 1
 
                 combte = None
-                # si la siguiente word es numérica (3+ dígitos), la tomo como combte
                 if j < len(words) and ONLY_DIGITS.fullmatch(words[j]["text"]):
                     combte = words[j]["text"].strip()
                     j += 1
 
-                # split words en: left (desc) y right (importes)
-                amounts = []
+                # separar desc vs importes
                 desc_parts = []
+                amts = []   # (col_idx, value_txt)
                 for w in words[j:]:
-                    txt = w["text"].strip()
-                    if MONEY_RE.fullmatch(txt):
-                        col = which_col(float(w["x0"]))
-                        amounts.append((col, txt))
+                    raw = w["text"].replace("\u00A0", " ").replace("\u202F", " ").strip()
+                    m = MONEY_RE.search(raw)
+                    if m:
+                        col = which_col(float(w["x0"])) if centers else 0
+                        amts.append((col, m.group(0)))
                     else:
-                        desc_parts.append(txt)
+                        desc_parts.append(w["text"])
                 desc = " ".join(desc_parts).strip()
 
-                # decidir débito/crédito ignorando la columna "saldo" (derecha)
-                deb = cre = np.nan
-                for col, txt in amounts:
-                    if col == rightmost_col_idx:
-                        continue  # saldo subtotal del día
-                    val = normalize_money(txt)
-                    # si hay 2 columnas (k==2): col 0 = débito, col 1 = crédito
-                    if len(centers) == 1:
-                        # raro; si hay una sola, no puedo distinguir; dejo para reglas por texto:
-                        if "CREDITO" in desc.upper() or "ACRED" in desc.upper():
-                            cre = val
-                        else:
-                            deb = val
-                    elif len(centers) == 2:
-                        if col == 0: deb = val
-                        else:        cre = val
+                # decidir débito/crédito, evitando saldo (columna derecha)
+                deb = cre = 0.0
+                if amts:
+                    # si no pude ubicar columnas (centers vacío), uso orden:
+                    if not centers:
+                        if len(amts) == 1:
+                            # único monto => lo tomo como movimiento (heurística texto)
+                            val = normalize_money(amts[0][1])
+                            if "ACRED" in desc.upper() or "CRÉDIT" in desc.upper() or "CREDITO" in desc.upper() or "CR " in desc.upper():
+                                cre = float(val)
+                            else:
+                                deb = float(val)
+                        elif len(amts) >= 2:
+                            # 2 o más: el último es saldo del día; el primero es el movimiento
+                            mov_val = normalize_money(amts[0][1])
+                            # heurística por texto para elegir lado:
+                            if "ACRED" in desc.upper() or "CRÉDIT" in desc.upper() or "CREDITO" in desc.upper():
+                                cre = float(mov_val)
+                            else:
+                                deb = float(mov_val)
                     else:
-                        # 3 columnas: 0=deb,1=cred,2=saldo
-                        if col == 0: deb = val
-                        elif col == 1: cre = val
+                        # con columnas: 0=deb, 1=cred, (2=saldo si existe)
+                        for col, txt in amts:
+                            if col == rightmost_col_idx and len(centers) >= 3:
+                                continue  # saldo
+                            val = float(normalize_money(txt))
+                            if len(centers) == 1:
+                                # imposible distinguir, heurística texto
+                                if "ACRED" in desc.upper() or "CREDITO" in desc.upper():
+                                    cre += val
+                                else:
+                                    deb += val
+                            elif len(centers) == 2:
+                                if col == 0: deb += val
+                                else:        cre += val
+                            else:
+                                if col == 0: deb += val
+                                elif col == 1: cre += val
 
                 rows_out.append({
                     "fecha": fecha,
                     "combte": combte,
                     "descripcion": desc,
-                    "debito": float(deb) if pd.notna(deb) else 0.0,
-                    "credito": float(cre) if pd.notna(cre) else 0.0,
+                    "debito": float(deb),
+                    "credito": float(cre),
                 })
                 last_idx = len(rows_out) - 1
             else:
-                # línea continuación de descripción (si no trae importe)
-                if (not has_amount) and last_idx is not None:
+                if (not has_amount_word) and last_idx is not None:
                     s = line_text.strip()
                     if s:
                         rows_out[last_idx]["descripcion"] = (rows_out[last_idx]["descripcion"] + " " + s).strip()
-                # si trae importes sin fecha -> la ignoro (suele ser totalización visual)
 
         df = pd.DataFrame(rows_out)
         if df.empty:
@@ -703,7 +759,7 @@ def credicoop_parse_from_words(file_like):
 
         df["desc_norm"] = df["descripcion"].map(normalize_desc)
 
-        # reconstruyo saldo corrido
+        # reconstrucción de saldo corrido
         running = float(saldo_anterior) if not np.isnan(saldo_anterior) else 0.0
         saldos = []
         for _, r in df.iterrows():
@@ -712,6 +768,7 @@ def credicoop_parse_from_words(file_like):
         df["saldo"] = saldos
 
         return df, fecha_cierre, saldo_final_pdf, saldo_anterior
+
 
 # ---------- Helper UI por cuenta (genérico) ----------
 def render_account_report(
