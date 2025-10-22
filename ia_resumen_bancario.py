@@ -161,7 +161,7 @@ def detect_bank_from_text(txt: str) -> str:
                key=lambda t: t[1])
     return best[0] if best[1] > 0 else "Banco no identificado"
 
-# ---------- extracción de líneas (texto+palabras) ----------
+# ---------- extracción de líneas ----------
 def extract_all_lines(file_like):
     out = []
     with pdfplumber.open(_rewind(file_like)) as pdf:
@@ -292,7 +292,7 @@ def macro_split_account_blocks(file_like):
         blocks.append(acc)
     return blocks
 
-# ---------- Parsing genérico (usa saldo por línea) ----------
+# ---------- Parsing genérico (con saldo en línea) ----------
 def parse_lines(lines) -> pd.DataFrame:
     rows = []
     seq = 0
@@ -387,7 +387,7 @@ def find_saldo_anterior_from_lines(lines):
             break
     return np.nan
 
-# ---------- Clasificación (igual que venías usando) ----------
+# ---------- Clasificación ----------
 RE_PERCEP_RG2408 = re.compile(
     r"(PERCEPCI[ÓO]N\s+IVA\s+RG\.?\s*2408|PERCEPCION\s+IVA\s+RG\s*2408.*COMIS\-?GASTOS)",
     re.IGNORECASE
@@ -517,54 +517,7 @@ def credicoop_extract_meta(file_like):
             title = " ".join(line.split()); break
     return {"title": title or "CUENTA (Credicoop)", "cbu": cbu, "account_number": acc}
 
-# ===== Credicoop: parser por palabras/posiciones (no usa saldo por línea) =====
-DATE_START = re.compile(r'^\s*(\d{1,2}/\d{2}/\d{2,4})\b')
-ONLY_DIGITS = re.compile(r'^\d{3,}$')
-
-def _kmeans_1d(xs, k):
-    """K-means 1D simple (para clusterizar posiciones X de importes)."""
-    xs = np.asarray(sorted(xs), dtype=float)
-    xs = xs[~np.isnan(xs)]
-    if len(xs) == 0:
-        return [], []
-    k = min(k, len(xs))
-    # init por percentiles
-    centers = np.quantile(xs, np.linspace(0, 1, k))
-    for _ in range(20):
-        # asignación
-        labels = np.argmin(np.abs(xs[:, None] - centers[None, :]), axis=1)
-        new_centers = np.array([xs[labels == i].mean() if np.any(labels == i) else centers[i]
-                                for i in range(k)])
-        if np.allclose(new_centers, centers, atol=1e-3):
-            break
-        centers = new_centers
-    order = np.argsort(centers)
-    centers = centers[order]
-    # devuelvo mapping desde valor->label ordenado
-    label_map = {}
-    for val, lab in zip(xs, np.argsort(np.abs(xs[:, None] - centers[None, :]), axis=1)[:,0]):
-        label_map[val] = lab
-    return centers.tolist(), label_map
-
-def _group_lines_words(page, ytol=2.0):
-    words = page.extract_words(extra_attrs=["x0","x1","top","bottom","text"])
-    if not words:
-        return []
-    words.sort(key=lambda w: (round(w["top"]/ytol), w["x0"]))
-    rows, cur, band = [], [], None
-    for w in words:
-        b = round(w["top"]/ytol)
-        if band is None or b == band:
-            cur.append(w)
-        else:
-            rows.append(cur)
-            cur = [w]
-        band = b
-    if cur:
-        rows.append(cur)
-    return rows
-
-# ===== Credicoop: parser por palabras/posiciones (robusto) =====
+# ===== Credicoop: parser por palabras/posiciones (sin usar saldo por línea) =====
 DATE_START = re.compile(r'^\s*(\d{1,2}/\d{2}/\d{2,4})\b')
 ONLY_DIGITS = re.compile(r'^\d{3,}$')
 
@@ -610,14 +563,14 @@ def _kmeans_1d(xs, k):
 def credicoop_parse_from_words(file_like):
     """
     Parser robusto para Credicoop:
-    - Toma SALDO ANTERIOR explícito.
-    - Detecta importes con search (tolerante a NBSP/espacios finos).
-    - Columnas por x0 (k-means). Fallback: orden de aparición (2 importes => monto + saldo).
-    - Reconstruye saldo desde SALDO ANTERIOR: saldo += crédito - débito.
-    - Líneas sin fecha/sin importes => continúan descripción anterior.
+    - Toma SALDO ANTERIOR explícito si existe.
+    - Detecta importes por palabra (tolerante a NBSP/espacios finos).
+    - Columnas por x0 (k-means). Si hay 3, la última se asume SALDO; si hay 2, son Débito/Crédito.
+    - No intenta leer saldos por línea; reconstruye saldo desde SALDO ANTERIOR.
+    - Líneas sin fecha y sin importes => continúan la descripción anterior.
     """
     with pdfplumber.open(_rewind(file_like)) as pdf:
-        # --- leer "texto plano" para saldos del encabezado/pie
+        # encabezados / pies para saldo anterior y final
         full_text_lines = []
         for p in pdf.pages:
             t = p.extract_text() or ""
@@ -639,12 +592,11 @@ def credicoop_parse_from_words(file_like):
                     fecha_cierre = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
                     saldo_final_pdf = _first_amount_value(ln)
 
-        # --- agrupar words por línea + recolectar x0 de importes (tolerante)
+        # agrupar palabras por línea y recolectar x0 de importes
         all_rows = []
         amount_xs = []
         for page in pdf.pages:
             for words in _group_lines_words(page, ytol=2.0):
-                # detectar importes con search (no fullmatch) por word
                 for w in words:
                     raw = w["text"].replace("\u00A0", " ").replace("\u202F", " ").strip()
                     m = MONEY_RE.search(raw)
@@ -652,7 +604,7 @@ def credicoop_parse_from_words(file_like):
                         amount_xs.append(float(w["x0"]))
                 all_rows.append(words)
 
-        # columnas esperadas
+        # detectar columnas (1, 2 o 3)
         k = 3 if len(amount_xs) >= 15 else (2 if len(amount_xs) >= 3 else 1)
         centers, _ = _kmeans_1d(amount_xs, k)
         centers = sorted(centers)
@@ -661,9 +613,9 @@ def credicoop_parse_from_words(file_like):
                 return 0
             diffs = [abs(x0 - c) for c in centers]
             return int(np.argmin(diffs))
-        rightmost_col_idx = len(centers) - 1  # probable saldo
+        rightmost_col_idx = len(centers) - 1  # probable SALDO si hay 3
 
-        # --- parseo línea a línea
+        # parseo
         rows_out = []
         last_idx = None
 
@@ -675,7 +627,7 @@ def credicoop_parse_from_words(file_like):
             if md:
                 fecha = pd.to_datetime(md.group(1), dayfirst=True, errors="coerce")
 
-                # localizar índice de la palabra fecha
+                # índice de la palabra fecha
                 di = None
                 for i, w in enumerate(words):
                     if DATE_RE.fullmatch(w["text"]):
@@ -687,9 +639,7 @@ def credicoop_parse_from_words(file_like):
                     combte = words[j]["text"].strip()
                     j += 1
 
-                # separar desc vs importes
-                desc_parts = []
-                amts = []   # (col_idx, value_txt)
+                desc_parts, amts = [], []   # amts: (col_idx, value_txt)
                 for w in words[j:]:
                     raw = w["text"].replace("\u00A0", " ").replace("\u202F", " ").strip()
                     m = MONEY_RE.search(raw)
@@ -700,34 +650,23 @@ def credicoop_parse_from_words(file_like):
                         desc_parts.append(w["text"])
                 desc = " ".join(desc_parts).strip()
 
-                # decidir débito/crédito, evitando saldo (columna derecha)
+                # decidir débito/crédito, ignorando saldo (columna derecha)
                 deb = cre = 0.0
                 if amts:
-                    # si no pude ubicar columnas (centers vacío), uso orden:
                     if not centers:
-                        if len(amts) == 1:
-                            # único monto => lo tomo como movimiento (heurística texto)
-                            val = normalize_money(amts[0][1])
-                            if "ACRED" in desc.upper() or "CRÉDIT" in desc.upper() or "CREDITO" in desc.upper() or "CR " in desc.upper():
-                                cre = float(val)
-                            else:
-                                deb = float(val)
-                        elif len(amts) >= 2:
-                            # 2 o más: el último es saldo del día; el primero es el movimiento
-                            mov_val = normalize_money(amts[0][1])
-                            # heurística por texto para elegir lado:
-                            if "ACRED" in desc.upper() or "CRÉDIT" in desc.upper() or "CREDITO" in desc.upper():
-                                cre = float(mov_val)
-                            else:
-                                deb = float(mov_val)
+                        # sin columnas: si hay 2+ importes, el último sería saldo => tomo el primero como mov
+                        mov_val = normalize_money(amts[0][1])
+                        if "ACRED" in desc.upper() or "CREDITO" in desc.upper():
+                            cre += float(mov_val)
+                        else:
+                            deb += float(mov_val)
                     else:
-                        # con columnas: 0=deb, 1=cred, (2=saldo si existe)
+                        # 0=deb, 1=cred, (2=saldo si existe)
                         for col, txt in amts:
                             if col == rightmost_col_idx and len(centers) >= 3:
                                 continue  # saldo
                             val = float(normalize_money(txt))
                             if len(centers) == 1:
-                                # imposible distinguir, heurística texto
                                 if "ACRED" in desc.upper() or "CREDITO" in desc.upper():
                                     cre += val
                                 else:
@@ -735,7 +674,7 @@ def credicoop_parse_from_words(file_like):
                             elif len(centers) == 2:
                                 if col == 0: deb += val
                                 else:        cre += val
-                            else:
+                            else:  # 3 columnas
                                 if col == 0: deb += val
                                 elif col == 1: cre += val
 
@@ -1077,7 +1016,6 @@ elif _bank_name == "Banco Credicoop":
     meta = credicoop_extract_meta(io.BytesIO(data))
     dfc, fecha_cierre, saldo_final_pdf, saldo_anterior_pdf = credicoop_parse_from_words(io.BytesIO(data))
 
-
     titulo = meta.get("title") or "CUENTA (Credicoop)"
     nro = meta.get("account_number") or "s/n"
     acc_id = f"credicoop-{re.sub(r'[^0-9A-Za-z]+', '_', nro)}"
@@ -1173,3 +1111,4 @@ elif _bank_name == "Banco Credicoop":
 else:
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
+
