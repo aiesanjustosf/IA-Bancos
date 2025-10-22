@@ -37,7 +37,12 @@ except Exception:
 
 # --- regex base ---
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{2,4}\b")  # dd/mm/aa o dd/mm/aaaa
-MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
+
+# CLAVE: aceptar separadores con espacio/nbsp y '-' final con o SIN espacio
+MONEY_RE = re.compile(
+    r'(?<!\S)(?:\d{1,3}(?:[.\s\u00A0\u202F]\d{3})*|\d+)\s?,\s?\d{2}(?:\s*-)?(?!\S)'
+)
+
 LONG_INT_RE = re.compile(r"\b\d{6,}\b")
 
 # ====== PATRONES ESPECÍFICOS ======
@@ -86,12 +91,15 @@ def normalize_money(tok: str) -> float:
     if not tok:
         return np.nan
     tok = tok.strip()
+    # permitir " -"
+    tok = tok.replace(" -", "-")
     neg = tok.endswith("-")
     tok = tok.rstrip("-")
+    # quitar espacios/nbsp en la parte entera
     if "," not in tok:
         return np.nan
     main, frac = tok.rsplit(",", 1)
-    main = main.replace(".", "").replace(" ", "")
+    main = main.replace(".", "").replace(" ", "").replace("\u00A0","").replace("\u202F","")
     try:
         val = float(f"{main}.{frac}")
         return -val if neg else val
@@ -517,12 +525,11 @@ def credicoop_extract_meta(file_like):
             title = " ".join(line.split()); break
     return {"title": title or "CUENTA (Credicoop)", "cbu": cbu, "account_number": acc}
 
-# ===== Credicoop: parser (UN solo movimiento por renglón; si hay 2 montos, el de la derecha es SALDO) =====
+# ===== Credicoop: parser (1 movimiento; si hay 2 montos, el de la derecha es saldo) =====
 DATE_ANY = DATE_RE
 ONLY_DIGITS = re.compile(r'^\d{3,}$')
 
 def _group_lines_words(page, ytol=3.5):
-    """Agrupa las 'words' del PDF en renglones por coordenada Y (tolerancia más amplia)."""
     words = page.extract_words(extra_attrs=["x0","x1","top","bottom","text"])
     if not words:
         return []
@@ -539,11 +546,9 @@ def _group_lines_words(page, ytol=3.5):
     return rows
 
 def _cluster_two(xs):
-    """Devuelve (c_izq, c_der) o None si no hay suficientes puntos para distinguir columnas."""
     xs = sorted(float(x) for x in xs if x is not None)
     if len(xs) < 4:
         return None
-    # inicializo por percentiles 30/70
     c1, c2 = np.quantile(xs, [0.3, 0.7])
     for _ in range(25):
         g1 = [x for x in xs if abs(x-c1) <= abs(x-c2)]
@@ -558,16 +563,13 @@ def credicoop_parse_from_words(file_like):
     """
     Reglas:
       - Cada renglón con fecha tiene como máximo 1 movimiento.
-      - Si hay 2 importes: el de la DERECHA es SALDO DEL DÍA -> se ignora; el otro es el movimiento.
-      - Si hay 1 importe: es el movimiento.
-      - Débito/Crédito:
-          * Si podemos inferir columnas por 'x0' de muchos renglones, usamos centro izquierdo=DEB, centro derecho=CRED.
-          * Si no, fallback por keywords en descripción (ACRED/CRÉDIT/CREDITO/`CR ` => crédito; si no => débito).
-      - Líneas sin fecha y sin importes: se pegan a la descripción anterior.
-      - El saldo corrido se reconstruye desde SALDO ANTERIOR si aparece.
+      - Si hay ≥2 importes: el de la DERECHA es SALDO (se ignora); el restante es el movimiento.
+      - Débito/Crédito por columnas (si se puede) o por keywords (ACRED/CRÉDIT/CREDITO/`CR `).
+      - Líneas sin fecha y sin importes: se concatenan a la descripción anterior.
+      - Saldo reconstruido desde SALDO ANTERIOR.
     """
     with pdfplumber.open(_rewind(file_like)) as pdf:
-        # 1) Buscar SALDO ANTERIOR y SALDO FINAL en texto plano (encabezado/pie)
+        # Buscar SALDO ANTERIOR / SALDO FINAL
         full_text_lines = []
         for p in pdf.pages:
             t = p.extract_text() or ""
@@ -588,7 +590,7 @@ def credicoop_parse_from_words(file_like):
                     fecha_cierre = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce")
                     saldo_final_pdf = _first_amount_value(ln)
 
-        # 2) Primera pasada: recolecto posiciones x0 de movimientos (excluyendo el saldo derecho)
+        # Pasada 1: recolectar x0 de movimientos (ignorando saldo derecho)
         mov_xs = []
         all_rows = []
         for page in pdf.pages:
@@ -604,21 +606,18 @@ def credicoop_parse_from_words(file_like):
                     mov_xs.append(amts[0][0])
                 elif len(amts) >= 2:
                     amts_sorted = sorted(amts, key=lambda t: t[0])
-                    for x0, _ in amts_sorted[:-1]:  # todo excepto el más a la derecha (saldo)
+                    for x0, _ in amts_sorted[:-1]:  # todo menos el más a la derecha (saldo)
                         mov_xs.append(x0)
 
-        # infiero columnas (si hay suficientes datos)
         col_centers = _cluster_two(mov_xs)  # (x_izq, x_der) o None
 
         def guess_side(x0, descU):
-            """Devuelve 'deb' o 'cre'."""
             if col_centers and x0 is not None:
                 left, right = col_centers
                 return 'deb' if abs(x0-left) <= abs(x0-right) else 'cre'
-            # fallback por keywords
             return 'cre' if any(k in descU for k in ("ACRED","CRÉDIT","CREDITO","CR ")) else 'deb'
 
-        # 3) Segunda pasada: parseo renglón a renglón
+        # Pasada 2: parseo definitivo
         rows_out = []
         last_idx = None
 
@@ -626,12 +625,11 @@ def credicoop_parse_from_words(file_like):
             line_text = " ".join(w["text"] for w in words).replace("\u00A0"," ").replace("\u202F"," ").strip()
             has_amount = bool(MONEY_RE.search(line_text))
 
-            # aceptar fecha en cualquier parte del renglón
-            mdate = DATE_ANY.search(line_text)
+            mdate = DATE_ANY.search(line_text)  # fecha en cualquier parte
             if mdate:
                 fecha = pd.to_datetime(mdate.group(0), dayfirst=True, errors="coerce")
 
-                # ubico índice de la word con la fecha
+                # índice de la palabra de fecha (para cortar la descripción inicial si hace falta)
                 di = None
                 for i, w in enumerate(words):
                     if DATE_RE.search(w["text"] or ""):
@@ -644,7 +642,7 @@ def credicoop_parse_from_words(file_like):
                     combte = after_date[0]["text"].strip()
                     after_date = after_date[1:]
 
-                # separo descripción y montos con posición
+                # separar descripción y montos
                 desc_parts, amts = [], []
                 for w in after_date:
                     raw = w["text"].replace("\u00A0"," ").replace("\u202F"," ").strip()
@@ -656,7 +654,7 @@ def credicoop_parse_from_words(file_like):
                 desc = " ".join(desc_parts).strip()
                 descU = desc.upper()
 
-                # único movimiento de la línea
+                # único movimiento
                 mov_val = 0.0
                 mov_x0  = None
                 if len(amts) == 1:
@@ -664,17 +662,14 @@ def credicoop_parse_from_words(file_like):
                     mov_val = float(normalize_money(mov_txt))
                 elif len(amts) >= 2:
                     amts_sorted = sorted(amts, key=lambda t: t[0])
-                    mov_x0, mov_txt = amts_sorted[0]     # izquierda = movimiento
+                    mov_x0, mov_txt = amts_sorted[0]   # izquierda = movimiento
                     mov_val = float(normalize_money(mov_txt))
-                else:
-                    mov_val = 0.0; mov_x0 = None
 
                 deb = cre = 0.0
-                side = guess_side(mov_x0, descU)
-                if side == 'cre':
-                    cre = mov_val
-                else:
-                    deb = mov_val
+                if mov_val != 0.0:
+                    side = guess_side(mov_x0, descU)
+                    if side == 'cre': cre = mov_val
+                    else:             deb = mov_val
 
                 rows_out.append({
                     "fecha": fecha,
@@ -686,7 +681,7 @@ def credicoop_parse_from_words(file_like):
                 last_idx = len(rows_out) - 1
 
             else:
-                # renglón de continuación: sin fecha y sin importes -> pega a la descripción anterior
+                # continuación de texto
                 if (not has_amount) and last_idx is not None:
                     s = line_text.strip()
                     if s:
@@ -698,7 +693,7 @@ def credicoop_parse_from_words(file_like):
 
         df["desc_norm"] = df["descripcion"].map(normalize_desc)
 
-        # 4) Reconstruyo saldo corrido SOLO con débito/crédito
+        # Saldo corrido
         running = float(saldo_anterior) if not np.isnan(saldo_anterior) else 0.0
         saldos = []
         for _, r in df.iterrows():
@@ -1011,7 +1006,7 @@ elif _bank_name == "Banco de la Nación Argentina":
     render_account_report(_bank_slug, titulo, nro, acc_id, all_lines, bna_extras=bna_extras)
 
 elif _bank_name == "Banco Credicoop":
-    # Parser específico: columnas por posición, saldo reconstruido desde SALDO ANTERIOR
+    # Parser específico Credicoop
     meta = credicoop_extract_meta(io.BytesIO(data))
     dfc, fecha_cierre, saldo_final_pdf, saldo_anterior_pdf = credicoop_parse_from_words(io.BytesIO(data))
 
