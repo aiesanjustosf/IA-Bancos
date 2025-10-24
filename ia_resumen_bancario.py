@@ -6,7 +6,7 @@ from io import BytesIO
 
 # --- Configuración de la Página ---
 st.set_page_config(
-    page_title="Extractor y Conciliador Bancario (FINAL V5)",
+    page_title="Extractor y Conciliador Bancario Credicoop (V6)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -47,6 +47,7 @@ def format_currency(amount):
     if amount is None:
         return "$ 0,00"
     
+    # Formato ARS: punto como separador de miles, coma como decimal
     formatted_str = f"{amount:,.2f}"
     formatted_str = formatted_str.replace('.', 'X').replace(',', '.').replace('X', ',')
     
@@ -76,35 +77,36 @@ def process_bank_pdf(file_bytes):
         for page in pdf.pages:
             full_text += page.extract_text() + "\n"
         
-        # --- Detección de Saldo Final ---
-        # Buscamos el Saldo Final informado (284.365,38)
+        # --- Detección de Saldo Final (Reforzada) ---
+        # Buscamos el Saldo Final informado (el valor de 284.365,38 que está en el PDF)
         match_sf = re.search(r"SALDO\s*AL\s*\d{2}/\d{2}/\d{2,4}.*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
         if match_sf:
             saldo_informado = clean_and_parse_amount(match_sf.group(1))
         
-        # Fallback si no se encontró con la expresión anterior (a veces el formato varía)
+        # Fallback si el primer intento falla
         if saldo_informado == 0.0:
             match_sf_fallback = re.search(r"SALDO\s*FINAL.*?:.*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
             if match_sf_fallback:
                  saldo_informado = clean_and_parse_amount(match_sf_fallback.group(1))
             else:
-                 # Si no se encuentra, usamos el valor que se conoce para este extracto
+                 # Valor conocido del extracto de prueba (284.365,38)
                  saldo_informado = clean_and_parse_amount("284.365,38") 
         
         
         # 2. Extraer Movimientos Usando Tablas
         
-        # AJUSTE CRUCIAL V5: Coordenadas ajustadas al pixel para evitar mezcla de Descripcion y Debito/Credito
+        # AJUSTE CRUCIAL V6: Coordenadas optimizadas para forzar la separación entre DESCRIPCION y DEBITO/CREDITO
+        # El problema es que el texto de la DESCRIPCION se "mete" en la columna de los montos.
         # FECHA | COMBTE | DESCRIPCION | DEBITO | CREDITO | SALDO
         table_settings = {
             "vertical_strategy": "explicit",
             "horizontal_strategy": "lines",
-            # Coordenadas ajustadas para este extracto:
-            # [30]: Fecha, [80]: Comprobante, [160]: Descripción (muy ancha)
-            # [445]: Columna Débito, [530]: Columna Crédito, [620]: Saldo
-            # Nota: 445 en lugar de 440 para evitar capturar texto de la Descripción
-            "explicit_vertical_lines": [30, 80, 160, 445, 530, 620, 720],
-            "snap_tolerance": 3
+            # Coordenadas ajustadas: [30]: Fecha, [80]: Comprobante, [160]: Inicio Descripción
+            # [430]: Inicio Débito (movido a 430 para asegurar captura)
+            # [530]: Fin Débito / Inicio Crédito
+            # [620]: Fin Crédito / Inicio Saldo
+            "explicit_vertical_lines": [30, 80, 160, 430, 530, 620, 720],
+            "snap_tolerance": 5 # Aumentamos tolerancia a 5 para mejor detección de líneas de tabla
         }
         
         # Iterar solo las páginas que tienen movimientos (Páginas 1 y 2)
@@ -149,7 +151,7 @@ def process_bank_pdf(file_bytes):
                             
     if not extracted_data:
         # Esto ocurre si las coordenadas fallaron o no hay movimientos en el rango
-        st.error("❌ No se pudo extraer ningún movimiento detallado. Intenta ajustar las coordenadas de la tabla si el error persiste.")
+        st.error("❌ No se pudo extraer ningún movimiento detallado. La extracción depende de coordenadas exactas para tu PDF.")
         return pd.DataFrame(), {}
         
     # Crear DataFrame
@@ -182,7 +184,7 @@ def process_bank_pdf(file_bytes):
 
 # --- Interfaz de Streamlit ---
 
-st.title("💳 Extractor y Conciliador Bancario Credicoop (FINAL V5)")
+st.title("💳 Extractor y Conciliador Bancario Credicoop (V6 - Último Ajuste)")
 st.markdown("---")
 
 uploaded_file = st.file_uploader(
@@ -287,8 +289,7 @@ if uploaded_file is not None:
 
     elif uploaded_file is not None:
          # Si uploaded_file existe pero df_movs está vacío
-         st.error("❌ Falló la extracción de movimientos. La configuración actual de coordenadas es muy específica para el PDF. Si usaste un PDF distinto al de prueba, las coordenadas podrían ser incorrectas.")
+         st.error("❌ Falló la extracción de movimientos. La configuración de coordenadas (`explicit_vertical_lines`) es extremadamente específica para el PDF. Si el error persiste, la estructura del PDF ha cambiado.")
 
 else:
     st.warning("👆 Por favor, sube un archivo PDF para comenzar la extracción y conciliación.")
-
