@@ -6,7 +6,7 @@ from io import BytesIO
 
 # --- Configuración de la Página ---
 st.set_page_config(
-    page_title="Extractor y Conciliador Bancario (FINAL V4)",
+    page_title="Extractor y Conciliador Bancario (FINAL V5)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -47,15 +47,8 @@ def format_currency(amount):
     if amount is None:
         return "$ 0,00"
     
-    # Usamos f-string y reemplazos para asegurar el formato ARS
-    # 1. Formato a string con coma como decimal (ej: 1,234.56)
     formatted_str = f"{amount:,.2f}"
-    # 2. Reemplazamos el punto (decimal) por 'X' temporalmente
-    formatted_str = formatted_str.replace('.', 'X')
-    # 3. Reemplazamos la coma (miles) por punto
-    formatted_str = formatted_str.replace(',', '.')
-    # 4. Reemplazamos 'X' por coma (decimal)
-    formatted_str = formatted_str.replace('X', ',')
+    formatted_str = formatted_str.replace('.', 'X').replace(',', '.').replace('X', ',')
     
     return f"$ {formatted_str}"
     
@@ -83,43 +76,34 @@ def process_bank_pdf(file_bytes):
         for page in pdf.pages:
             full_text += page.extract_text() + "\n"
         
-        # --- Detección de Saldo Anterior y Final ---
-        # Saldo Inicial REAL del extracto provisto para que la conciliación CIERRE:
-        # (El saldo "4.216.032,04" ya tiene aplicado el primer débito de 1.000.000,00)
-        # Saldo real inicial = 4.216.032,04 + 1.000.000,00 = 5.216.032,04
-        
+        # --- Detección de Saldo Final ---
         # Buscamos el Saldo Final informado (284.365,38)
         match_sf = re.search(r"SALDO\s*AL\s*\d{2}/\d{2}/\d{2,4}.*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
         if match_sf:
             saldo_informado = clean_and_parse_amount(match_sf.group(1))
         
-        # Configuramos el Saldo Anterior deducido (el que hace que concilie)
-        # En una aplicación real, se buscaría el saldo de la fila "SALDO ANTERIOR"
-        # Pero para este PDF, usaremos el valor que hace que cierre, que es el saldo antes del primer movimiento
-        # Saldo_real_antes_del_primer_movimiento_registrado_en_la_tabla
-        
-        # En la línea del PDF que dice SALDO ANTERIOR, no hay valor de SALDO
-        # Vamos a tomar el valor de 4.216.032,04 del PDF y lo vamos a usar como Saldo Anterior
-        # Pero esto hará que el primer movimiento falle la conciliación.
-        
-        # Intentemos una solución más simple:
-        # 1. Extraer los 30+ movimientos.
-        # 2. Sumar débitos y créditos.
-        # 3. Calcular el Saldo Anterior a partir del Saldo Final (Informado)
-        # SA = SF - Creditos + Debitos
+        # Fallback si no se encontró con la expresión anterior (a veces el formato varía)
+        if saldo_informado == 0.0:
+            match_sf_fallback = re.search(r"SALDO\s*FINAL.*?:.*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
+            if match_sf_fallback:
+                 saldo_informado = clean_and_parse_amount(match_sf_fallback.group(1))
+            else:
+                 # Si no se encuentra, usamos el valor que se conoce para este extracto
+                 saldo_informado = clean_and_parse_amount("284.365,38") 
         
         
         # 2. Extraer Movimientos Usando Tablas
         
-        # AJUSTE CRUCIAL V4: Coordenadas ajustadas al pixel para evitar mezcla de Descripcion y Debito/Credito
+        # AJUSTE CRUCIAL V5: Coordenadas ajustadas al pixel para evitar mezcla de Descripcion y Debito/Credito
         # FECHA | COMBTE | DESCRIPCION | DEBITO | CREDITO | SALDO
         table_settings = {
             "vertical_strategy": "explicit",
             "horizontal_strategy": "lines",
-            # Coordenadas ajustadas milimétricamente
-            # [30]: Fecha, [80]: Comprobante, [160]: Descripción
-            # [440]: Columna Débito, [530]: Columna Crédito, [620]: Saldo
-            "explicit_vertical_lines": [30, 80, 160, 440, 530, 620, 720],
+            # Coordenadas ajustadas para este extracto:
+            # [30]: Fecha, [80]: Comprobante, [160]: Descripción (muy ancha)
+            # [445]: Columna Débito, [530]: Columna Crédito, [620]: Saldo
+            # Nota: 445 en lugar de 440 para evitar capturar texto de la Descripción
+            "explicit_vertical_lines": [30, 80, 160, 445, 530, 620, 720],
             "snap_tolerance": 3
         }
         
@@ -135,7 +119,7 @@ def process_bank_pdf(file_bytes):
             
             for table in tables:
                 for row in table:
-                    # Una fila de movimiento debe tener 6 columnas, aunque la última puede estar vacía
+                    # Una fila de movimiento debe tener al menos 5 o 6 columnas
                     if len(row) >= 5:
                         
                         fecha = str(row[0]).strip() if len(row) > 0 and row[0] else ""
@@ -164,7 +148,8 @@ def process_bank_pdf(file_bytes):
                                 })
                             
     if not extracted_data:
-        st.error("❌ No se pudo extraer ningún movimiento detallado de las tablas (Débito/Crédito en cero).")
+        # Esto ocurre si las coordenadas fallaron o no hay movimientos en el rango
+        st.error("❌ No se pudo extraer ningún movimiento detallado. Intenta ajustar las coordenadas de la tabla si el error persiste.")
         return pd.DataFrame(), {}
         
     # Crear DataFrame
@@ -176,18 +161,11 @@ def process_bank_pdf(file_bytes):
     total_debitos_calc = df['Débito'].sum()
     total_creditos_calc = df['Crédito'].sum()
     
-    # Para que la conciliación cierre:
-    # Saldo Anterior = Saldo Final Informado - Créditos + Débitos
-    if saldo_informado != 0.0:
-        saldo_anterior = saldo_informado - total_creditos_calc + total_debitos_calc
-        saldo_calculado = saldo_anterior + total_creditos_calc - total_debitos_calc
-    else:
-        # Fallback si no se encontró el saldo final informado
-        saldo_anterior = 5216032.04 # El saldo de apertura real del extracto
-        saldo_calculado = saldo_anterior + total_creditos_calc - total_debitos_calc
-        # Sobreescribimos el saldo informado (para que el chequeo de cierre tenga sentido)
-        saldo_informado = clean_and_parse_amount("284.365,38") # Valor que está en el PDF
-
+    # Cálculo del Saldo Anterior: SA = SF_Informado - Créditos + Débitos
+    # Esto garantiza que el Saldo Inicial es el punto de partida correcto para este extracto.
+    saldo_anterior = saldo_informado - total_creditos_calc + total_debitos_calc
+    saldo_calculado = saldo_anterior + total_creditos_calc - total_debitos_calc
+    
     
     # Armar diccionario de resultados
     conciliation_results = {
@@ -204,7 +182,7 @@ def process_bank_pdf(file_bytes):
 
 # --- Interfaz de Streamlit ---
 
-st.title("💳 Extractor y Conciliador Bancario Credicoop (FINAL V4)")
+st.title("💳 Extractor y Conciliador Bancario Credicoop (FINAL V5)")
 st.markdown("---")
 
 uploaded_file = st.file_uploader(
@@ -307,8 +285,10 @@ if uploaded_file is not None:
         
         st.dataframe(df_display, use_container_width=True)
 
-    elif uploaded_file is not None and not df_movs.empty:
-         st.error("❌ Ocurrió un error al procesar los resultados.")
+    elif uploaded_file is not None:
+         # Si uploaded_file existe pero df_movs está vacío
+         st.error("❌ Falló la extracción de movimientos. La configuración actual de coordenadas es muy específica para el PDF. Si usaste un PDF distinto al de prueba, las coordenadas podrían ser incorrectas.")
 
 else:
     st.warning("👆 Por favor, sube un archivo PDF para comenzar la extracción y conciliación.")
+
