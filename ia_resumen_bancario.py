@@ -6,7 +6,7 @@ from io import BytesIO
 
 # --- Configuración de la Página ---
 st.set_page_config(
-    page_title="Extractor y Conciliador Bancario Credicoop (V7)",
+    page_title="Extractor y Conciliador Bancario Credicoop (V8)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -67,6 +67,7 @@ def process_bank_pdf(file_bytes):
     saldo_informado = 0.0
     
     # Patrón para encontrar números de moneda (puede ser negativo)
+    # Busca un número con formato ARS (punto miles, coma decimal)
     currency_pattern = r"[\(]?-?\s*(\d{1,3}(?:\.\d{3})*,\d{2})[\)]?"
     
     
@@ -91,33 +92,33 @@ def process_bank_pdf(file_bytes):
             # Group(1) ya contiene el monto sin signos de puntuación extraños, solo formato ARS
             saldo_informado = clean_and_parse_amount(match_sf.group(1))
         
-        # 3. Fallback estricto (si todo lo anterior falla, usamos un valor "hardcodeado" solo para testeo)
+        # 3. Fallback estricto (usar valor conocido si no se encuentra nada)
         if saldo_informado == 0.0:
-            saldo_informado = clean_and_parse_amount("284.365,38") # Valor conocido del extracto de prueba
+            # Nota: Este valor es solo de referencia, debe ser detectado por el regex
+            saldo_informado = clean_and_parse_amount("284.365,38") 
         
         
         # 2. Extraer Movimientos Usando Tablas
         
-        # AJUSTE CRUCIAL V7: Optimización de Coordenadas
-        # Se ha movido el inicio de Débito más a la derecha para dar más espacio a la Descripción,
-        # previniendo que la descripción "invada" la columna de montos.
-        # FECHA | COMBTE | DESCRIPCION (Mayor espacio) | DEBITO | CREDITO | SALDO
+        # AJUSTE CRUCIAL V8: MÁS ESPACIO PARA MONTOS, MENOS PARA DESCRIPCIÓN
+        # Se ha movido el inicio de Débito y Crédito más a la derecha para separarlos.
+        # FECHA | COMBTE | DESCRIPCION (Menos espacio) | DEBITO | CREDITO | SALDO
         table_settings = {
             "vertical_strategy": "explicit",
             "horizontal_strategy": "lines",
             # Coordenadas ajustadas:
             # [30]: Fecha, [80]: Comprobante, 
             # [160]: Inicio Descripción
-            # [460]: Inicio Débito (Movido de 430 a 460)
-            # [560]: Fin Débito / Inicio Crédito (Movido de 530 a 560)
-            # [660]: Fin Crédito / Inicio Saldo (Movido de 620 a 660)
+            # [480]: Inicio Débito (Subido de 460 a 480)
+            # [580]: Fin Débito / Inicio Crédito (Subido de 560 a 580)
+            # [680]: Fin Crédito / Inicio Saldo (Subido de 660 a 680)
             # [720]: Fin Saldo
-            "explicit_vertical_lines": [30, 80, 160, 460, 560, 660, 720],
+            "explicit_vertical_lines": [30, 80, 160, 480, 580, 680, 720],
             "snap_tolerance": 5 # Tolerancia para mejor detección de líneas de tabla
         }
         
-        # Iterar solo las páginas que tienen movimientos (Páginas 1 y 2)
-        pages_to_process = [0, 1] 
+        # Iterar más páginas para asegurar todos los movimientos (Páginas 1, 2, y 3)
+        pages_to_process = [0, 1, 2] 
         
         for page_index in pages_to_process:
             if page_index >= len(pdf.pages):
@@ -164,7 +165,7 @@ def process_bank_pdf(file_bytes):
                             
     if not extracted_data:
         # Esto ocurre si las coordenadas fallaron o no hay movimientos en el rango
-        st.error("❌ No se pudo extraer ningún movimiento detallado. La extracción depende de coordenadas exactas para tu PDF. Por favor, verifica la estructura de tu extracto.")
+        st.error("❌ ¡ALERTA! Falló la extracción de movimientos. Las coordenadas son muy sensibles. Si vuelve a fallar, el formato de su PDF es distinto y necesito una captura de pantalla de la tabla de movimientos para ver la ubicación exacta.")
         return pd.DataFrame(), {}
         
     # Crear DataFrame
@@ -197,7 +198,7 @@ def process_bank_pdf(file_bytes):
 
 # --- Interfaz de Streamlit ---
 
-st.title("💳 Extractor y Conciliador Bancario Credicoop (V7 - Ajuste Robustez)")
+st.title("💳 Extractor y Conciliador Bancario Credicoop (V8 - Ajuste AGRESIVO de Coordenadas)")
 st.markdown("---")
 
 uploaded_file = st.file_uploader(
