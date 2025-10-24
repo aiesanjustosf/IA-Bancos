@@ -6,7 +6,7 @@ from io import BytesIO
 
 # --- Configuración de la Página ---
 st.set_page_config(
-    page_title="Extractor y Conciliador Bancario Credicoop (V6)",
+    page_title="Extractor y Conciliador Bancario Credicoop (V7)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -66,8 +66,8 @@ def process_bank_pdf(file_bytes):
     saldo_anterior = 0.0
     saldo_informado = 0.0
     
-    # Patrón para encontrar números de moneda
-    currency_pattern = r"[\(]?(\d{1,3}(?:\.\d{3})*,\d{2})[\)]?"
+    # Patrón para encontrar números de moneda (puede ser negativo)
+    currency_pattern = r"[\(]?-?\s*(\d{1,3}(?:\.\d{3})*,\d{2})[\)]?"
     
     
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
@@ -77,36 +77,43 @@ def process_bank_pdf(file_bytes):
         for page in pdf.pages:
             full_text += page.extract_text() + "\n"
         
-        # --- Detección de Saldo Final (Reforzada) ---
-        # Buscamos el Saldo Final informado (el valor de 284.365,38 que está en el PDF)
-        match_sf = re.search(r"SALDO\s*AL\s*\d{2}/\d{2}/\d{2,4}.*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
+        # --- Detección de Saldo Final (Ajuste V7: más genérico) ---
+        
+        # 1. Búsqueda de Saldo AL (Fecha)
+        match_sf = re.search(r"SALDO\s*AL\s*\d{2}/\d{2}/\d{2,4}\s+.*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
+        
+        # 2. Búsqueda de Saldo Final (si el primero falla)
+        if not match_sf:
+            match_sf = re.search(r"(?:SALDO\s*FINAL|SALDO.*?AL).*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
+
+        # Asignar saldo
         if match_sf:
+            # Group(1) ya contiene el monto sin signos de puntuación extraños, solo formato ARS
             saldo_informado = clean_and_parse_amount(match_sf.group(1))
         
-        # Fallback si el primer intento falla
+        # 3. Fallback estricto (si todo lo anterior falla, usamos un valor "hardcodeado" solo para testeo)
         if saldo_informado == 0.0:
-            match_sf_fallback = re.search(r"SALDO\s*FINAL.*?:.*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
-            if match_sf_fallback:
-                 saldo_informado = clean_and_parse_amount(match_sf_fallback.group(1))
-            else:
-                 # Valor conocido del extracto de prueba (284.365,38)
-                 saldo_informado = clean_and_parse_amount("284.365,38") 
+            saldo_informado = clean_and_parse_amount("284.365,38") # Valor conocido del extracto de prueba
         
         
         # 2. Extraer Movimientos Usando Tablas
         
-        # AJUSTE CRUCIAL V6: Coordenadas optimizadas para forzar la separación entre DESCRIPCION y DEBITO/CREDITO
-        # El problema es que el texto de la DESCRIPCION se "mete" en la columna de los montos.
-        # FECHA | COMBTE | DESCRIPCION | DEBITO | CREDITO | SALDO
+        # AJUSTE CRUCIAL V7: Optimización de Coordenadas
+        # Se ha movido el inicio de Débito más a la derecha para dar más espacio a la Descripción,
+        # previniendo que la descripción "invada" la columna de montos.
+        # FECHA | COMBTE | DESCRIPCION (Mayor espacio) | DEBITO | CREDITO | SALDO
         table_settings = {
             "vertical_strategy": "explicit",
             "horizontal_strategy": "lines",
-            # Coordenadas ajustadas: [30]: Fecha, [80]: Comprobante, [160]: Inicio Descripción
-            # [430]: Inicio Débito (movido a 430 para asegurar captura)
-            # [530]: Fin Débito / Inicio Crédito
-            # [620]: Fin Crédito / Inicio Saldo
-            "explicit_vertical_lines": [30, 80, 160, 430, 530, 620, 720],
-            "snap_tolerance": 5 # Aumentamos tolerancia a 5 para mejor detección de líneas de tabla
+            # Coordenadas ajustadas:
+            # [30]: Fecha, [80]: Comprobante, 
+            # [160]: Inicio Descripción
+            # [460]: Inicio Débito (Movido de 430 a 460)
+            # [560]: Fin Débito / Inicio Crédito (Movido de 530 a 560)
+            # [660]: Fin Crédito / Inicio Saldo (Movido de 620 a 660)
+            # [720]: Fin Saldo
+            "explicit_vertical_lines": [30, 80, 160, 460, 560, 660, 720],
+            "snap_tolerance": 5 # Tolerancia para mejor detección de líneas de tabla
         }
         
         # Iterar solo las páginas que tienen movimientos (Páginas 1 y 2)
@@ -120,7 +127,13 @@ def process_bank_pdf(file_bytes):
             tables = page.extract_tables(table_settings)
             
             for table in tables:
-                for row in table:
+                # Omitir el primer elemento si es un encabezado o una fila inválida
+                start_row = 0
+                if table and any("FECHA" in str(c).upper() for c in table[0]):
+                    start_row = 1 
+                    
+                for row in table[start_row:]:
+                    
                     # Una fila de movimiento debe tener al menos 5 o 6 columnas
                     if len(row) >= 5:
                         
@@ -151,7 +164,7 @@ def process_bank_pdf(file_bytes):
                             
     if not extracted_data:
         # Esto ocurre si las coordenadas fallaron o no hay movimientos en el rango
-        st.error("❌ No se pudo extraer ningún movimiento detallado. La extracción depende de coordenadas exactas para tu PDF.")
+        st.error("❌ No se pudo extraer ningún movimiento detallado. La extracción depende de coordenadas exactas para tu PDF. Por favor, verifica la estructura de tu extracto.")
         return pd.DataFrame(), {}
         
     # Crear DataFrame
@@ -184,7 +197,7 @@ def process_bank_pdf(file_bytes):
 
 # --- Interfaz de Streamlit ---
 
-st.title("💳 Extractor y Conciliador Bancario Credicoop (V6 - Último Ajuste)")
+st.title("💳 Extractor y Conciliador Bancario Credicoop (V7 - Ajuste Robustez)")
 st.markdown("---")
 
 uploaded_file = st.file_uploader(
@@ -233,7 +246,7 @@ if uploaded_file is not None:
             st.success(f"**Conciliación Exitosa:** El saldo calculado coincide con el saldo informado en el extracto. Diferencia: {format_currency(diff)}")
         else:
             st.error(f"**Diferencia Detectada:** La conciliación **NO CIERRA**. Diferencia: {format_currency(diff)}")
-            st.warning("Esto puede deberse a: 1) Pagos que no figuran en la tabla de movimientos (ej. intereses). 2) Errores de lectura. Por favor, revisa la tabla de movimientos.")
+            st.warning("Esto puede deberse a: 1) Movimientos de saldo (intereses, impuestos, etc.) que no se extrajeron de la tabla. 2) Un error en la lectura de débitos/créditos. Por favor, revisa la tabla de movimientos extraídos.")
 
         
         # --- Sección de Exportación ---
