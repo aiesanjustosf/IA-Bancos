@@ -6,7 +6,7 @@ from io import BytesIO
 
 # --- Configuración de la Página ---
 st.set_page_config(
-    page_title="Extractor y Conciliador Bancario",
+    page_title="Extractor y Conciliador Bancario (CORREGIDO)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -16,33 +16,41 @@ st.set_page_config(
 def clean_and_parse_amount(text):
     """
     Limpia una cadena de texto y la convierte a un número flotante.
-    Maneja el formato europeo/argentino (punto como separador de miles, coma como decimal).
+    Maneja el formato argentino (punto como separador de miles, coma como decimal).
     """
-    if not isinstance(text, str):
+    if not isinstance(text, str) or not text.strip():
         return 0.0
     
-    # 1. Eliminar espacios y símbolos no numéricos (excepto punto y coma)
-    cleaned_text = text.strip().replace('$', '').replace('.', '').replace(' ', '')
+    # 1. Eliminar símbolos de moneda y espacios, y asegurar que los guiones negativos estén al inicio
+    cleaned_text = text.strip().replace('$', '').replace(' ', '')
+    is_negative = cleaned_text.startswith('-')
+    cleaned_text = cleaned_text.replace('-', '')
     
-    # 2. Reemplazar la coma decimal por punto decimal
+    # 2. Eliminar el separador de miles (punto) y convertir la coma decimal a punto
     if ',' in cleaned_text:
-        cleaned_text = cleaned_text.replace(',', '.')
+        # Si tiene coma, asumimos que el punto es de miles
+        cleaned_text = cleaned_text.replace('.', '').replace(',', '.')
     
     try:
-        # 3. Intentar convertir a float
-        return float(cleaned_text)
+        amount = float(cleaned_text)
+        return -amount if is_negative else amount
     except ValueError:
+        # Esto sucede con textos como "VACIO" o descripciones que se cuelan
         return 0.0
 
 def format_currency(amount):
     """Formatea un número como moneda ARS."""
     if amount is None:
         return "$ 0,00"
-    return f"$ {amount:,.2f}".replace('.', 'X').replace(',', '.').replace('X', ',')
-
-
+    # Usamos f-string y locale para formato argentino si es posible, sino manual
+    try:
+        return f"$ {amount:,.2f}".replace('.', 'X').replace(',', '.').replace('X', ',')
+    except:
+        return f"$ {amount:,.2f}" # Fallback
+    
 # --- Lógica Principal de Extracción del PDF ---
 
+# Usamos allow_output_mutation=True para compatibilidad con versiones antiguas
 @st.cache_data
 def process_bank_pdf(file_bytes):
     """
@@ -50,110 +58,105 @@ def process_bank_pdf(file_bytes):
     Retorna el DataFrame de movimientos y el diccionario de saldos de conciliación.
     """
     
-    # Inicialización de variables
     extracted_data = []
     saldo_anterior = 0.0
     saldo_informado = 0.0
     
-    # Patrones para encontrar saldos y totales específicos en el texto (Credicoop N&P)
-    # Busca el patrón de número con separadores (ej: 1.234.567,89 o 1.234,56)
-    currency_pattern = r"(\d{1,3}(?:\.\d{3})*,\d{2})"
-    
-    # Patrones de búsqueda de texto clave
-    patron_saldo_anterior = r"(?:SALDO\s*ANTERIOR)(?:\s+PAGINA\s+SIGUIENTE)?\s*(-?" + currency_pattern + r")"
-    patron_saldo_al = r"SALDO AL\s*\d{2}/\d{2}/\d{4}\s*(-?" + currency_pattern + r")"
-    patron_total_debito = r"TOTAL DEBITOS\s*" + currency_pattern
-    patron_total_credito = r"TOTAL CREDITOS\s*" + currency_pattern
+    # Patrón para encontrar números de moneda (ej: 1.234.567,89 o -1.234,56)
+    currency_pattern = r"-?(\d{1,3}(?:\.\d{3})*,\d{2})"
     
     
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         full_text = ""
         
-        # 1. Extraer todo el texto para buscar saldos (más fiable que las tablas)
+        # 1. Extraer todo el texto para buscar saldos clave
         for page in pdf.pages:
             full_text += page.extract_text() + "\n"
         
-        # 2. Intento de extracción de Saldos del texto completo
-        
-        # Saldo Anterior (a veces viene después de SALDO ANTERIOR)
-        match_sa = re.search(r"SALDO ANTERIOR\s*(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
+        # Extracción de Saldo Anterior
+        # Busca SALDO ANTERIOR... seguido de un número
+        match_sa = re.search(r"SALDO\s*ANTERIOR.*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
         if match_sa:
-             # El grupo 1 es el valor capturado. Puede ser ARS 352.167,18
-             saldo_anterior = clean_and_parse_amount(match_sa.group(1).replace('ARS', ''))
-        
-        # Saldo Final (Busca SALDO AL DD/MM/AAAA)
-        match_sf = re.search(r"SALDO AL\s*\d{2}/\d{2}/\d{4}\s*(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
+             # match_sa.group(1) es la cadena del monto (ej: 4.216.032,04)
+             saldo_anterior = clean_and_parse_amount(match_sa.group(1))
+
+        # Extracción de Saldo Final Informado
+        # Busca SALDO AL DD/MM/YY o SALDO AL DD/MM/YYYY seguido de un número
+        match_sf = re.search(r"SALDO\s*AL\s*\d{2}/\d{2}/\d{2,4}.*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
         if match_sf:
             saldo_informado = clean_and_parse_amount(match_sf.group(1))
         
-        # Si no se encuentra con el patrón específico, intentar una búsqueda genérica
-        if saldo_informado == 0.0:
-            # Buscar el último saldo en la parte inferior de la última página (un último intento)
-            last_page_text = pdf.pages[-1].extract_text()
-            match_last_saldo = re.findall(currency_pattern, last_page_text)[-1:]
-            if match_last_saldo:
-                saldo_informado = clean_and_parse_amount(match_last_saldo[0])
-
-
-        # 3. Extraer Movimientos Usando Tablas
+        # 2. Extraer Movimientos Usando Tablas
         
-        # Definición de la estructura de la tabla (ajustada al PDF de Credicoop)
+        # AJUSTE CRUCIAL: Coordenadas ajustadas para el formato Credicoop.
         # FECHA | COMBTE | DESCRIPCION | DEBITO | CREDITO | SALDO
         table_settings = {
             "vertical_strategy": "explicit",
             "horizontal_strategy": "lines",
-            "explicit_vertical_lines": [30, 80, 160, 440, 520, 600, 720], # Coordenadas aproximadas
+            # Coordenadas ajustadas al PDF del usuario para separar DEBITO y CREDITO correctamente.
+            "explicit_vertical_lines": [30, 80, 160, 440, 530, 620, 720],
             "snap_tolerance": 3
         }
         
-        for page in pdf.pages:
-            # Buscar tablas en la página
+        # Iterar solo las páginas que tienen movimientos (Páginas 1 y 2 en este ejemplo)
+        # Esto evita procesar las páginas de comisiones y avisos
+        pages_to_process = [0, 1] # Índice 0 es Pag 1, Índice 1 es Pag 2
+        
+        for page_index in pages_to_process:
+            if page_index >= len(pdf.pages):
+                continue
+                
+            page = pdf.pages[page_index]
             tables = page.extract_tables(table_settings)
             
             for table in tables:
                 for row in table:
-                    # Una fila de movimiento debería tener al menos 6 columnas
-                    if len(row) >= 6:
-                        # La primera columna debe ser la fecha (DD/MM/YY)
-                        fecha = row[0]
-                        if re.match(r"\d{2}/\d{2}/\d{2}", str(fecha).strip()):
-                            # Es una fila de movimiento
-                            mov = {
-                                'fecha': str(row[0]).strip(),
-                                'comprobante': str(row[1]).strip(),
-                                'descripcion': str(row[2]).strip(),
-                                'debito_raw': str(row[3]).strip(),
-                                'credito_raw': str(row[4]).strip(),
-                                'saldo_raw': str(row[5]).strip()
-                            }
+                    # Una fila de movimiento debe tener exactamente 6 o 5 columnas significativas
+                    if len(row) >= 5:
+                        
+                        # El PDF de Credicoop tiene filas de continuación.
+                        # Buscamos que la columna 0 (Fecha) tenga el formato DD/MM/YY
+                        fecha = str(row[0]).strip()
+                        if re.match(r"\d{2}/\d{2}/\d{2}", fecha):
                             
-                            # Limpieza y parsing de valores
-                            debito = clean_and_parse_amount(mov['debito_raw'])
-                            credito = clean_and_parse_amount(mov['credito_raw'])
+                            # Los datos están en los índices esperados:
+                            # [0]: Fecha
+                            # [1]: Comprobante (Puede ser una continuación de texto)
+                            # [2]: Descripción (Puede ser la continuación)
+                            # [3]: Débito (Monto o vacío)
+                            # [4]: Crédito (Monto o vacío)
+                            # [5]: Saldo (Monto o vacío)
                             
-                            # Asegurar que el débito o el crédito sean 0.0 si la columna tiene texto 'VACIO'
-                            if 'VACIO' in mov['debito_raw'].upper():
-                                debito = 0.0
-                            if 'VACIO' in mov['credito_raw'].upper():
-                                credito = 0.0
-
-                            extracted_data.append({
-                                'Fecha': mov['fecha'],
-                                'Comprobante': mov['comprobante'],
-                                'Descripcion': mov['descripcion'],
-                                'Débito': debito,
-                                'Crédito': credito,
-                                'Saldo_Final_Linea': clean_and_parse_amount(mov['saldo_raw'])
-                            })
+                            debito_raw = str(row[3]).strip() if len(row) > 3 and row[3] else ""
+                            credito_raw = str(row[4]).strip() if len(row) > 4 and row[4] else ""
+                            saldo_raw = str(row[5]).strip() if len(row) > 5 and row[5] else ""
+                            
+                            debito = clean_and_parse_amount(debito_raw)
+                            credito = clean_and_parse_amount(credito_raw)
+                            
+                            # Solo considerar como movimiento si tiene Débito O Crédito
+                            if debito != 0.0 or credito != 0.0:
+                                extracted_data.append({
+                                    'Fecha': fecha,
+                                    'Comprobante': str(row[1]).strip(),
+                                    'Descripcion': str(row[2]).strip(),
+                                    'Débito': debito,
+                                    'Crédito': credito,
+                                    'Saldo_Final_Linea': clean_and_parse_amount(saldo_raw)
+                                })
                             
     if not extracted_data:
-        st.warning("⚠️ No se pudieron extraer movimientos tabulares. Intenta con un PDF con mejor calidad.")
+        # Fallback si no se encuentran movimientos tabulares, pero se encontraron saldos
+        if saldo_anterior != 0.0 or saldo_informado != 0.0:
+             st.warning("⚠️ Se encontraron saldos, pero no se pudieron extraer los movimientos detallados de las tablas.")
+        else:
+             st.error("❌ No se pudo extraer ningún dato.")
         return pd.DataFrame(), {}
         
     # Crear DataFrame
     df = pd.DataFrame(extracted_data)
     
-    # 4. Conciliación y Cálculos Finales
+    # 3. Conciliación y Cálculos Finales
     
     # Totales calculados
     total_debitos_calc = df['Débito'].sum()
@@ -169,7 +172,7 @@ def process_bank_pdf(file_bytes):
         'Débitos Totales (Movimientos)': total_debitos_calc,
         'Saldo Final Calculado': saldo_calculado,
         'Saldo Final Informado (PDF)': saldo_informado,
-        'Diferencia de Conciliación': saldo_informado - saldo_calculado if saldo_informado != 0 else 0
+        'Diferencia de Conciliación': saldo_informado - saldo_calculado
     }
     
     return df, conciliation_results
@@ -177,7 +180,7 @@ def process_bank_pdf(file_bytes):
 
 # --- Interfaz de Streamlit ---
 
-st.title("💳 Extractor y Conciliador Bancario Credicoop")
+st.title("💳 Extractor y Conciliador Bancario Credicoop (CORREGIDO)")
 st.markdown("---")
 
 uploaded_file = st.file_uploader(
@@ -194,7 +197,7 @@ if uploaded_file is not None:
     # Ejecutar la extracción y conciliación (usando caché de Streamlit)
     df_movs, results = process_bank_pdf(file_bytes)
     
-    if not df_movs.empty:
+    if not df_movs.empty and results:
         st.success("✅ Extracción y procesamiento completados.")
         
         # --- Sección de Conciliación ---
@@ -219,19 +222,17 @@ if uploaded_file is not None:
         # Cálculos para la alerta final
         diff = results['Diferencia de Conciliación']
         
-        if abs(diff) < 0.50: # Tolerancia de 50 centavos
-            alert_type = "success"
-            alert_message = f"**Conciliación Exitosa:** El saldo calculado coincide con el saldo informado en el extracto."
-        else:
-            alert_type = "warning"
-            alert_message = f"**Diferencia Detectada:** Hay una diferencia en la conciliación."
-
-        st.markdown(f"**Saldo Final Calculado:** {format_currency(results['Saldo Final Calculado'])}")
-        st.markdown(f"**Saldo Final Informado (PDF):** {format_currency(results['Saldo Final Informado (PDF)'])}")
+        # Mostrar los saldos clave
+        st.markdown(f"**Saldo Final Calculado (SA + Créditos - Débitos):** **{format_currency(results['Saldo Final Calculado'])}**")
+        st.markdown(f"**Saldo Final Informado (PDF):** **{format_currency(results['Saldo Final Informado (PDF)'])}**")
         
-        st.markdown(f"**Diferencia de Conciliación:** :red[{format_currency(diff)}]")
+        # Alerta de diferencia
+        if abs(diff) < 0.50: # Tolerancia de 50 centavos
+            st.success(f"**Conciliación Exitosa:** El saldo calculado coincide con el saldo informado en el extracto. Diferencia: {format_currency(diff)}")
+        else:
+            st.error(f"**Diferencia Detectada:** La conciliación **NO CIERRA**. Diferencia: {format_currency(diff)}")
+            st.warning("Esto puede deberse a: 1) Pagos que no figuran en la tabla de movimientos (ej. intereses). 2) Errores de lectura de saldos o movimientos. Por favor, revisa la tabla de movimientos.")
 
-        st.alert(alert_type, alert_message)
         
         # --- Sección de Exportación ---
         st.header("3. Movimientos Detallados y Exportación")
@@ -245,16 +246,16 @@ if uploaded_file is not None:
                 df.to_excel(writer, sheet_name='Movimientos', index=False)
                 
                 # Hoja 2: Resumen/Conciliación
-                resumen_df = pd.DataFrame(list(results.items()), columns=['Concepto', 'Valor'])
+                resumen_data = [
+                    ('Saldo Anterior (PDF)', results['Saldo Anterior (PDF)']),
+                    ('Créditos Totales', results['Créditos Totales (Movimientos)']),
+                    ('Débitos Totales', results['Débitos Totales (Movimientos)']),
+                    ('Saldo Final Calculado', results['Saldo Final Calculado']),
+                    ('Saldo Final Informado (PDF)', results['Saldo Final Informado (PDF)']),
+                    ('Diferencia de Conciliación', results['Diferencia de Conciliación']),
+                ]
+                resumen_df = pd.DataFrame(resumen_data, columns=['Concepto', 'Valor'])
                 resumen_df.to_excel(writer, sheet_name='Resumen', index=False)
-                
-                # Formato de valores en ARS en la hoja de resumen (opcional, avanzado)
-                workbook = writer.book
-                currency_format = workbook.add_format({'num_format': '[$$-es-AR]#,##0.00'})
-                worksheet = writer.sheets['Resumen']
-                
-                # Aplicar formato de moneda a la columna 'Valor' (columna B)
-                worksheet.set_column('B:B', 15, currency_format)
                 
             return output.getvalue()
 
@@ -264,7 +265,7 @@ if uploaded_file is not None:
         st.download_button(
             label="Descargar Movimientos a Excel (xlsx)",
             data=excel_bytes,
-            file_name="Movimientos_Conciliados.xlsx",
+            file_name=f"Movimientos_Credicoop_{df_movs['Fecha'].iloc[-1].replace('/', '-')}.xlsx",
             mime="application/vnd.ms-excel",
         )
         
@@ -275,15 +276,19 @@ if uploaded_file is not None:
         
         # Preparar DF para mostrarlo limpio en Streamlit
         df_display = df_movs.copy()
+        
+        # Aplicar formato de moneda para la vista (pero mantener números para exportación)
         df_display['Débito'] = df_display['Débito'].apply(lambda x: format_currency(x) if x > 0 else "")
         df_display['Crédito'] = df_display['Crédito'].apply(lambda x: format_currency(x) if x > 0 else "")
         df_display['Saldo_Final_Linea'] = df_display['Saldo_Final_Linea'].apply(format_currency)
+        
         df_display.rename(columns={'Saldo_Final_Linea': 'Saldo en la Línea (PDF)'}, inplace=True)
         
+        # Mostrar el DataFrame, ordenado por fecha descendente
         st.dataframe(df_display, use_container_width=True)
 
-    elif uploaded_file is not None:
-         st.error("❌ No se pudo extraer ningún dato. Verifica el formato del PDF.")
+    elif uploaded_file is not None and not df_movs.empty:
+         st.error("❌ Ocurrió un error al procesar los resultados.")
 
 else:
     st.warning("👆 Por favor, sube un archivo PDF para comenzar la extracción y conciliación.")
