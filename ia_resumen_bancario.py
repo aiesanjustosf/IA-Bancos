@@ -6,7 +6,7 @@ from io import BytesIO
 
 # --- Configuración de la Página ---
 st.set_page_config(
-    page_title="Extractor y Conciliador Bancario Credicoop (V13)",
+    page_title="Extractor y Conciliador Bancario Credicoop (V14 - RegEx)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -21,8 +21,8 @@ def clean_and_parse_amount(text):
     if not isinstance(text, str) or not text.strip():
         return 0.0
     
-    # 1. Eliminar símbolos de moneda y espacios
-    cleaned_text = text.strip().replace('$', '').replace(' ', '')
+    # 1. Eliminar símbolos de moneda, espacios y saltos de línea
+    cleaned_text = text.strip().replace('$', '').replace(' ', '').replace('\n', '')
     
     # 2. Manejo de negativo (paréntesis o guion)
     is_negative = cleaned_text.startswith('-') or (cleaned_text.startswith('(') and cleaned_text.endswith(')'))
@@ -58,127 +58,110 @@ def format_currency(amount):
 @st.cache_data
 def process_bank_pdf(file_bytes):
     """
-    Extrae, limpia y concilia los movimientos de un extracto bancario Credicoop.
-    Retorna el DataFrame de movimientos y el diccionario de saldos de conciliación.
+    Extrae, limpia y concilia los movimientos de un extracto bancario Credicoop
+    utilizando una estrategia robusta de Expresiones Regulares.
     """
     
     extracted_data = []
-    saldo_anterior = 0.0
     saldo_informado = 0.0
     
     # Patrón para encontrar números de moneda
     currency_pattern = r"[\(]?-?\s*(\d{1,3}(?:\.\d{3})*,\d{2})[\)]?"
     
+    # Expresión Regular para detectar el SALDO FINAL en el texto
+    # (?:SALDO\s*AL.*?)(\d{2}/\d{2}/\d{2,4}) buscará la fecha después de 'SALDO AL'
+    # (-?" + currency_pattern + r") capturará el monto (puede ser negativo)
     
+    # Expresión Regular para DETECTAR UNA LÍNEA DE MOVIMIENTO COMPLETA
+    # Esta es la clave para la robustez, ya que busca el patrón rígido (Fecha + Montos)
+    
+    # 1. Fecha: \d{2}/\d{2}/\d{2} (ej. 01/06/25)
+    # 2. Comprobante: (\d{6}) (ej. 262461, o texto)
+    # 3. Descripción: (.*?) (todo el texto entre el comprobante y los montos)
+    # 4. Monto (Crédito/Débito/Saldo): (-?\s*\d{1,3}(?:\.\d{3})*,\d{2})
+    # Se adapta para capturar dos montos (Débito y Crédito) y el Saldo final
+    
+    # Patrón para una línea de movimiento, asumiendo que el texto del PDF es lineal:
+    # Captura 1: Fecha (DD/MM/AA)
+    # Captura 2: Comprobante (texto/número)
+    # Captura 3: Descripción (el texto intermedio)
+    # Captura 4: Monto 1 (Débito)
+    # Captura 5: Monto 2 (Crédito)
+    # Captura 6: Monto 3 (Saldo)
+    
+    # Vamos a usar un patrón más flexible basado en el snippet que muestra el PDF
+    # Patrón: Fecha | Combte | Descripción | Monto1 | Monto2 | Monto3
+    
+    # Monto simple para RegEx: permite (o no) guiones, puntos de miles y coma decimal.
+    monto_regex = r"[\(]?-?\s*(\d{1,3}(?:\.\d{3})*,\d{2})[\)]?"
+    
+    # El patrón más robusto (y complejo) para el formato Credicoop (Fecha Comprobante Descripción Monto1 Monto2 Monto3)
+    # Usa \s+ para manejar cualquier cantidad de espacios o saltos de línea.
+    # El ".*?" en la descripción es CRÍTICO para que tome todo el texto entre el Comprobante y los montos.
+    movement_pattern = re.compile(
+        r"(\d{2}/\d{2}/\d{2,4})\s+"        # 1. Fecha
+        r"(.+?)"                           # 2. Comprobante (Non-greedy until desc)
+        r"(.+?)"                           # 3. Descripción (Non-greedy until montos)
+        r"(?:\s{2,}|\n|\r)"                # Separador (al menos 2 espacios, o salto de línea)
+        r"(\s{1,2}|" + monto_regex + r")"  # 4. Débito (Espacio si está vacío, o Monto)
+        r"(?:\s{2,}|\n|\r)"                # Separador
+        r"(\s{1,2}|" + monto_regex + r")"  # 5. Crédito (Espacio si está vacío, o Monto)
+        r"(?:\s{2,}|\n|\r)"                # Separador
+        r"(" + monto_regex + r")",         # 6. Saldo (Siempre tiene que haber saldo)
+        re.DOTALL | re.IGNORECASE
+    )
+
+
     with pdfplumber.open(BytesIO(file_bytes)) as pdf:
         full_text = ""
         
-        # 1. Extraer todo el texto para buscar saldos clave
+        # 1. Extraer todo el texto de todas las páginas para tener el flujo completo
         for page in pdf.pages:
-            full_text += page.extract_text() + "\n"
+            full_text += page.extract_text(x_tolerance=2) + "\n\n"
         
-        # --- Detección de Saldo Final (Saldo al 30/06/2025) ---
-        
-        # Búsqueda estricta del Saldo AL XXXXXXX seguido del monto
+        # --- Detección de Saldo Final (Aún por RegEx) ---
         match_sf = re.search(r"(?:SALDO\s*AL.*?)(\d{2}/\d{2}/\d{2,4}).*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
         
         if match_sf:
-            saldo_str = match_sf.group(2) # El monto es el segundo grupo
+            saldo_str = match_sf.group(2)
             saldo_informado = clean_and_parse_amount(saldo_str)
         else:
-            # Fallback a búsqueda genérica de "SALDO" y monto (menos confiable)
             match_sf_gen = re.search(r"(?:SALDO\s*FINAL|SALDO.*?AL).*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
             if match_sf_gen:
                 saldo_informado = clean_and_parse_amount(match_sf_gen.group(1))
 
-        # 2. Extraer Movimientos Usando Tablas por REGIÓN (SOLUCIÓN DEFINITIVA)
+        # 2. Extraer Movimientos Usando RegEx en el texto completo
         
-        # Definir las coordenadas aproximadas de la tabla de movimientos en el PDF
-        # Se asume que el área de la tabla comienza en Y=120 y termina en Y=720 (la parte inferior de la página).
-        # X: 0 a 792 (ancho completo del PDF)
-        # Y: 0 a 1000 (alto completo del PDF)
-        # Bbox: (x0, top, x1, bottom)
-        TABLE_REGION_BBOX = (30, 120, 780, 720) 
-
-        # Configuraciones de tabla ahora son mínimas, confiando en la detección de lineas del PDF
-        table_settings = {
-            # Se usa 'lines' porque el extracto de Credicoop tiene líneas divisorias visibles.
-            "vertical_strategy": "lines", 
-            "horizontal_strategy": "lines",
-            "snap_tolerance": 8 # Tolerancia aumentada para capturar mejor las lineas sutiles.
-        }
-        
-        # Iterar páginas con movimientos
-        pages_to_process = range(len(pdf.pages))
-        
-        for page_index in pages_to_process:
-            if page_index >= len(pdf.pages):
-                continue
-                
-            page = pdf.pages[page_index]
+        # Iterar sobre todas las coincidencias del patrón de movimiento
+        for match in movement_pattern.finditer(full_text):
             
-            # 1. Recortar la página a la región de la tabla de movimientos
-            cropped_page = page.crop(TABLE_REGION_BBOX)
+            # Los grupos de captura se corresponden con el patrón RegEx
+            fecha = match.group(1).strip()
+            comprobante = match.group(2).strip()
+            descripcion = match.group(3).strip().replace('\n', ' ').replace('\r', ' ')
             
-            # 2. Extraer tablas de la región recortada
-            tables = cropped_page.extract_tables(table_settings)
+            # Los grupos 4 y 5 son Débito y Crédito, pueden ser un espacio o un monto
+            debito_raw = match.group(4).strip()
+            credito_raw = match.group(5).strip()
+            saldo_raw = match.group(6).strip()
             
-            for table in tables:
-                # Omitir el primer elemento si es un encabezado o la fila de "SALDO ANTERIOR"
-                start_row = 0
-                if table and (any("FECHA" in str(c).upper() for c in table[0]) or any("ANTERIOR" in str(c).upper() for c in table[0])):
-                    start_row = 1 
-                    
-                for row in table[start_row:]:
-                    
-                    # Una fila de movimiento debe tener al menos 6 columnas (0 a 5)
-                    # La extracción por región puede generar diferentes números de columnas si la detección de líneas es imperfecta.
-                    # Adaptamos los índices para los 6 campos esperados
-                    
-                    if len(row) >= 5: # Mínimo 5 campos (Fecha, Combte, Desc, Debito/Credito/Saldo)
-                        
-                        # Indices de las columnas esperadas después de la detección automática (Aprox.)
-                        fecha_idx = 0
-                        combte_idx = 1
-                        desc_idx = 2
-                        
-                        # La ubicación de Débito, Crédito y Saldo es variable, usamos los últimos 3 campos si hay más de 6
-                        if len(row) > 6:
-                            # Si hay más de 6 columnas (por detecciones falsas), intentamos tomar los campos correctos
-                            debito_idx = len(row) - 3
-                            credito_idx = len(row) - 2
-                            saldo_idx = len(row) - 1
-                        else:
-                            # Si hay 6 columnas exactas (lo ideal)
-                            debito_idx = 3
-                            credito_idx = 4
-                            saldo_idx = 5
-                        
-                        fecha = str(row[fecha_idx]).strip() if row[fecha_idx] else ""
-                        
-                        # CRÍTICO: Excluir las filas que no tienen fecha válida (encabezados, continuaciones, saldos)
-                        if re.match(r"\d{2}/\d{2}/\d{2}", fecha):
-                            
-                            debito_raw = str(row[debito_idx]).strip() if row[debito_idx] else ""
-                            credito_raw = str(row[credito_idx]).strip() if row[credito_idx] else ""
-                            saldo_raw = str(row[saldo_idx]).strip() if row[saldo_idx] else ""
-                            
-                            debito = clean_and_parse_amount(debito_raw)
-                            credito = clean_and_parse_amount(credito_raw)
-                            
-                            # Solo considerar como movimiento si tiene Débito O Crédito, y no es cero.
-                            if debito != 0.0 or credito != 0.0:
-                                extracted_data.append({
-                                    'Fecha': fecha,
-                                    'Comprobante': str(row[combte_idx]).strip(),
-                                    'Descripcion': str(row[desc_idx]).strip(),
-                                    'Débito': debito,
-                                    'Crédito': credito,
-                                    'Saldo_Final_Linea': clean_and_parse_amount(saldo_raw)
-                                })
+            debito = clean_and_parse_amount(debito_raw)
+            credito = clean_and_parse_amount(credito_raw)
+            saldo = clean_and_parse_amount(saldo_raw)
+            
+            # Filtro final de calidad: debe tener Débito O Crédito
+            if debito != 0.0 or credito != 0.0:
+                extracted_data.append({
+                    'Fecha': fecha,
+                    'Comprobante': comprobante,
+                    'Descripcion': descripcion,
+                    'Débito': debito,
+                    'Crédito': credito,
+                    'Saldo_Final_Linea': saldo
+                })
                             
     if not extracted_data:
-        st.error("❌ ¡ALERTA! Falló la extracción de movimientos. La detección de tabla por región falló. El formato de su PDF es altamente inusual.")
+        st.error("❌ ¡ALERTA! Falló la extracción de movimientos. El patrón de texto no coincide con los movimientos. El PDF podría ser una imagen o tener un formato muy inusual.")
         return pd.DataFrame(), {}
         
     # Crear DataFrame
@@ -198,7 +181,6 @@ def process_bank_pdf(file_bytes):
     total_creditos_calc = df['Crédito'].sum()
     
     # Cálculo del Saldo Anterior: SA = SF_Informado - Créditos + Débitos
-    # Esto garantiza que el Saldo Inicial es el punto de partida correcto para este extracto.
     saldo_anterior = saldo_informado - total_creditos_calc + total_debitos_calc
     saldo_calculado = saldo_anterior + total_creditos_calc - total_debitos_calc
     
@@ -218,7 +200,7 @@ def process_bank_pdf(file_bytes):
 
 # --- Interfaz de Streamlit ---
 
-st.title("💳 Extractor y Conciliador Bancario Credicoop (V13 - SOLUCIÓN DEFINITIVA)")
+st.title("💳 Extractor y Conciliador Bancario Credicoop (V14 - RegEx)")
 st.markdown("---")
 
 uploaded_file = st.file_uploader(
@@ -323,7 +305,8 @@ if uploaded_file is not None:
 
     elif uploaded_file is not None:
          # Si uploaded_file existe pero df_movs está vacío
-         st.error("❌ Falló la extracción de movimientos. La detección de tabla por región falló. Por favor, intente con la versión V12 si esta no funciona.")
+         st.error("❌ Falló la extracción de movimientos. El patrón de texto no coincide con los movimientos. Por favor, revisa si el PDF es texto seleccionable y no una imagen.")
 
 else:
     st.warning("👆 Por favor, sube un archivo PDF para comenzar la extracción y conciliación.")
+
