@@ -6,7 +6,7 @@ from io import BytesIO
 
 # --- Configuración de la Página ---
 st.set_page_config(
-    page_title="Extractor y Conciliador Bancario Credicoop (V11)",
+    page_title="Extractor y Conciliador Bancario Credicoop (V13)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -66,7 +66,7 @@ def process_bank_pdf(file_bytes):
     saldo_anterior = 0.0
     saldo_informado = 0.0
     
-    # Patrón para encontrar números de moneda (puede ser negativo)
+    # Patrón para encontrar números de moneda
     currency_pattern = r"[\(]?-?\s*(\d{1,3}(?:\.\d{3})*,\d{2})[\)]?"
     
     
@@ -77,84 +77,91 @@ def process_bank_pdf(file_bytes):
         for page in pdf.pages:
             full_text += page.extract_text() + "\n"
         
-        # --- Detección de Saldo Final (Ajuste V9: Más estricto) ---
+        # --- Detección de Saldo Final (Saldo al 30/06/2025) ---
         
-        # 1. Búsqueda estricta de "SALDO AL 30/06/2025 ..." seguida del monto
-        # Intentamos ser lo más precisos posible con la fecha final del extracto.
-        match_sf = re.search(r"(?:SALDO AL.*?)(\d{2}/\d{2}/\d{2,4})\s+.*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
+        # Búsqueda estricta del Saldo AL XXXXXXX seguido del monto
+        match_sf = re.search(r"(?:SALDO\s*AL.*?)(\d{2}/\d{2}/\d{2,4}).*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
         
-        # 2. Búsqueda de Saldo Final (si el primero falla)
-        if not match_sf:
-            match_sf = re.search(r"(?:SALDO\s*FINAL|SALDO.*?AL).*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
-
-        # Asignar saldo
         if match_sf:
-            # Group(1) o Group(2) contiene el monto
-            # En el primer patrón Group(2) es el monto. En el segundo patrón Group(1) es el monto.
-            try:
-                # Intentamos el más estricto
-                saldo_str = match_sf.group(2) 
-            except IndexError:
-                # Si falló, tomamos el grupo 1 (del patrón más genérico)
-                saldo_str = match_sf.group(1) 
-            
+            saldo_str = match_sf.group(2) # El monto es el segundo grupo
             saldo_informado = clean_and_parse_amount(saldo_str)
+        else:
+            # Fallback a búsqueda genérica de "SALDO" y monto (menos confiable)
+            match_sf_gen = re.search(r"(?:SALDO\s*FINAL|SALDO.*?AL).*?(-?" + currency_pattern + r")", full_text, re.DOTALL | re.IGNORECASE)
+            if match_sf_gen:
+                saldo_informado = clean_and_parse_amount(match_sf_gen.group(1))
+
+        # 2. Extraer Movimientos Usando Tablas por REGIÓN (SOLUCIÓN DEFINITIVA)
         
-        # 3. Fallback: Intentar obtener el Saldo Final de la última fila de la tabla (si la tabla se leyó correctamente)
-        if saldo_informado == 0.0:
-            st.warning("⚠️ El Saldo Final no se pudo detectar del texto libre. Intentando obtenerlo de la última línea de movimientos extraída.")
-            # Este fallback se aplica más adelante si hay movimientos extraídos.
-        
-        
-        # 2. Extraer Movimientos Usando Tablas
-        
-        # AJUSTE CRUCIAL V11: AJUSTE DE COORDENADAS Y TOLERANCIA AUMENTADA
-        # FECHA | COMBTE | DESCRIPCION (Menos espacio) | DEBITO | CREDITO | SALDO
+        # Definir las coordenadas aproximadas de la tabla de movimientos en el PDF
+        # Se asume que el área de la tabla comienza en Y=120 y termina en Y=720 (la parte inferior de la página).
+        # X: 0 a 792 (ancho completo del PDF)
+        # Y: 0 a 1000 (alto completo del PDF)
+        # Bbox: (x0, top, x1, bottom)
+        TABLE_REGION_BBOX = (30, 120, 780, 720) 
+
+        # Configuraciones de tabla ahora son mínimas, confiando en la detección de lineas del PDF
         table_settings = {
-            "vertical_strategy": "explicit",
+            # Se usa 'lines' porque el extracto de Credicoop tiene líneas divisorias visibles.
+            "vertical_strategy": "lines", 
             "horizontal_strategy": "lines",
-            # Coordenadas ajustadas V11:
-            # [30]: Fecha, [80]: Comprobante, 
-            # [150]: Inicio Descripción (Más estrecho)
-            # [440]: Inicio Débito
-            # [540]: Fin Débito / Inicio Crédito
-            # [640]: Fin Crédito / Inicio Saldo
-            # [720]: Fin Saldo
-            "explicit_vertical_lines": [30, 80, 150, 440, 540, 640, 720],
-            "snap_tolerance": 8 # Tolerancia aumentada a 8 (antes 5) para capturar mejor las líneas
+            "snap_tolerance": 8 # Tolerancia aumentada para capturar mejor las lineas sutiles.
         }
         
-        # Iterar más páginas para asegurar todos los movimientos
-        pages_to_process = range(len(pdf.pages)) # Revisamos todas las páginas, no solo las 3 primeras
+        # Iterar páginas con movimientos
+        pages_to_process = range(len(pdf.pages))
         
         for page_index in pages_to_process:
             if page_index >= len(pdf.pages):
                 continue
                 
             page = pdf.pages[page_index]
-            tables = page.extract_tables(table_settings)
+            
+            # 1. Recortar la página a la región de la tabla de movimientos
+            cropped_page = page.crop(TABLE_REGION_BBOX)
+            
+            # 2. Extraer tablas de la región recortada
+            tables = cropped_page.extract_tables(table_settings)
             
             for table in tables:
-                # Omitir el primer elemento si es un encabezado o una fila inválida
+                # Omitir el primer elemento si es un encabezado o la fila de "SALDO ANTERIOR"
                 start_row = 0
-                if table and any("FECHA" in str(c).upper() for c in table[0]):
+                if table and (any("FECHA" in str(c).upper() for c in table[0]) or any("ANTERIOR" in str(c).upper() for c in table[0])):
                     start_row = 1 
                     
                 for row in table[start_row:]:
                     
-                    # Una fila de movimiento debe tener al menos 5 o 6 columnas
-                    if len(row) >= 5:
+                    # Una fila de movimiento debe tener al menos 6 columnas (0 a 5)
+                    # La extracción por región puede generar diferentes números de columnas si la detección de líneas es imperfecta.
+                    # Adaptamos los índices para los 6 campos esperados
+                    
+                    if len(row) >= 5: # Mínimo 5 campos (Fecha, Combte, Desc, Debito/Credito/Saldo)
                         
-                        fecha = str(row[0]).strip() if len(row) > 0 and row[0] else ""
+                        # Indices de las columnas esperadas después de la detección automática (Aprox.)
+                        fecha_idx = 0
+                        combte_idx = 1
+                        desc_idx = 2
+                        
+                        # La ubicación de Débito, Crédito y Saldo es variable, usamos los últimos 3 campos si hay más de 6
+                        if len(row) > 6:
+                            # Si hay más de 6 columnas (por detecciones falsas), intentamos tomar los campos correctos
+                            debito_idx = len(row) - 3
+                            credito_idx = len(row) - 2
+                            saldo_idx = len(row) - 1
+                        else:
+                            # Si hay 6 columnas exactas (lo ideal)
+                            debito_idx = 3
+                            credito_idx = 4
+                            saldo_idx = 5
+                        
+                        fecha = str(row[fecha_idx]).strip() if row[fecha_idx] else ""
                         
                         # CRÍTICO: Excluir las filas que no tienen fecha válida (encabezados, continuaciones, saldos)
                         if re.match(r"\d{2}/\d{2}/\d{2}", fecha):
                             
-                            # Row indices: [0]: Fecha, [1]: Comprobante, [2]: Descripción, [3]: Débito, [4]: Crédito, [5]: Saldo
-                            
-                            debito_raw = str(row[3]).strip() if len(row) > 3 and row[3] else ""
-                            credito_raw = str(row[4]).strip() if len(row) > 4 and row[4] else ""
-                            saldo_raw = str(row[5]).strip() if len(row) > 5 and row[5] else ""
+                            debito_raw = str(row[debito_idx]).strip() if row[debito_idx] else ""
+                            credito_raw = str(row[credito_idx]).strip() if row[credito_idx] else ""
+                            saldo_raw = str(row[saldo_idx]).strip() if row[saldo_idx] else ""
                             
                             debito = clean_and_parse_amount(debito_raw)
                             credito = clean_and_parse_amount(credito_raw)
@@ -163,16 +170,15 @@ def process_bank_pdf(file_bytes):
                             if debito != 0.0 or credito != 0.0:
                                 extracted_data.append({
                                     'Fecha': fecha,
-                                    'Comprobante': str(row[1]).strip(),
-                                    'Descripcion': str(row[2]).strip(),
+                                    'Comprobante': str(row[combte_idx]).strip(),
+                                    'Descripcion': str(row[desc_idx]).strip(),
                                     'Débito': debito,
                                     'Crédito': credito,
                                     'Saldo_Final_Linea': clean_and_parse_amount(saldo_raw)
                                 })
                             
     if not extracted_data:
-        # Esto ocurre si las coordenadas fallaron o no hay movimientos en el rango
-        st.error("❌ ¡ALERTA! Falló la extracción de movimientos. La configuración de coordenadas de tabla es el problema principal. Por favor, intente con la sugerencia manual de la línea 126.")
+        st.error("❌ ¡ALERTA! Falló la extracción de movimientos. La detección de tabla por región falló. El formato de su PDF es altamente inusual.")
         return pd.DataFrame(), {}
         
     # Crear DataFrame
@@ -212,7 +218,7 @@ def process_bank_pdf(file_bytes):
 
 # --- Interfaz de Streamlit ---
 
-st.title("💳 Extractor y Conciliador Bancario Credicoop (V11 - Máxima Robustez)")
+st.title("💳 Extractor y Conciliador Bancario Credicoop (V13 - SOLUCIÓN DEFINITIVA)")
 st.markdown("---")
 
 uploaded_file = st.file_uploader(
@@ -317,8 +323,7 @@ if uploaded_file is not None:
 
     elif uploaded_file is not None:
          # Si uploaded_file existe pero df_movs está vacío
-         st.error("❌ Falló la extracción de movimientos. La configuración de coordenadas (`explicit_vertical_lines`) es el problema central. Sigue la instrucción de la línea 126 para probar los ajustes manuales.")
+         st.error("❌ Falló la extracción de movimientos. La detección de tabla por región falló. Por favor, intente con la versión V12 si esta no funciona.")
 
 else:
     st.warning("👆 Por favor, sube un archivo PDF para comenzar la extracción y conciliación.")
-
