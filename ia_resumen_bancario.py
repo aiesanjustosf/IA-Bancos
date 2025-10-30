@@ -35,14 +35,12 @@ except Exception:
 
 # --- regex base ---
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{2,4}\b")  # dd/mm/aa o dd/mm/aaaa
-
-# acepta: -1.234,56  /  1.234,56-  /  123,45
 MONEY_RE = re.compile(r'(?<!\S)-?(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
 LONG_INT_RE = re.compile(r"\b\d{6,}\b")
 
 # ====== PATRONES ESPECÍFICOS ======
 # ---- Banco Macro ----
-HYPH = r"[-\u2010\u2011\u2012\u2013\u2014\u2212]"  # guiones variantes
+HYPH = r"[-\u2010\u2011\u2012\u2013\u2014\u2212]"
 ACCOUNT_TOKEN_RE = re.compile(rf"\b\d\s*{HYPH}\s*\d{{3}}\s*{HYPH}\s*\d{{10}}\s*{HYPH}\s*\d\b")
 SALDO_ANT_PREFIX   = re.compile(r"^SALDO\s+U?LTIMO\s+EXTRACTO\s+AL", re.IGNORECASE)
 SALDO_FINAL_PREFIX = re.compile(r"^SALDO\s+FINAL\s+AL\s+D[ÍI]A",     re.IGNORECASE)
@@ -54,13 +52,13 @@ HEADER_ROW_PAT = re.compile(r"^(FECHA\s+DESCRIPC(?:I[ÓO]N|ION)|FECHA\s+CONCEPTO
 NON_MOV_PAT    = re.compile(r"(INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S|TOTAL\s+RESUMEN\s+OPERATIVO|RESUMEN\s+DEL\s+PER[IÍ]ODO)", re.IGNORECASE)
 INFO_HEADER    = re.compile(r"INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S", re.IGNORECASE)
 
-# ---- Banco de Santa Fe (Consolidado de cuentas) ----
+# ---- Banco de Santa Fe ----
 SF_ACC_LINE_RE = re.compile(
     r"\b(Cuenta\s+Corriente\s+Pesos|Cuenta\s+Corriente\s+En\s+D[óo]lares|Caja\s+de\s+Ahorro\s+Pesos|Caja\s+de\s+Ahorro\s+En\s+D[óo]lares)\s+Nro\.?\s*([0-9][0-9./-]*)",
     re.IGNORECASE
 )
 
-# ---- Banco Nación (BNA) ----
+# ---- Banco Nación ----
 BNA_NAME_HINT = "BANCO DE LA NACION ARGENTINA"
 BNA_PERIODO_RE = re.compile(r"PERIODO:\s*(\d{2}/\d{2}/\d{4})\s*AL\s*(\d{2}/\d{2}/\d{4})", re.IGNORECASE)
 BNA_CUENTA_CBU_RE = re.compile(
@@ -181,7 +179,7 @@ def galicia_header_saldos_from_text(txt: str) -> dict:
         fin = normalize_money(m2.group(1))
     return {"saldo_inicial": ini, "saldo_final": fin}
 
-# ---------- “Información de su/s Cuenta/s” (whitelist Macro) ----------
+# ---------- Macro: “Información de su/s Cuenta/s” ----------
 def _normalize_account_token(tok: str) -> str:
     return re.sub(rf"\s*{HYPH}\s*", "-", tok)
 
@@ -222,7 +220,6 @@ def _normalize_title_from_pending(pending_title: str) -> str:
     if "CAJA DE AHORRO" in t:                                                  return "CAJA DE AHORRO"
     return "CUENTA"
 
-# ---------- Macro: segmentación por cuentas ----------
 def macro_split_account_blocks(file_like):
     whitelist = macro_extract_account_whitelist(file_like)
     white_set = set(whitelist.keys())
@@ -299,13 +296,8 @@ def macro_split_account_blocks(file_like):
         blocks.append(acc)
     return blocks
 
-# ---------- Parsing movimientos (genérico + Galicia) ----------
+# ---------- Parsing líneas (genérico + Galicia) ----------
 def parse_lines(lines) -> pd.DataFrame:
-    """
-    Regla general (sirve para Galicia también):
-    - Último importe = SALDO
-    - Penúltimo importe = movimiento del renglón (crédito o débito; con signo si aplica)
-    """
     rows, seq = [], 0
     for ln in lines:
         if not ln.strip():
@@ -322,7 +314,7 @@ def parse_lines(lines) -> pd.DataFrame:
             continue
 
         saldo   = normalize_money(am[-1].group(0))   # última columna = saldo
-        monto   = normalize_money(am[-2].group(0))   # penúltima = movimiento
+        monto   = normalize_money(am[-2].group(0))   # penúltima = movimiento (+ crédito / - débito)
 
         desc = ln[d.end(): am[0].start()].strip()
         seq += 1
@@ -402,7 +394,7 @@ def find_saldo_anterior_from_lines(lines):
             break
     return np.nan
 
-# ---------- Render helpers (evitar "…") ----------
+# ---------- Render helpers ----------
 def metric_text(label: str, value: float):
     st.markdown(
         f"""
@@ -422,13 +414,16 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if "SALDO ANTERIOR" in u or "SALDO ANTERIOR" in n:
         return "SALDO ANTERIOR"
 
+    # Ley 25.413
     if ("LEY 25413" in u) or ("IMPTRANS" in u) or ("IMP.S/CREDS" in u) or ("IMPDBCR 25413" in u) or ("N/D DBCR 25413" in u) or \
        ("LEY 25413" in n) or ("IMPTRANS" in n) or ("IMP.S/CREDS" in n) or ("IMPDBCR 25413" in n) or ("N/D DBCR 25413" in n):
         return "LEY 25413"
 
-    if ("SIRCREB" in u) or ("SIRCREB" in n):
+    # SIRCREB (incl. “ING. BRUTOS S/ CRED”)
+    if ("SIRCREB" in u) or ("SIRCREB" in n) or re.search(r"ING\.?\s*BRUTOS.*S/?\s*CRED", u) or re.search(r"ING\.?\s*BRUTOS.*S/?\s*CRED", n):
         return "SIRCREB"
 
+    # Percepciones / Retenciones IVA
     if (
         ("IVA PERC" in u) or ("IVA PERCEP" in u) or ("RG3337" in u) or
         ("IVA PERC" in n) or ("IVA PERCEP" in n) or ("RG3337" in n) or
@@ -437,12 +432,13 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     ):
         return "Percepciones de IVA"
 
+    # IVA sobre comisiones
     if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n):
         return "IVA 21% (sobre comisiones)"
-
     if ("IVA RINS" in u or "IVA REDUC" in u) or ("IVA RINS" in n or "IVA REDUC" in n) or ("IVA 10,5" in u) or ("IVA 10,5" in n):
         return "IVA 10,5% (sobre comisiones)"
 
+    # Plazo Fijo
     if ("PLAZO FIJO" in u) or ("PLAZO FIJO" in n) or ("P.FIJO" in u) or ("P.FIJO" in n) or ("P FIJO" in u) or ("P FIJO" in n) or ("PFIJO" in u) or ("PFIJO" in n):
         if cre and cre != 0:
             return "Acreditación Plazo Fijo"
@@ -450,31 +446,36 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
             return "Débito Plazo Fijo"
         return "Plazo Fijo"
 
+    # Comisiones
     if ("COMIS.TRANSF" in u) or ("COMIS.TRANSF" in n) or ("COMIS TRANSF" in u) or ("COMIS TRANSF" in n) or \
        ("COMIS.COMPENSACION" in u) or ("COMIS.COMPENSACION" in n) or ("COMIS COMPENSACION" in u) or ("COMIS COMPENSACION" in n):
         return "Gastos por comisiones"
-
     if ("MANTENIMIENTO MENSUAL PAQUETE" in u) or ("MANTENIMIENTO MENSUAL PAQUETE" in n) or \
        ("COMOPREM" in n) or ("COMVCAUT" in n) or ("COMTRSIT" in n) or ("COM.NEGO" in n) or ("CO.EXCESO" in n) or ("COM." in n):
         return "Gastos por comisiones"
 
+    # Débitos automáticos / Seguros
     if ("DB-SNP" in n) or ("DEB.AUT" in n) or ("DEB.AUTOM" in n) or ("SEGUROS" in n) or ("GTOS SEG" in n):
         return "Débito automático"
 
+    # Varias
     if "DYC" in n: return "DyC"
     if ("AFIP" in n or "ARCA" in n) and deb and deb != 0: return "Débitos ARCA"
     if "API" in n: return "API"
 
-    if "DEB.CUOTA PRESTAMO" in n or ("PRESTAMO" in n and "DEB." in n): return "Cuota de préstamo"
-    if ("CR.PREST" in n) or ("CREDITO PRESTAMOS" in n) or ("CRÉDITO PRÉSTAMOS" in n): return "Acreditación Préstamos"
+    # Préstamos
+    if "CUOTA PRÉSTAMO" in u or "CUOTA PRÉSTAMO" in n or "CUOTA PRESTAMO" in u or "CUOTA PRESTAMO" in n or "DEB.CUOTA PRESTAMO" in n:
+        return "Cuota de préstamo"
+    if ("CR.PREST" in n) or ("CREDITO PRESTAMOS" in n) or ("CRÉDITO PRÉSTAMOS" in n):
+        return "Acreditación Préstamos"
 
+    # Cheques
     if "CH 48 HS" in n or "CH.48 HS" in n: return "Cheques 48 hs"
 
-    if ("PAGO COMERC" in n) or ("CR-CABAL" in n) or ("CR CABAL" in n) or ("CR TARJ" in n): return "Acreditaciones Tarjetas de Crédito/Débito"
-
-    if ("CR-DEPEF" in n) or ("CR DEPEF" in n) or ("DEPOSITO EFECTIVO" in n) or ("DEP.EFECTIVO" in n) or ("DEP EFECTIVO" in n):
-        return "Depósito en Efectivo"
-
+    # Transferencias
+    if ("TRANSFERENCIA DE TERCEROS" in u) or ("TRANSFERENCIA DE TERCEROS" in n):
+        if cre and cre != 0: return "Transferencia de terceros recibida"
+        if deb and deb != 0: return "Transferencia a terceros realizada"
     if (("CR-TRSFE" in n) or ("TRANSF RECIB" in n) or ("TRANLINK" in n)) and cre and cre != 0:
         return "Transferencia de terceros recibida"
     if (("DB-TRSFE" in n) or ("TRSFE-ET" in n) or ("TRSFE-IT" in n)) and deb and deb != 0:
@@ -482,6 +483,7 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if ("DTNCTAPR" in n) or ("ENTRE CTA" in n) or ("CTA PROPIA" in n):
         return "Transferencia entre cuentas propias"
 
+    # Valores
     if ("NEG.CONT" in n) or ("NEGOCIADOS" in n):
         return "Acreditación de valores"
 
@@ -497,7 +499,7 @@ def render_account_report(
     acc_id: str,
     lines: list[str],
     bna_extras: dict | None = None,
-    header_saldos: dict | None = None   # para Galicia: {'saldo_inicial':..., 'saldo_final':...}
+    header_saldos: dict | None = None
 ):
     st.markdown("---")
     st.subheader(f"{account_title} · Nro {account_number}")
@@ -506,7 +508,7 @@ def render_account_report(
     fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(lines)
     saldo_anterior = find_saldo_anterior_from_lines(lines)
 
-    # ===== Débito/Crédito =====
+    # Débito/Crédito
     df = df.sort_values(["fecha", "orden"]).reset_index(drop=True)
     if banco_slug == "galicia":
         df["debito"]  = np.where(df["monto_pdf"] < 0, -df["monto_pdf"], 0.0)
@@ -518,28 +520,24 @@ def render_account_report(
         df["credito"] = np.where(df["delta_saldo"] > 0,  df["delta_saldo"], 0.0)
         df["importe"] = df["debito"] - df["credito"]
 
-    # ===== Saldo inicial / final (ajuste Galicia) =====
+    # Saldo inicial / final (Galicia usa encabezado o reconstrucción)
     saldo_inicial = np.nan
     if banco_slug == "galicia":
-        # 1) Encabezado
         if header_saldos:
             if not np.isnan(header_saldos.get("saldo_inicial", np.nan)):
                 saldo_inicial = float(header_saldos["saldo_inicial"])
             if not np.isnan(header_saldos.get("saldo_final", np.nan)):
                 saldo_final_pdf = float(header_saldos["saldo_final"])
-        # 2) Reconstrucción si no hay encabezado
         if np.isnan(saldo_inicial) and not df.empty:
-            s0 = float(df.loc[0, "saldo"])
-            m0 = float(df.loc[0, "monto_pdf"])
+            s0 = float(df.loc[0, "saldo"]); m0 = float(df.loc[0, "monto_pdf"])
             saldo_inicial = s0 - m0 if m0 > 0 else s0 + (-m0)
     else:
-        # Otros bancos: usamos lo detectado en el PDF
         if not np.isnan(saldo_anterior):
             saldo_inicial = float(saldo_anterior)
         elif not df.empty and pd.notna(df.loc[0, "saldo"]) and pd.notna(df.loc[0, "delta_saldo"]):
             saldo_inicial = float(df.loc[0, "saldo"] - df.loc[0, "delta_saldo"])
 
-    # Con movimientos: insertar SALDO ANTERIOR si lo tenemos
+    # Insertar SALDO ANTERIOR si lo tenemos
     if not np.isnan(saldo_inicial):
         first_date = df["fecha"].dropna().min()
         fecha_apertura = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59) if pd.notna(first_date) else pd.NaT
@@ -573,25 +571,22 @@ def render_account_report(
     date_suffix = f"_{fecha_cierre.strftime('%Y%m%d')}" if pd.notna(fecha_cierre) else ""
     acc_suffix  = f"_{account_number}"
 
-    # ===== Cabecera legible (sin “...”) =====
     st.caption("Resumen del período")
     c1, c2, c3 = st.columns(3)
     with c1: metric_text("Saldo inicial", saldo_inicial_show)
     with c2: metric_text("Total créditos (+)", total_creditos)
     with c3: metric_text("Total débitos (–)", total_debitos)
     c4, c5, c6 = st.columns(3)
-    with c4: metric_text("Saldo final (PDF)", saldo_final_visto)
+    with c4: metric_text("Saldo final (PDF)",  saldo_final_visto)
     with c5: metric_text("Saldo final calculado", saldo_final_calculado)
     with c6: metric_text("Diferencia", diferencia)
 
-    if cuadra:
-        st.success("Conciliado.")
-    else:
-        st.error("No cuadra la conciliación.")
+    if cuadra: st.success("Conciliado.")
+    else:      st.error("No cuadra la conciliación.")
     if pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
-    # ===== Resumen Operativo (IVA + Otros) =====
+    # ===== Resumen Operativo =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
 
     iva21_mask  = df_sorted["Clasificación"].eq("IVA 21% (sobre comisiones)")
@@ -600,11 +595,18 @@ def render_account_report(
     iva105 = float(df_sorted.loc[iva105_mask, "debito"].sum())
     net21  = round(iva21  / 0.21,  2) if iva21  else 0.0
     net105 = round(iva105 / 0.105, 2) if iva105 else 0.0
-    percep_iva = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
-    ley_25413  = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25413"),          "debito"].sum())
-    sircreb    = float(df_sorted.loc[df_sorted["Clasificación"].eq("SIRCREB"),            "debito"].sum())
 
-    # Galicia: IVA y fallback
+    percep_iva = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
+
+    # >>> Ley 25.413 con signo (devoluciones/ créditos restan)
+    ley_mask = df_sorted["Clasificación"].eq("LEY 25413")
+    ley_deb = float(df_sorted.loc[ley_mask, "debito"].sum())
+    ley_cre = float(df_sorted.loc[ley_mask, "credito"].sum())
+    ley_25413 = ley_deb - ley_cre
+
+    sircreb = float(df_sorted.loc[df_sorted["Clasificación"].eq("SIRCREB"), "debito"].sum())
+
+    # Galicia: IVA y fallback adicional
     if banco_slug == "galicia":
         udesc = df_sorted["desc_norm"].fillna("").str.upper()
         mask_percep_iva = udesc.str.contains(r"PERCEP\.?\s*IVA")
@@ -612,8 +614,7 @@ def render_account_report(
         mask_iva_gal = udesc.str.contains(r"\bIVA\b") & (~mask_percep_iva)
         iva21_gal = float(df_sorted.loc[mask_iva_gal, "debito"].sum())
         if iva21_gal > 0:
-            iva21 = iva21_gal
-            net21 = round(iva21 / 0.21, 2)
+            iva21 = iva21_gal; net21 = round(iva21 / 0.21, 2)
         else:
             mask_comisiones_fallback = (
                 udesc.str.contains(r"COM\.?\s*DEP[ÓO]SITO\s+DE\s+CHEQUE") |
@@ -621,8 +622,7 @@ def render_account_report(
             )
             net21 = float(df_sorted.loc[mask_comisiones_fallback, "debito"].sum())
             iva21 = 0.0
-        iva105 = 0.0
-        net105 = 0.0
+        iva105 = 0.0; net105 = 0.0
 
     m1, m2, m3 = st.columns(3)
     with m1: metric_text("Neto Comisiones 21%", net21)
@@ -636,7 +636,7 @@ def render_account_report(
 
     o1, o2, o3 = st.columns(3)
     with o1: metric_text("Percepciones de IVA (RG 3337 / RG 2408)", percep_iva)
-    with o2: metric_text("Ley 25.413", ley_25413)
+    with o2: metric_text("Ley 25.413 (neto)", ley_25413)
     with o3: metric_text("SIRCREB", sircreb)
 
     total_operativo = net21 + iva21 + net105 + iva105 + percep_iva + ley_25413 + sircreb
@@ -706,7 +706,7 @@ def render_account_report(
                 ["IVA 10,5%",             fmt_ar(iva105)],
                 ["Bruto 10,5%",           fmt_ar(net105 + iva105)],
                 ["Percepciones de IVA (RG 3337 / RG 2408)", fmt_ar(percep_iva)],
-                ["Ley 25.413",            fmt_ar(ley_25413)],
+                ["Ley 25.413 (neto)",     fmt_ar(ley_25413)],
                 ["SIRCREB",               fmt_ar(sircreb)],
                 ["TOTAL",                 fmt_ar(total_operativo)],
             ]
@@ -734,7 +734,7 @@ def render_account_report(
         except Exception as e:
             st.info(f"No se pudo generar el PDF del Resumen Operativo: {e}")
 
-# ---------- Banco Santa Fe: extraer Nro de cuenta desde “Consolidado de cuentas” ----------
+# ---------- Banco Santa Fe: extraer Nro de cuenta ----------
 def santafe_extract_accounts(file_like):
     items = []
     for _, ln in extract_all_lines(file_like):
