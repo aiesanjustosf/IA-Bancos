@@ -76,6 +76,10 @@ BNA_GASTOS_RE = re.compile(
     re.IGNORECASE
 )
 
+# ---- NUEVO: Banco Galicia ----
+GALICIA_TABLE_MARK = "Resumen de Cuenta Corriente en Pesos"
+GALICIA_HEADER_RE  = re.compile(r"\bFecha\s+Descripción\s+Origen\s+Crédito\s+Débito\s+Saldo\b", re.I)
+
 # ---- NUEVO: Santa Fe - "SALDO ULTIMO RESUMEN" sin fecha ----
 SF_SALDO_ULT_RE = re.compile(r"SALDO\s+U?LTIMO\s+RESUMEN", re.IGNORECASE)
 
@@ -136,9 +140,11 @@ def normalize_desc(desc: str) -> str:
     return u
 
 # ---------- Detección de banco (solo banner) ----------
-BANK_MACRO_HINTS = ("BANCO MACRO","CUENTA CORRIENTE BANCARIA","SALDO ULTIMO EXTRACTO AL","DEBITO FISCAL IVA BASICO","N/D DBCR 25413")
+BANK_MACRO_HINTS   = ("BANCO MACRO","CUENTA CORRIENTE BANCARIA","SALDO ULTIMO EXTRACTO AL","DEBITO FISCAL IVA BASICO","N/D DBCR 25413")
 BANK_SANTAFE_HINTS = ("BANCO DE SANTA FE","NUEVO BANCO DE SANTA FE","SALDO ANTERIOR","IMPTRANS","IVA GRAL")
-BANK_NACION_HINTS = (BNA_NAME_HINT, "SALDO ANTERIOR", "SALDO FINAL", "I.V.A. BASE", "COMIS.")
+BANK_NACION_HINTS  = (BNA_NAME_HINT, "SALDO ANTERIOR", "SALDO FINAL", "I.V.A. BASE", "COMIS.")
+# NUEVO: Galicia
+BANK_GALICIA_HINTS = ("BANCO GALICIA", "RESUMEN DE CUENTA CORRIENTE EN PESOS", "SIRCREB", "IMP. DEB./CRE. LEY 25413", "TRANSFERENCIA DE TERCEROS", "COELSA")
 
 def _text_from_pdf(file_like) -> str:
     try:
@@ -149,13 +155,15 @@ def _text_from_pdf(file_like) -> str:
 
 def detect_bank_from_text(txt: str) -> str:
     U = (txt or "").upper()
-    score_macro = sum(1 for k in BANK_MACRO_HINTS if k in U)
-    score_sf    = sum(1 for k in BANK_SANTAFE_HINTS if k in U)
-    score_bna   = sum(1 for k in BANK_NACION_HINTS if k in U)
-    if score_macro >= score_sf and score_macro >= score_bna and score_macro > 0: return "Banco Macro"
-    if score_sf >= score_macro and score_sf >= score_bna and score_sf > 0:       return "Banco de Santa Fe"
-    if score_bna >= score_macro and score_bna >= score_sf and score_bna > 0:     return "Banco de la Nación Argentina"
-    return "Banco no identificado"
+    score_macro   = sum(1 for k in BANK_MACRO_HINTS   if k in U)
+    score_sf      = sum(1 for k in BANK_SANTAFE_HINTS if k in U)
+    score_bna     = sum(1 for k in BANK_NACION_HINTS  if k in U)
+    score_galicia = sum(1 for k in BANK_GALICIA_HINTS if k in U)
+    # orden por mayor puntaje
+    pairs = [("Banco Macro", score_macro), ("Banco de Santa Fe", score_sf),
+             ("Banco de la Nación Argentina", score_bna), ("Banco Galicia", score_galicia)]
+    best = max(pairs, key=lambda x: x[1])
+    return best[0] if best[1] > 0 else "Banco no identificado"
 
 # ---------- extracción de líneas ----------
 def extract_all_lines(file_like):
@@ -541,7 +549,7 @@ def render_account_report(
         }])
         df = pd.concat([apertura, df], ignore_index=True)
 
-    # Débito/Crédito por delta de saldo (robusto para BNA)
+    # Débito/Crédito por delta de saldo (robusto para BNA y Galicia)
     df = df.sort_values(["fecha", "orden"]).reset_index(drop=True)
     df["delta_saldo"] = df["saldo"].diff()
     df["debito"]  = np.where(df["delta_saldo"] < 0, -df["delta_saldo"], 0.0)
@@ -808,7 +816,7 @@ _auto_bank_name = detect_bank_from_text(_bank_txt)
 with st.expander("Opciones avanzadas (detección de banco)", expanded=False):
     forced = st.selectbox(
         "Forzar identificación del banco",
-        options=("Auto (detectar)", "Banco de Santa Fe", "Banco Macro", "Banco de la Nación Argentina"),
+        options=("Auto (detectar)", "Banco de Santa Fe", "Banco Macro", "Banco de la Nación Argentina", "Banco Galicia"),
         index=0,
         help="Solo cambia la etiqueta informativa y el nombre de archivo."
     )
@@ -821,12 +829,15 @@ elif _bank_name == "Banco de Santa Fe":
     st.success(f"Detectado: {_bank_name}")
 elif _bank_name == "Banco de la Nación Argentina":
     st.success(f"Detectado: {_bank_name}")
+elif _bank_name == "Banco Galicia":
+    st.success(f"Detectado: {_bank_name}")
 else:
     st.warning("No se pudo identificar el banco automáticamente. Se intentará procesar.")
 
 _bank_slug = ("macro" if _bank_name == "Banco Macro"
               else "santafe" if _bank_name == "Banco de Santa Fe"
               else "nacion" if _bank_name == "Banco de la Nación Argentina"
+              else "galicia" if _bank_name == "Banco Galicia"
               else "generico")
 
 # --- Flujo por banco ---
@@ -879,8 +890,18 @@ elif _bank_name == "Banco de la Nación Argentina":
 
     render_account_report(_bank_slug, titulo, nro, acc_id, all_lines, bna_extras=bna_extras)
 
+elif _bank_name == "Banco Galicia":
+    # Galicia trae cabecera "Fecha · Descripción · Origen · Crédito · Débito · Saldo".
+    # El pipeline genérico (parse_lines + delta de saldo) funciona bien.
+    all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
+    # Si querés detectar el encabezado explícito:
+    if not any(GALICIA_HEADER_RE.search(l) or GALICIA_TABLE_MARK in l for l in all_lines):
+        st.info("No se encontró explícitamente el encabezado de la tabla de Galicia; se procesa igual por patrón de montos.")
+    render_account_report(_bank_slug, "Cuenta Corriente (Galicia)", "s/n", "galicia-unica", all_lines)
+
 else:
     # Desconocido: procesar genérico
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
+
 
