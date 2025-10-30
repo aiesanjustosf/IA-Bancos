@@ -597,7 +597,7 @@ def render_account_report(
     try:
         st.success("Conciliado.") if cuadra else st.error("No cuadra la conciliación.")
     except Exception:
-        st.write("Conciliación:", "OK" if cuadra o else "No cuadra")
+        st.write("Conciliación:", "OK" if cuadra else "No cuadra")
     if pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
@@ -901,7 +901,7 @@ elif _bank_name == "Banco de la Nación Argentina":
     render_account_report(_bank_slug, titulo, nro, acc_id, all_lines, bna_extras=bna_extras)
 
 elif _bank_name == "Banco Galicia":
-    # Galicia trae cabecera "Fecha · Descripción · Origen · Crédito · Débito · Saldo".
+    # Galicia suele traer cabecera "Fecha · Descripción · Origen · Crédito · Débito · Saldo".
     # El pipeline genérico (parse_lines + delta de saldo) funciona bien.
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     if not any(GALICIA_HEADER_RE.search(l) or GALICIA_TABLE_MARK in l for l in all_lines):
