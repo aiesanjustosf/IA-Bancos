@@ -35,7 +35,12 @@ except Exception:
 
 # --- regex base ---
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{2,4}\b")  # dd/mm/aa o dd/mm/aaaa
-MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
+
+# acepta: -1.234,56  /  1.234,56-  /  123,45
+MONEY_RE = re.compile(
+    r'(?<!\S)-?(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)'
+)
+
 LONG_INT_RE = re.compile(r"\b\d{6,}\b")
 
 # ====== PATRONES ESPECÍFICOS ======
@@ -71,11 +76,10 @@ BNA_GASTOS_RE = re.compile(r"-\s*(INTERESES|COMISION|SELLADOS|I\.V\.A\.?\s*BASE|
 # ---- Banco Galicia ----
 BANK_GALICIA_HINTS = (
     "BANCO GALICIA",
-    "RESUMEN DE CUENTA CORRIENTE EN PESOS",
+    "RESUMEN DE CUENTA",
     "SIRCREB",
     "IMP. DEB./CRE. LEY 25413",
     "TRANSFERENCIA DE TERCEROS",
-    "COELSA",
 )
 GALICIA_HEADER_RE  = re.compile(r"\bFECHA\s+DESCRIPCI[ÓO]N\s+ORIGEN\s+CR[ÉE]DITO\s+D[ÉE]BITO\s+SALDO\b", re.I)
 
@@ -87,8 +91,8 @@ def normalize_money(tok: str) -> float:
     if not tok:
         return np.nan
     tok = tok.strip()
-    neg = tok.endswith("-")
-    tok = tok.rstrip("-")
+    neg = tok.endswith("-") or tok.startswith("-")
+    tok = tok.lstrip("-").rstrip("-")
     if "," not in tok:
         return np.nan
     main, frac = tok.rsplit(",", 1)
@@ -293,23 +297,30 @@ def macro_split_account_blocks(file_like):
 
 # ---------- Parsing movimientos ----------
 def parse_lines(lines) -> pd.DataFrame:
-    rows = []
-    seq = 0
+    """
+    Regla general (sirve para Galicia también):
+    - Último importe = SALDO
+    - Penúltimo importe = movimiento del renglón (crédito o débito; con signo si aplica)
+    """
+    rows, seq = [], 0
     for ln in lines:
         if not ln.strip():
             continue
         if PER_PAGE_TITLE_PAT.search(ln) or HEADER_ROW_PAT.search(ln) or NON_MOV_PAT.search(ln):
             continue
+
         am = list(MONEY_RE.finditer(ln))
         if len(am) < 2:
             continue
+
         d = DATE_RE.search(ln)
         if not d or d.end() >= am[0].start():
             continue
-        saldo   = normalize_money(am[-1].group(0))
-        importe = normalize_money(am[-2].group(0))
-        first_money = am[0]
-        desc = ln[d.end(): first_money.start()].strip()
+
+        saldo   = normalize_money(am[-1].group(0))   # última columna SIEMPRE es saldo
+        monto   = normalize_money(am[-2].group(0))   # penúltima columna = crédito o débito (según signo)
+
+        desc = ln[d.end(): am[0].start()].strip()
         seq += 1
         rows.append({
             "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
@@ -317,7 +328,8 @@ def parse_lines(lines) -> pd.DataFrame:
             "desc_norm": normalize_desc(desc),
             "debito": 0.0,
             "credito": 0.0,
-            "importe": importe,      # informativo
+            "importe": monto,      # monto del renglón
+            "monto_pdf": monto,    # explícito para Galicia
             "saldo": saldo,
             "pagina": 0,
             "orden": seq
@@ -496,16 +508,16 @@ def render_account_report(
         with c4: st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final_visto)}")
         with c5: st.metric("Saldo final calculado", f"$ {fmt_ar(saldo_final_calculado)}")
         with c6: st.metric("Diferencia", f"$ {fmt_ar(diferencia)}")
-        try:
-            st.success("Conciliado.") if cuadra else st.error("No cuadra la conciliación.")
-        except Exception:
-            st.write("Conciliación:", "OK" if cuadra else "No cuadra")
+        if cuadra:
+            st.success("Conciliado.")
+        else:
+            st.error("No cuadra la conciliación.")
         if pd.notna(fecha_cierre):
             st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
         st.info("Sin Movimientos")
         return
 
-    # Con movimientos
+    # Con movimientos: insertar SALDO ANTERIOR si existe
     if not np.isnan(saldo_anterior):
         first_date = df["fecha"].dropna().min()
         fecha_apertura = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59) if pd.notna(first_date) else pd.NaT
@@ -516,18 +528,27 @@ def render_account_report(
             "debito": 0.0,
             "credito": 0.0,
             "importe": 0.0,
+            "monto_pdf": 0.0,
             "saldo": float(saldo_anterior),
             "pagina": 0,
             "orden": 0
         }])
         df = pd.concat([apertura, df], ignore_index=True)
 
-    # Delta de saldo => débitos/créditos
+    # ===== Débito/Crédito =====
     df = df.sort_values(["fecha", "orden"]).reset_index(drop=True)
-    df["delta_saldo"] = df["saldo"].diff()
-    df["debito"]  = np.where(df["delta_saldo"] < 0, -df["delta_saldo"], 0.0)
-    df["credito"] = np.where(df["delta_saldo"] > 0,  df["delta_saldo"], 0.0)
-    df["importe"] = df["debito"] - df["credito"]
+    if banco_slug == "galicia":
+        # En Galicia el penúltimo importe es el movimiento del renglón
+        df["debito"]  = np.where(df["monto_pdf"] < 0, -df["monto_pdf"], 0.0)
+        df["credito"] = np.where(df["monto_pdf"] > 0,  df["monto_pdf"], 0.0)
+        df["delta_saldo"] = df["saldo"].diff()   # para conciliación
+        # 'importe' ya es el del renglón; no lo pisamos
+    else:
+        # Resto de bancos: delta de saldo robusto
+        df["delta_saldo"] = df["saldo"].diff()
+        df["debito"]  = np.where(df["delta_saldo"] < 0, -df["delta_saldo"], 0.0)
+        df["credito"] = np.where(df["delta_saldo"] > 0,  df["delta_saldo"], 0.0)
+        df["importe"] = df["debito"] - df["credito"]
 
     # Clasificación
     df["Clasificación"] = df.apply(
@@ -557,17 +578,17 @@ def render_account_report(
     with c4: st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final_visto)}")
     with c5: st.metric("Saldo final calculado", f"$ {fmt_ar(saldo_final_calculado)}")
     with c6: st.metric("Diferencia", f"$ {fmt_ar(diferencia)}")
-    try:
-        st.success("Conciliado.") if cuadra else st.error("No cuadra la conciliación.")
-    except Exception:
-        st.write("Conciliación:", "OK" if cuadra else "No cuadra")
+    if cuadra:
+        st.success("Conciliado.")
+    else:
+        st.error("No cuadra la conciliación.")
     if pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
     # ===== Resumen Operativo (IVA + Otros) =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
 
-    # Base genérica (otros bancos)
+    # Base genérica
     iva21_mask  = df_sorted["Clasificación"].eq("IVA 21% (sobre comisiones)")
     iva105_mask = df_sorted["Clasificación"].eq("IVA 10,5% (sobre comisiones)")
     iva21  = float(df_sorted.loc[iva21_mask,  "debito"].sum())
@@ -835,7 +856,7 @@ elif _bank_name == "Banco de la Nación Argentina":
 elif _bank_name == "Banco Galicia":
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     if not any(GALICIA_HEADER_RE.search(l) for l in all_lines):
-        st.info("No se encontró explícitamente el encabezado de la tabla de Galicia; se procesa igual por patrón de montos.")
+        st.info("No se encontró explícitamente el encabezado de la tabla de Galicia; se procesa igual por montos.")
     render_account_report(_bank_slug, "Cuenta Corriente (Galicia)", "s/n", "galicia-unica", all_lines)
 
 else:
