@@ -144,7 +144,14 @@ BANK_MACRO_HINTS   = ("BANCO MACRO","CUENTA CORRIENTE BANCARIA","SALDO ULTIMO EX
 BANK_SANTAFE_HINTS = ("BANCO DE SANTA FE","NUEVO BANCO DE SANTA FE","SALDO ANTERIOR","IMPTRANS","IVA GRAL")
 BANK_NACION_HINTS  = (BNA_NAME_HINT, "SALDO ANTERIOR", "SALDO FINAL", "I.V.A. BASE", "COMIS.")
 # NUEVO: Galicia
-BANK_GALICIA_HINTS = ("BANCO GALICIA", "RESUMEN DE CUENTA CORRIENTE EN PESOS", "SIRCREB", "IMP. DEB./CRE. LEY 25413", "TRANSFERENCIA DE TERCEROS", "COELSA")
+BANK_GALICIA_HINTS = (
+    "BANCO GALICIA",
+    "RESUMEN DE CUENTA CORRIENTE EN PESOS",
+    "SIRCREB",
+    "IMP. DEB./CRE. LEY 25413",
+    "TRANSFERENCIA DE TERCEROS",
+    "COELSA",
+)
 
 def _text_from_pdf(file_like) -> str:
     try:
@@ -159,9 +166,12 @@ def detect_bank_from_text(txt: str) -> str:
     score_sf      = sum(1 for k in BANK_SANTAFE_HINTS if k in U)
     score_bna     = sum(1 for k in BANK_NACION_HINTS  if k in U)
     score_galicia = sum(1 for k in BANK_GALICIA_HINTS if k in U)
-    # orden por mayor puntaje
-    pairs = [("Banco Macro", score_macro), ("Banco de Santa Fe", score_sf),
-             ("Banco de la Nación Argentina", score_bna), ("Banco Galicia", score_galicia)]
+    pairs = [
+        ("Banco Macro", score_macro),
+        ("Banco de Santa Fe", score_sf),
+        ("Banco de la Nación Argentina", score_bna),
+        ("Banco Galicia", score_galicia),
+    ]
     best = max(pairs, key=lambda x: x[1])
     return best[0] if best[1] > 0 else "Banco no identificado"
 
@@ -587,7 +597,7 @@ def render_account_report(
     try:
         st.success("Conciliado.") if cuadra else st.error("No cuadra la conciliación.")
     except Exception:
-        st.write("Conciliación:", "OK" if cuadra else "No cuadra")
+        st.write("Conciliación:", "OK" if cuadra o else "No cuadra")
     if pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
@@ -894,7 +904,6 @@ elif _bank_name == "Banco Galicia":
     # Galicia trae cabecera "Fecha · Descripción · Origen · Crédito · Débito · Saldo".
     # El pipeline genérico (parse_lines + delta de saldo) funciona bien.
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
-    # Si querés detectar el encabezado explícito:
     if not any(GALICIA_HEADER_RE.search(l) or GALICIA_TABLE_MARK in l for l in all_lines):
         st.info("No se encontró explícitamente el encabezado de la tabla de Galicia; se procesa igual por patrón de montos.")
     render_account_report(_bank_slug, "Cuenta Corriente (Galicia)", "s/n", "galicia-unica", all_lines)
@@ -903,5 +912,3 @@ else:
     # Desconocido: procesar genérico
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
-
-
