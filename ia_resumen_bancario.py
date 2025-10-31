@@ -211,6 +211,23 @@ def credicoop_parse_records_xy(file_like):
         df["saldo"] = saldos
     return df, fecha_cierre, saldo_final_pdf, saldo_anterior_pdf
 
+# ---- NUEVO: Banco Santander / Banco Galicia (solo hints) ----
+BANK_SANTANDER_HINTS = (
+    "BANCO SANTANDER",
+    "SANTANDER RIO",
+    "DETALLE DE MOVIMIENTO",
+    "SALDO INICIAL",
+    "SALDO FINAL",
+)
+
+BANK_GALICIA_HINTS = (
+    "BANCO GALICIA",
+    "RESUMEN DE CUENTA",
+    "DESCRIPCIÓN ORIGEN CRÉDITO DÉBITO SALDO",
+    "SIRCREB",
+    "IMP. DEB./CRE. LEY 25413",
+)
+
 # --- utils ---
 def normalize_money(tok: str) -> float:
     if not tok:
@@ -286,9 +303,17 @@ def detect_bank_from_text(txt: str) -> str:
     score_sf    = sum(1 for k in BANK_SANTAFE_HINTS if k in U)
     score_bna   = sum(1 for k in BANK_NACION_HINTS if k in U)
     score_cred  = sum(1 for k in BANK_CREDICOOP_HINTS if k in U)
+    score_sant  = sum(1 for k in BANK_SANTANDER_HINTS if k in U)
+    score_gal   = sum(1 for k in BANK_GALICIA_HINTS if k in U)
     # elegir el mayor score; si todos 0, "no identificado"
-    scores = [("Banco Macro", score_macro), ("Banco de Santa Fe", score_sf),
-              ("Banco de la Nación Argentina", score_bna), ("Banco Credicoop", score_cred)]
+    scores = [
+        ("Banco Macro", score_macro),
+        ("Banco de Santa Fe", score_sf),
+        ("Banco de la Nación Argentina", score_bna),
+        ("Banco Credicoop", score_cred),
+        ("Banco Santander", score_sant),
+        ("Banco Galicia", score_gal),
+    ]
     scores.sort(key=lambda x: x[1], reverse=True)
     return scores[0][0] if scores[0][1] > 0 else "Banco no identificado"
 
@@ -423,7 +448,7 @@ def macro_split_account_blocks(file_like):
         blocks.append(acc)
     return blocks
 
-# ---------- Parsing movimientos (genérico: Macro/SF/BNA) ----------
+# ---------- Parsing movimientos (genérico: Macro/SF/BNA/Glacia) ----------
 def parse_lines(lines) -> pd.DataFrame:
     rows = []
     seq = 0  # preserva orden exacto de aparición
@@ -456,6 +481,95 @@ def parse_lines(lines) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
+# ---------- NUEVO: Parser específico Santander ----------
+def parse_santander_lines(lines: list[str]) -> pd.DataFrame:
+    """
+    Santander: FECHA | DESCRIPCIÓN | REFERENCIA | DÉBITOS | CRÉDITOS | SALDO
+    - La fecha puede figurar una vez y las líneas siguientes heredan.
+    - Los importes pueden venir con o sin '$'. MONEY_RE ya los capta.
+    Regla:
+      * Último monto = SALDO
+      * Si hay 3+ montos: [débitos, créditos, saldo]
+      * Si hay 2 montos: [movimiento, saldo] -> signo según Δ saldo
+    """
+    rows, seq = [], 0
+    current_date = None
+    prev_saldo = None
+
+    for ln in lines:
+        s = ln.strip()
+        if not s:
+            continue
+
+        mdate = DATE_RE.search(s)
+        if mdate:
+            current_date = pd.to_datetime(mdate.group(0), dayfirst=True, errors="coerce")
+
+        # saltar cabeceras comunes
+        if HEADER_ROW_PAT.search(s) or NON_MOV_PAT.search(s):
+            continue
+
+        am = list(MONEY_RE.finditer(s))
+        if len(am) < 2:
+            continue
+
+        saldo = normalize_money(am[-1].group(0))
+
+        # Descripción entre fecha (si hay) y primer monto
+        first_amt_start = am[0].start()
+        if mdate and mdate.end() < first_amt_start:
+            desc = s[mdate.end():first_amt_start].strip()
+        else:
+            # línea sin fecha (usa la última conocida)
+            # tomar lo que haya antes del primer monto como descripción
+            desc = s[:first_amt_start].strip()
+
+        deb = cre = 0.0
+        if len(am) >= 3:
+            deb = normalize_money(am[0].group(0))
+            cre = normalize_money(am[1].group(0))
+            # en algunos PDFs la columna vacía queda como 0, lo mantenemos
+        else:
+            mov = normalize_money(am[0].group(0))
+            if prev_saldo is not None:
+                delta = saldo - prev_saldo
+                # si el saldo sube por el mismo valor del movimiento -> crédito
+                if abs(delta - mov) < 0.02:
+                    cre = mov
+                elif abs(delta + mov) < 0.02:
+                    deb = mov
+                else:
+                    # heurística mínima por texto
+                    U = s.upper()
+                    if "CRÉDIT" in U or "CREDITO" in U or "DEP" in U:
+                        cre = mov
+                    else:
+                        deb = mov
+            else:
+                # primera línea sin saldo previo: prudente
+                deb = mov
+
+        seq += 1
+        rows.append({
+            "fecha": current_date if current_date is not None else pd.NaT,
+            "descripcion": desc,
+            "desc_norm": normalize_desc(desc),
+            "debito": deb,
+            "credito": cre,
+            "importe": cre - deb,
+            "saldo": saldo,
+            "pagina": 0,
+            "orden": seq
+        })
+        prev_saldo = saldo
+
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        # si vienen filas “SALDO INICIAL” explícitas, ya las tomará más abajo;
+        # aquí no forzamos nada para no interferir con tu lógica
+        pass
+    return df
+
 # ---------- Saldos ----------
 def _only_one_amount(line: str) -> bool:
     return len(list(MONEY_RE.finditer(line))) == 1
@@ -474,7 +588,7 @@ def find_saldo_final_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if pd.notna(fecha) and not np.isnan(saldo):
                     return fecha, saldo
-    # 2) BNA: "SALDO FINAL <importe>" sin fecha
+    # 2) Genérico: "SALDO FINAL" sin fecha
     for ln in reversed(lines):
         if "SALDO FINAL" in ln.upper() and _only_one_amount(ln):
             saldo = _first_amount_value(ln)
@@ -498,6 +612,13 @@ def find_saldo_anterior_from_lines(lines):
             saldo = _first_amount_value(ln)
             if not np.isnan(saldo):
                 return saldo
+    # 2.b NUEVO: "SALDO INICIAL" (para Santander / Galicia)
+    for ln in lines:
+        U = ln.upper()
+        if "SALDO INICIAL" in U and _only_one_amount(ln):
+            v = _first_amount_value(ln)
+            if not np.isnan(v):
+                return v
     # 3) Macro variantes
     for ln in lines:
         U = ln.upper()
@@ -910,7 +1031,7 @@ _auto_bank_name = detect_bank_from_text(_bank_txt)
 with st.expander("Opciones avanzadas (detección de banco)", expanded=False):
     forced = st.selectbox(
         "Forzar identificación del banco",
-        options=("Auto (detectar)", "Banco de Santa Fe", "Banco Macro", "Banco de la Nación Argentina", "Banco Credicoop"),
+        options=("Auto (detectar)", "Banco de Santa Fe", "Banco Macro", "Banco de la Nación Argentina", "Banco Credicoop", "Banco Santander", "Banco Galicia"),
         index=0,
         help="Solo cambia la etiqueta informativa y el nombre de archivo."
     )
@@ -925,6 +1046,10 @@ elif _bank_name == "Banco de la Nación Argentina":
     st.success(f"Detectado: {_bank_name}")
 elif _bank_name == "Banco Credicoop":
     st.success(f"Detectado: {_bank_name}")
+elif _bank_name == "Banco Santander":
+    st.success(f"Detectado: {_bank_name}")
+elif _bank_name == "Banco Galicia":
+    st.success(f"Detectado: {_bank_name}")
 else:
     st.warning("No se pudo identificar el banco automáticamente. Se intentará procesar.")
 
@@ -932,6 +1057,8 @@ _bank_slug = ("macro" if _bank_name == "Banco Macro"
               else "santafe" if _bank_name == "Banco de Santa Fe"
               else "nacion" if _bank_name == "Banco de la Nación Argentina"
               else "credicoop" if _bank_name == "Banco Credicoop"
+              else "santander" if _bank_name == "Banco Santander"
+              else "galicia" if _bank_name == "Banco Galicia"
               else "generico")
 
 # --- Flujo por banco ---
@@ -1116,11 +1243,38 @@ elif _bank_name == "Banco Credicoop":
                 key=f"dl_csv_{acc_id}",
             )
 
+elif _bank_name == "Banco Santander":
+    # Parser específico Santander (no toca nada del resto)
+    all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
+    df_san = parse_santander_lines(all_lines)
+
+    # Si por algún motivo quedó vacío, caemos al genérico para no romper
+    if df_san.empty:
+        render_account_report(_bank_slug, "CUENTA (Santander)", "s/n", "santander-unica", all_lines)
+    else:
+        # Reusar pipeline estándar de render:
+        # Construimos "lines" sintéticos a partir del DF para usar el mismo render si querés,
+        # pero más simple: render manual breve (sin duplicar lógica). Acá aprovechamos el genérico:
+        # Volvemos a armar "lines" de texto tipo "dd/mm/aa DESC ... monto ... saldo" para que el render funcione igual.
+        synth_lines = []
+        for _, r in df_san.iterrows():
+            f = r["fecha"].strftime("%d/%m/%Y") if pd.notna(r["fecha"]) else "01/01/1900"
+            # armamos una línea compatible con parse_lines (fecha ... movimiento ... saldo)
+            mov = r["credito"] if r["credito"] else ( -r["debito"] if r["debito"] else 0.0 )
+            def mk(x):  # a , con separador
+                return f"{abs(x):,.2f}".replace(",", "§").replace(".", ",").replace("§", ".") + ( "-" if x<0 else "" )
+            synth_lines.append(f"{f} {r['descripcion']} {mk(mov)} {mk(r['saldo'])}")
+        render_account_report(_bank_slug, "Cuenta Corriente (Santander)", "s/n", "santander-unica", synth_lines)
+
+elif _bank_name == "Banco Galicia":
+    # Galicia funciona con el parser genérico por estructura de columnas
+    all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
+    render_account_report(_bank_slug, "Cuenta Corriente (Galicia)", "s/n", "galicia-unica", all_lines)
+
 else:
     # Desconocido: procesar genérico
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
-
 
 
 
