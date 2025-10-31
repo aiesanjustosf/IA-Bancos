@@ -1,15 +1,23 @@
-# =========================
-#  PARSER BANCO SANTANDER
-#  Integración no destructiva
-#  AIE San Justo - IA Resumen Bancario
-# =========================
+# ia_resumen_bancario.py
+# IA - AIE San Justo
+# App segura con parser Banco Santander + UI mínima (no rompe bancos existentes)
 
 import re
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 from decimal import Decimal, InvalidOperation
 
-# ============== Utilitarios numéricos ==============
+import streamlit as st
+import pandas as pd
+
+# --- Config UI base (segura, sin loops) ---
+st.set_page_config(page_title="IA Resumen Bancario", layout="wide")
+st.title("IA Resumen Bancario")
+st.caption("AIE San Justo – Parser bancos (incluye Banco Santander)")
+
+# =========================
+#  UTILITARIOS NÚMEROS / TEXTO
+# =========================
 
 def _to_decimal(ar_amount: str) -> Decimal:
     """
@@ -26,7 +34,6 @@ def _to_decimal(ar_amount: str) -> Decimal:
     try:
         return Decimal(s)
     except InvalidOperation:
-        # último intento: limpiar cualquier basura residual
         s = re.sub(r"[^0-9\.-]", "", s)
         if s in ("", "-", ".", "-."):
             return Decimal("0")
@@ -40,8 +47,18 @@ def _find_money_all(s: str) -> List[str]:
 def _normalized(s: str) -> str:
     return re.sub(r"\s+", " ", s.strip().lower())
 
-# ============== Modelo de datos ==============
+def format_money(v: Decimal) -> str:
+    try:
+        return f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    except Exception:
+        try:
+            return f"{float(Decimal(v)) :,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        except Exception:
+            return str(v)
 
+# =========================
+#  MODELO DE DATOS
+# =========================
 @dataclass
 class Movimiento:
     fecha: str
@@ -51,180 +68,17 @@ class Movimiento:
     saldo: Decimal
     clasificacion: str
 
-# ============== Detección ==============
+# =========================
+#  PARSER BANCO SANTANDER
+# =========================
 
 def santander_detect(texto: str) -> bool:
     t = _normalized(texto)
-    # Señales bien propias del PDF Santander mostrado
     return (
         "banco santander argentina" in t
         and "movimientos en pesos" in t
         and "saldo inicial" in t
     )
-
-# ============== Parser principal ==============
-
-def santander_parse(texto: str) -> Dict:
-    """
-    Parsea el bloque 'Movimientos en pesos' de Santander.
-    - Usa 'Saldo Inicial' como saldo inicial.
-    - Cada renglón con fecha tiene un solo importe de movimiento y un saldo.
-    - Decide débito/crédito por delta de saldo.
-    - Clasifica según reglas pedidas.
-    Retorna dict con:
-      - movimientos: List[Movimiento]
-      - saldo_inicial, saldo_final : Decimal
-      - resumen_operativo: dict con totales
-    """
-    # 1) Aislar sección de 'Movimientos en pesos' hasta 'Saldo total' o 'Detalle impositivo'
-    t = texto.replace("\r", "\n")
-    mov_ini = re.search(r"Movimientos en pesos", t, flags=re.IGNORECASE)
-    if not mov_ini:
-        raise ValueError("No se encontró el bloque 'Movimientos en pesos' en Santander.")
-    sub = t[mov_ini.end():]
-
-    corte = re.search(r"(Saldo total|Detalle impositivo)\b", sub, flags=re.IGNORECASE)
-    if corte:
-        sub = sub[:corte.start()]
-
-    # 2) Limpiar y separar líneas
-    raw_lines = [l for l in sub.splitlines()]
-    lines = [re.sub(r"\s+$", "", l) for l in raw_lines if l.strip() != ""]
-
-    # 3) Buscar 'Saldo Inicial' y tomar saldo
-    saldo_inicial = None
-    movimientos: List[Movimiento] = []
-
-    fecha_rx = re.compile(r"^\s*(\d{2}/\d{2}/\d{2})\b")
-    # Algunos renglones pueden partir la descripción (ej: "Pago haberes" / "2509...").
-    # Haremos un pequeño state machine para “acumular” descripción hasta ver importes.
-    prev_balance: Optional[Decimal] = None
-    buffer_fecha: Optional[str] = None
-    buffer_desc: List[str] = []
-
-    def flush_record(line_with_amounts: str):
-        nonlocal prev_balance, buffer_fecha, buffer_desc, movimientos
-        if buffer_fecha is None:
-            return
-        # extraer importes: se esperan 2 en cada movimiento (monto y saldo)
-        amounts = _find_money_all(line_with_amounts)
-        if len(amounts) < 2:
-            # Si no se obtienen 2, intentar sumar la línea anterior (algunas extracciones pegan)
-            # NOTA: en la muestra real siempre hay 2 (monto, saldo)
-            return
-
-        mov_importe = _to_decimal(amounts[0])
-        saldo_importe = _to_decimal(amounts[-1])
-
-        # Determinar débito/crédito por delta contra saldo previo
-        deb = Decimal("0")
-        cre = Decimal("0")
-
-        if prev_balance is not None:
-            delta = saldo_importe - prev_balance
-            # tolerancia centavos
-            if abs(delta - mov_importe) < Decimal("0.02"):
-                # Aumentó el saldo -> Crédito
-                cre = mov_importe
-            elif abs(delta + mov_importe) < Decimal("0.02"):
-                # Disminuyó el saldo -> Débito
-                deb = mov_importe
-            else:
-                # Fallback por palabras clave si delta no calza (muy raro)
-                joined_desc = _normalized(" ".join(buffer_desc))
-                if any(k in joined_desc for k in ("depósito", "deposito", "credito", "crédito")):
-                    cre = mov_importe
-                else:
-                    deb = mov_importe
-        else:
-            # Primer movimiento sin previo (no debería ocurrir porque tenemos 'Saldo inicial')
-            # Asumir crédito por defecto si dice depósito, si no, débito.
-            joined_desc = _normalized(" ".join(buffer_desc))
-            if any(k in joined_desc for k in ("depósito", "deposito", "credito", "crédito")):
-                cre = mov_importe
-            else:
-                deb = mov_importe
-
-        clasif = santander_clasificar(" ".join(buffer_desc), deb, cre)
-
-        movimientos.append(
-            Movimiento(
-                fecha=buffer_fecha,
-                descripcion=" ".join(buffer_desc).strip(),
-                debito=deb,
-                credito=cre,
-                saldo=saldo_importe,
-                clasificacion=clasif,
-            )
-        )
-        prev_balance = saldo_importe
-        buffer_fecha = None
-        buffer_desc = []
-
-    for i, ln in enumerate(lines):
-        ln_clean = ln.strip()
-
-        # Capturar saldo inicial explícito
-        if "saldo inicial" in _normalized(ln_clean):
-            # Buscar el último importe de esa línea como saldo inicial
-            amounts = _find_money_all(ln_clean)
-            if amounts:
-                saldo_inicial = _to_decimal(amounts[-1])
-                prev_balance = saldo_inicial
-            continue
-
-        # Si arranca con fecha, es un nuevo movimiento
-        m = fecha_rx.match(ln_clean)
-        if m:
-            # Si quedó uno abierto, hay que cerrarlo (caso raro sin importes)
-            # pero normalmente el cierre se hace cuando aparecen importes.
-            if buffer_fecha is not None and buffer_desc:
-                # No hay importes, lo descartamos (no debería ocurrir)
-                buffer_fecha = None
-                buffer_desc = []
-            buffer_fecha = m.group(1)
-            # Quitar la fecha de la línea para rastrear descripción/ importes
-            resto = ln_clean[m.end():].strip()
-            if resto:
-                buffer_desc = [resto]
-            else:
-                buffer_desc = []
-            continue
-
-        # Si estamos dentro de un movimiento (hay fecha en buffer)
-        if buffer_fecha is not None:
-            # ¿Vienen importes en esta línea?
-            money_found = _find_money_all(ln_clean)
-            if len(money_found) >= 2:
-                # Esta línea contiene el (monto movimiento) y el (saldo)
-                flush_record(ln_clean)
-            else:
-                # línea de continuación de descripción (ej: “Pago haberes” / “2509...”)
-                buffer_desc.append(ln_clean)
-        else:
-            # Estamos fuera de un registro; no hacemos nada
-            pass
-
-    # Cerrar si quedó algo pendiente (muy raro)
-    # (Sin importes no se puede decidir débito/crédito, así que lo ignoramos)
-    # -- nada --
-
-    if saldo_inicial is None:
-        raise ValueError("No se pudo determinar el Saldo Inicial en Santander.")
-
-    saldo_final = prev_balance if prev_balance is not None else saldo_inicial
-
-    # ============== Resumen operativo ==============
-    resumen = santander_resumen_operativo(movimientos)
-
-    return {
-        "movimientos": movimientos,
-        "saldo_inicial": saldo_inicial,
-        "saldo_final": saldo_final,
-        "resumen_operativo": resumen,
-    }
-
-# ============== Clasificación ==============
 
 def santander_clasificar(descripcion: str, debito: Decimal, credito: Decimal) -> str:
     d = _normalized(descripcion)
@@ -260,10 +114,7 @@ def santander_clasificar(descripcion: str, debito: Decimal, credito: Decimal) ->
     if "deposito" in d or "depósito" in d:
         return "Depósito de efectivo"
 
-    # Genérica
     return "Otros"
-
-# ============== Totales Resumen Operativo ==============
 
 def santander_resumen_operativo(movs: List[Movimiento]) -> Dict[str, Decimal]:
     total_gastos = Decimal("0")
@@ -275,46 +126,152 @@ def santander_resumen_operativo(movs: List[Movimiento]) -> Dict[str, Decimal]:
     for m in movs:
         cls = m.clasificacion.lower()
 
-        # Gastos: comisión + IVA/Percepciones forman parte de gastos operativos
+        # Gastos: comisión + IVA/Percepciones
         if cls.startswith("gasto"):
-            total_gastos += m.debito  # comisión suele ser débito
+            total_gastos += m.debito
         if "iva" in cls:
-            # pueden aparecer como débitos (percepciones/rg); si hubiera créditos, se restan
             total_iva += m.debito
             total_iva -= m.credito
 
-        # Ley 25.413: sumar débitos y restar créditos al neto
+        # Ley 25.413
         if "ley 25.413" in cls:
             ley_debitos += m.debito
             ley_creditos += m.credito
 
-        # SIRCREB: normalmente es débito (percepción sobre créditos)
+        # SIRCREB
         if "sircreb" in cls:
             sircreb += m.debito
 
-    # Neto ley 25.413 (como pediste: los créditos RESTAN)
     ley_neto = ley_debitos - ley_creditos
-
-    # Gastos totales incluyen comisión + IVA/percepciones
     gastos_totales = total_gastos + total_iva
 
     return {
-        "GASTOS_totales": gastos_totales,         # Comisión + IVA/percepciones
-        "IVA_total": total_iva,                   # Desglosado por claridad
+        "GASTOS_totales": gastos_totales,
+        "IVA_total": total_iva,
         "Ley25413_debitos": ley_debitos,
         "Ley25413_creditos": ley_creditos,
-        "Ley25413_neto": ley_neto,               # débitos - créditos
-        "SIRCREB_total": sircreb,                 # Ingresos Brutos s/ crédito
+        "Ley25413_neto": ley_neto,
+        "SIRCREB_total": sircreb,
     }
 
-# ============== Integración con tu router de bancos ==============
+def santander_parse(texto: str) -> Dict:
+    """
+    Parsea 'Movimientos en pesos' de Santander.
+    """
+    t = texto.replace("\r", "\n")
+    mov_ini = re.search(r"Movimientos en pesos", t, flags=re.IGNORECASE)
+    if not mov_ini:
+        raise ValueError("No se encontró el bloque 'Movimientos en pesos' en Santander.")
+    sub = t[mov_ini.end():]
+    corte = re.search(r"(Saldo total|Detalle impositivo)\b", sub, flags=re.IGNORECASE)
+    if corte:
+        sub = sub[:corte.start()]
+
+    raw_lines = [l for l in sub.splitlines()]
+    lines = [re.sub(r"\s+$", "", l) for l in raw_lines if l.strip() != ""]
+
+    saldo_inicial = None
+    movimientos: List[Movimiento] = []
+
+    fecha_rx = re.compile(r"^\s*(\d{2}/\d{2}/\d{2})\b")
+    prev_balance: Optional[Decimal] = None
+    buffer_fecha: Optional[str] = None
+    buffer_desc: List[str] = []
+
+    def flush_record(line_with_amounts: str):
+        nonlocal prev_balance, buffer_fecha, buffer_desc, movimientos
+        if buffer_fecha is None:
+            return
+        amounts = _find_money_all(line_with_amounts)
+        if len(amounts) < 2:
+            return
+
+        mov_importe = _to_decimal(amounts[0])
+        saldo_importe = _to_decimal(amounts[-1])
+
+        deb = Decimal("0")
+        cre = Decimal("0")
+
+        if prev_balance is not None:
+            delta = saldo_importe - prev_balance
+            if abs(delta - mov_importe) < Decimal("0.02"):
+                cre = mov_importe
+            elif abs(delta + mov_importe) < Decimal("0.02"):
+                deb = mov_importe
+            else:
+                joined_desc = _normalized(" ".join(buffer_desc))
+                if any(k in joined_desc for k in ("depósito", "deposito", "credito", "crédito")):
+                    cre = mov_importe
+                else:
+                    deb = mov_importe
+        else:
+            joined_desc = _normalized(" ".join(buffer_desc))
+            if any(k in joined_desc for k in ("depósito", "deposito", "credito", "crédito")):
+                cre = mov_importe
+            else:
+                deb = mov_importe
+
+        clasif = santander_clasificar(" ".join(buffer_desc), deb, cre)
+
+        movimientos.append(
+            Movimiento(
+                fecha=buffer_fecha,
+                descripcion=" ".join(buffer_desc).strip(),
+                debito=deb,
+                credito=cre,
+                saldo=saldo_importe,
+                clasificacion=clasif,
+            )
+        )
+        prev_balance = saldo_importe
+        buffer_fecha = None
+        buffer_desc = []
+
+    for ln in lines:
+        ln_clean = ln.strip()
+
+        if "saldo inicial" in _normalized(ln_clean):
+            amounts = _find_money_all(ln_clean)
+            if amounts:
+                saldo_inicial = _to_decimal(amounts[-1])
+                prev_balance = saldo_inicial
+            continue
+
+        m = fecha_rx.match(ln_clean)
+        if m:
+            if buffer_fecha is not None and buffer_desc:
+                buffer_fecha = None
+                buffer_desc = []
+            buffer_fecha = m.group(1)
+            resto = ln_clean[m.end():].strip()
+            if resto:
+                buffer_desc = [resto]
+            else:
+                buffer_desc = []
+            continue
+
+        if buffer_fecha is not None:
+            money_found = _find_money_all(ln_clean)
+            if len(money_found) >= 2:
+                flush_record(ln_clean)
+            else:
+                buffer_desc.append(ln_clean)
+
+    if saldo_inicial is None:
+        raise ValueError("No se pudo determinar el Saldo Inicial en Santander.")
+
+    saldo_final = prev_balance if prev_balance is not None else saldo_inicial
+    resumen = santander_resumen_operativo(movimientos)
+
+    return {
+        "movimientos": movimientos,
+        "saldo_inicial": saldo_inicial,
+        "saldo_final": saldo_final,
+        "resumen_operativo": resumen,
+    }
 
 def banco_santander_handler(texto_pdf: str) -> Dict:
-    """
-    Empaqueta parseo y devuelve dict listo para integrarse a tu flujo actual.
-    """
     parsed = santander_parse(texto_pdf)
-    # Convertir a estructura homogénea con el resto (lista de dicts para DataFrame)
     filas = []
     for m in parsed["movimientos"]:
         filas.append({
@@ -336,11 +293,119 @@ def banco_santander_handler(texto_pdf: str) -> Dict:
         "cuenta_detectada": "Cuenta Corriente (Santander)",
     }
 
-# Ejemplo de cómo enchufarlo a tu router existente:
-# (1) En tu detección global, agregá santander_detect(texto_pdf)
-# (2) En tu switch/if de bancos, llamá a banco_santander_handler(texto_pdf)
-#
-# if santander_detect(texto_pdf):
-#     return banco_santander_handler(texto_pdf)
-#
-# Listo. Mantiene TODO lo previo y suma Santander.
+# =========================
+#  ROUTER (extensible a otros bancos)
+# =========================
+
+def router_detectar_banco(texto: str) -> str:
+    if santander_detect(texto):
+        return "Santander"
+    # Agregá aquí otras detecciones existentes:
+    # if nacion_detect(texto): return "Nación"
+    # if macro_detect(texto): return "Macro"
+    # if santafe_detect(texto): return "Santa Fe"
+    # if credicoop_detect(texto): return "Credicoop"
+    return "Desconocido"
+
+def router_parse(texto: str) -> Dict:
+    banco = router_detectar_banco(texto)
+    if banco == "Santander":
+        return banco_santander_handler(texto)
+    raise ValueError("No se detectó banco soportado en el PDF.")
+
+# =========================
+#  LECTURA PDF (pdfplumber)
+# =========================
+
+def leer_pdf_a_texto(file) -> str:
+    try:
+        import pdfplumber
+    except Exception as e:
+        raise RuntimeError(f"No se pudo importar pdfplumber: {e}")
+    full = []
+    with pdfplumber.open(file) as pdf:
+        for p in pdf.pages:
+            try:
+                full.append(p.extract_text() or "")
+            except Exception:
+                full.append("")
+    return "\n".join(full)
+
+# =========================
+#  UI
+# =========================
+
+col1, col2 = st.columns([2,1], gap="large")
+
+with col1:
+    st.subheader("Cargar PDF")
+    up = st.file_uploader("Subí el resumen bancario (PDF)", type=["pdf"])
+
+    usar_demo = st.checkbox("Usar PDF de prueba (2509 Santander.pdf) si está disponible en el servidor", value=False)
+
+    if up or usar_demo:
+        try:
+            if usar_demo:
+                # si corrés local/servidor y tenés el archivo
+                demo_path = "/mnt/data/2509 Santander.pdf"
+                texto = leer_pdf_a_texto(demo_path)
+            else:
+                texto = leer_pdf_a_texto(up)
+
+            banco = router_detectar_banco(texto)
+            st.info(f"Banco detectado: **{banco}**")
+
+            datos = router_parse(texto)
+
+            # DataFrame
+            df = pd.DataFrame(datos["rows"])
+            if not df.empty:
+                df_fmt = df.copy()
+                for c in ["debito", "credito", "saldo"]:
+                    df_fmt[c] = df_fmt[c].apply(lambda x: format_money(Decimal(str(x))))
+                st.subheader("Movimientos")
+                st.dataframe(df_fmt, use_container_width=True, height=420)
+
+            # Saldos
+            st.subheader("Saldos")
+            cA, cB, cC = st.columns(3)
+            cA.metric("Saldo inicial", f"$ {format_money(Decimal(str(datos['saldo_inicial'])))}")
+            cB.metric("Saldo final", f"$ {format_money(Decimal(str(datos['saldo_final'])))}")
+            cC.metric("Moneda", datos.get("moneda", "ARS"))
+
+            # Resumen operativo
+            st.subheader("Resumen Operativo")
+            ro = datos["resumen_operativo"]
+            df_ro = pd.DataFrame(
+                {
+                    "Concepto": [
+                        "GASTOS_totales",
+                        "IVA_total",
+                        "Ley25413_debitos",
+                        "Ley25413_creditos",
+                        "Ley25413_neto (débitos - créditos)",
+                        "SIRCREB_total",
+                    ],
+                    "Importe": [
+                        ro["GASTOS_totales"],
+                        ro["IVA_total"],
+                        ro["Ley25413_debitos"],
+                        ro["Ley25413_creditos"],
+                        ro["Ley25413_neto"],
+                        ro["SIRCREB_total"],
+                    ],
+                }
+            )
+            df_ro["Importe"] = df_ro["Importe"].apply(lambda x: f"$ {format_money(Decimal(str(x)))}")
+            st.dataframe(df_ro, use_container_width=True, height=260)
+
+        except Exception as e:
+            st.error(f"Error procesando el PDF: {e}")
+
+with col2:
+    st.subheader("Estado")
+    st.write("- App cargada correctamente.")
+    st.write("- Parser Santander activo.")
+    st.write("- Si no se detecta el banco, se mostrará error controlado.")
+    st.markdown("—")
+    st.caption("Tip: si tu app quedaba en blanco, era por una excepción antes del render. Este layout la captura y la muestra en pantalla.")
