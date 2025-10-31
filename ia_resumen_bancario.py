@@ -336,35 +336,61 @@ def macro_split_account_blocks(file_like):
 
 # ---------- Parsing líneas (genérico + Galicia) ----------
 def parse_lines(lines) -> pd.DataFrame:
+    """
+    Parser genérico por líneas:
+    - Acepta montos con o sin '$'
+    - No exige que la fecha esté antes del primer monto
+    - Usa el último monto como 'saldo' y el penúltimo como 'movimiento'
+    """
     rows, seq = [], 0
     for ln in lines:
-        if not ln.strip():
+        s = ln.strip()
+        if not s:
             continue
-        if PER_PAGE_TITLE_PAT.search(ln) or HEADER_ROW_PAT.search(ln) or NON_MOV_PAT.search(ln):
+        if PER_PAGE_TITLE_PAT.search(s) or HEADER_ROW_PAT.search(s) or NON_MOV_PAT.search(s):
             continue
-        am = list(MONEY_RE.finditer(ln))
-        if len(am) < 2:
+
+        # Montos: combinar con y sin '$'
+        ms = list(MONEY_RE.finditer(s))
+        ms_dollar = list(MONEY_WITH_SIGN_RE.finditer(s))
+        if len(ms_dollar) > len(ms):
+            ms = ms_dollar
+        # Necesitamos al menos 2 (movimiento y saldo)
+        if len(ms) < 2:
             continue
-        d = DATE_RE.search(ln)
-        if not d or d.end() >= am[0].start():
-            continue
-        saldo = normalize_money(am[-1].group(0))
-        monto = normalize_money(am[-2].group(0))
-        desc = ln[d.end(): am[0].start()].strip()
+
+        # Fecha en cualquier parte de la línea
+        d = DATE_RE.search(s)
+        fecha = pd.to_datetime(d.group(0), dayfirst=True, errors="coerce") if d else pd.NaT
+
+        saldo = normalize_money(ms[-1].group(0))
+        mov   = normalize_money(ms[-2].group(0))
+
+        # Descripción: desde el fin de la fecha hasta el inicio del primer monto detectable
+        # Si la fecha está después, igual guardamos lo que haya antes del primer monto.
+        first_amt_start = ms[0].start()
+        desc_start = d.end() if d else 0
+        if desc_start > first_amt_start:
+            # fecha después del primer monto -> tomar el tramo hasta el monto
+            desc = s[:first_amt_start].strip()
+        else:
+            desc = s[desc_start:first_amt_start].strip()
+
         seq += 1
         rows.append({
-            "fecha": pd.to_datetime(d.group(0), dayfirst=True, errors="coerce"),
+            "fecha": fecha,
             "descripcion": desc,
             "desc_norm": normalize_desc(desc),
             "debito": 0.0,
             "credito": 0.0,
-            "importe": monto,
-            "monto_pdf": monto,
+            "importe": mov,          # signo se resuelve luego por delta de saldo
+            "monto_pdf": mov,
             "saldo": saldo,
             "pagina": 0,
             "orden": seq
         })
     return pd.DataFrame(rows)
+
 
 # ---------- Santander: parser dedicado ----------
 def parse_santander_lines(lines: list[str]) -> pd.DataFrame:
