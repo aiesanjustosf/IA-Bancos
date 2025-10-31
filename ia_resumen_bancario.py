@@ -77,9 +77,6 @@ GAL_SALDO_FINAL_RE   = re.compile(r"SALDO\s+FINAL.*?(-?(?:\d{1,3}(?:\.\d{3})*|\d
 # ---- Santa Fe - "SALDO ULTIMO RESUMEN" ----
 SF_SALDO_ULT_RE = re.compile(r"SALDO\s+U?LTIMO\s+RESUMEN", re.IGNORECASE)
 
-# ---- Banco Santander ----  (NUEVO)
-BANK_SANTANDER_HINTS = ("BANCO SANTANDER", "MOVIMIENTOS EN PESOS", "SALDO INICIAL", "SIRCREB", "LEY 25.413")
-
 # --- utils ---
 def normalize_money(tok: str) -> float:
     if not tok:
@@ -155,7 +152,6 @@ def detect_bank_from_text(txt: str) -> str:
         "Banco de Santa Fe": sum(1 for k in BANK_SANTAFE_HINTS if k in U),
         "Banco de la Nación Argentina": sum(1 for k in BANK_NACION_HINTS if k in U),
         "Banco Galicia": sum(1 for k in BANK_GALICIA_HINTS if k in U),
-        "Banco Santander": sum(1 for k in BANK_SANTANDER_HINTS if k in U),  # NUEVO
     }
     best = max(scores.items(), key=lambda x: x[1])
     return best[0] if best[1] > 0 else "Banco no identificado"
@@ -361,14 +357,6 @@ def find_saldo_final_from_lines(lines):
     return pd.NaT, np.nan
 
 def find_saldo_anterior_from_lines(lines):
-    # Santander: "Saldo Inicial ..." con 1 importe (NUEVO)
-    for ln in lines:
-        U = ln.upper()
-        if "SALDO INICIAL" in U and _only_one_amount(ln):
-            v = _first_amount_value(ln)
-            if not np.isnan(v):
-                return v
-    # Macro / genérico: "SALDO ULTIMO EXTRACTO AL ..."
     for ln in lines:
         if SALDO_ANT_PREFIX.match(ln):
             d = DATE_RE.search(ln)
@@ -426,7 +414,7 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if "SALDO ANTERIOR" in u or "SALDO ANTERIOR" in n:
         return "SALDO ANTERIOR"
 
-    # Ley 25.413 (genérico)
+    # Ley 25.413
     if ("LEY 25413" in u) or ("IMPTRANS" in u) or ("IMP.S/CREDS" in u) or ("IMPDBCR 25413" in u) or ("N/D DBCR 25413" in u) or \
        ("LEY 25413" in n) or ("IMPTRANS" in n) or ("IMP.S/CREDS" in n) or ("IMPDBCR 25413" in n) or ("N/D DBCR 25413" in n):
         return "LEY 25413"
@@ -435,7 +423,7 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if ("SIRCREB" in u) or ("SIRCREB" in n) or re.search(r"ING\.?\s*BRUTOS.*S/?\s*CRED", u) or re.search(r"ING\.?\s*BRUTOS.*S/?\s*CRED", n):
         return "SIRCREB"
 
-    # Percepciones / Retenciones IVA (genérico)
+    # Percepciones / Retenciones IVA
     if (
         ("IVA PERC" in u) or ("IVA PERCEP" in u) or ("RG3337" in u) or
         ("IVA PERC" in n) or ("IVA PERCEP" in n) or ("RG3337" in n) or
@@ -443,16 +431,6 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
         (("RETEN" in n or "RETENC" in n) and (("I.V.A" in n) or ("IVA" in n)) and (("RG.2408" in n) or ("RG 2408" in n) or ("RG2408" in n)))
     ):
         return "Percepciones de IVA"
-
-    # ---- Santander: etiquetas propias (NUEVO) ----
-    if ("COMISION POR SERVICIO DE CUENTA" in u) or ("COMISIÓN POR SERVICIO DE CUENTA" in u):
-        return "Gastos por comisiones"
-    if ("IVA 21% REG DE TRANSFISC LEY27743" in u) or ("IVA 21% REG DE TRANSFISC LEY 27743" in u):
-        return "IVA 21% (sobre comisiones)"
-    if ("IVA PERCEPCION RG 2408" in u) or ("IVA PERCEPCIÓN RG 2408" in u):
-        return "Percepciones de IVA"
-    if ("LEY 25.413" in u) or ("IMPUESTO LEY 25.413" in u):
-        return "LEY 25413"
 
     # IVA sobre comisiones
     if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n):
@@ -468,7 +446,7 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
             return "Débito Plazo Fijo"
         return "Plazo Fijo"
 
-    # Comisiones (genérico)
+    # Comisiones
     if ("COMIS.TRANSF" in u) or ("COMIS.TRANSF" in n) or ("COMIS TRANSF" in u) or ("COMIS TRANSF" in n) or \
        ("COMIS.COMPENSACION" in u) or ("COMIS.COMPENSACION" in n) or ("COMIS COMPENSACION" in u) or ("COMIS COMPENSACION" in n):
         return "Gastos por comisiones"
@@ -811,7 +789,7 @@ _auto_bank_name = detect_bank_from_text(_bank_txt)
 with st.expander("Opciones avanzadas (detección de banco)", expanded=False):
     forced = st.selectbox(
         "Forzar identificación del banco",
-        options=("Auto (detectar)", "Banco de Santa Fe", "Banco Macro", "Banco de la Nación Argentina", "Banco Galicia", "Banco Santander"),  # NUEVO
+        options=("Auto (detectar)", "Banco de Santa Fe", "Banco Macro", "Banco de la Nación Argentina", "Banco Galicia"),
         index=0,
         help="Solo cambia la etiqueta informativa y el nombre de archivo."
     )
@@ -826,8 +804,6 @@ elif _bank_name == "Banco de la Nación Argentina":
     st.success(f"Detectado: {_bank_name}")
 elif _bank_name == "Banco Galicia":
     st.success(f"Detectado: {_bank_name}")
-elif _bank_name == "Banco Santander":  # NUEVO
-    st.success(f"Detectado: {_bank_name}")
 else:
     st.warning("No se pudo identificar el banco automáticamente. Se intentará procesar.")
 
@@ -835,7 +811,6 @@ _bank_slug = ("macro" if _bank_name == "Banco Macro"
               else "santafe" if _bank_name == "Banco de Santa Fe"
               else "nacion" if _bank_name == "Banco de la Nación Argentina"
               else "galicia" if _bank_name == "Banco Galicia"
-              else "santander" if _bank_name == "Banco Santander"   # NUEVO
               else "generico")
 
 # --- Flujo por banco ---
@@ -886,11 +861,6 @@ elif _bank_name == "Banco Galicia":
         st.info("No se encontró explícitamente el encabezado de la tabla de Galicia; se procesa igual por montos.")
     header_saldos = galicia_header_saldos_from_text(_bank_txt)
     render_account_report(_bank_slug, "Cuenta Corriente (Galicia)", "s/n", "galicia-unica", all_lines, header_saldos=header_saldos)
-
-elif _bank_name == "Banco Santander":  # NUEVO
-    # Santander: “Saldo Inicial” explícito y una sola columna de movimiento + saldo por línea
-    all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
-    render_account_report(_bank_slug, "Cuenta Corriente (Santander)", "s/n", "santander-unica", all_lines)
 
 else:
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
