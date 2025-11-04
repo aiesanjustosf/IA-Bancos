@@ -640,7 +640,7 @@ def render_account_report(
         st.info("Sin Movimientos")
         return
 
-    if not np.isnan(saldo_anterior)):
+    if not np.isnan(saldo_anterior):
         first_date = df["fecha"].dropna().min()
         fecha_apertura = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59) if pd.notna(first_date) else pd.NaT
         apertura = pd.DataFrame([{
