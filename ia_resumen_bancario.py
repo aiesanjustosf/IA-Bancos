@@ -646,11 +646,30 @@ def find_saldo_anterior_from_lines(lines):
     return np.nan
 
 # ---------- Clasificación ----------
+
+# Santander: comisiones e IVA sobre comisiones (Ley 27743)
+RE_SANTANDER_COMISION_CUENTA = re.compile(
+    r"\bCOMISI[ÓO]N\s+POR\s+SERVICIO\s+DE\s+CUENTA\b",
+    re.IGNORECASE
+)
+RE_SANTANDER_IVA_TRANSFSC = re.compile(
+    r"\bIVA\s*21%\b.*\b(REG(?:ISTRO)?\s*DE\s*TRANSF\S*\s*SC|TRANSFSC)\b.*\bLEY\s*27743\b",
+    re.IGNORECASE
+)
+
 RE_PERCEP_RG2408 = re.compile(r"PERCEPCI[ÓO]N\s+IVA\s+RG\.?\s*2408", re.IGNORECASE)
 
 def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     u = (desc or "").upper()
     n = (desc_norm or "").upper()
+
+    # Santander — Comisiones (neto)
+    if RE_SANTANDER_COMISION_CUENTA.search(u) or RE_SANTANDER_COMISION_CUENTA.search(n):
+        return "Gastos por comisiones"
+
+    # Santander — IVA 21% sobre comisiones (Ley 27743)
+    if RE_SANTANDER_IVA_TRANSFSC.search(u) or RE_SANTANDER_IVA_TRANSFSC.search(n):
+        return "IVA 21% (sobre comisiones)"
 
     # Saldos
     if "SALDO ANTERIOR" in u or "SALDO ANTERIOR" in n:
@@ -678,7 +697,7 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     ):
         return "Percepciones de IVA"
 
-    # IVA sobre comisiones (BNA usa "I.V.A. BASE", Credicoop usa “I.V.A. - Débito Fiscal 21%”)
+    # IVA sobre comisiones (BNA/Credicoop/etc.)
     if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) \
        or ("I.V.A" in u and "DÉBITO FISCAL" in u) or ("I.V.A" in n and "DEBITO FISCAL" in n):
         if "10,5" in u or "10,5" in n or "10.5" in u or "10.5" in n:
@@ -1252,10 +1271,7 @@ elif _bank_name == "Banco Santander":
     if df_san.empty:
         render_account_report(_bank_slug, "CUENTA (Santander)", "s/n", "santander-unica", all_lines)
     else:
-        # Reusar pipeline estándar de render:
-        # Construimos "lines" sintéticos a partir del DF para usar el mismo render si querés,
-        # pero más simple: render manual breve (sin duplicar lógica). Acá aprovechamos el genérico:
-        # Volvemos a armar "lines" de texto tipo "dd/mm/aa DESC ... monto ... saldo" para que el render funcione igual.
+        # Reusar pipeline estándar de render con líneas sintéticas compatibles
         synth_lines = []
         for _, r in df_san.iterrows():
             f = r["fecha"].strftime("%d/%m/%Y") if pd.notna(r["fecha"]) else "01/01/1900"
@@ -1275,6 +1291,3 @@ else:
     # Desconocido: procesar genérico
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     render_account_report(_bank_slug, "CUENTA", "s/n", "generica-unica", all_lines)
-
-
-
