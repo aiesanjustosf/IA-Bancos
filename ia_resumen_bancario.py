@@ -52,7 +52,7 @@ HEADER_ROW_PAT = re.compile(r"^(FECHA\s+DESCRIPC(?:I[ÓO]N|ION)|FECHA\s+CONCEPTO
 NON_MOV_PAT    = re.compile(r"(INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S|TOTAL\s+RESUMEN\s+OPERATIVO|RESUMEN\s+DEL\s+PER[IÍ]ODO)", re.IGNORECASE)
 INFO_HEADER    = re.compile(r"INFORMACI[ÓO]N\s+DE\s+SU/S\s+CUENTA/S", re.IGNORECASE)
 
-# ---- Banco de Santa Fe ----
+# ---- Banco de Santa Fe (Consolidado de cuentas) ----
 SF_ACC_LINE_RE = re.compile(
     r"\b(Cuenta\s+Corriente\s+Pesos|Cuenta\s+Corriente\s+En\s+D[óo]lares|Caja\s+de\s+Ahorro\s+Pesos|Caja\s+de\s+Ahorro\s+En\s+D[óo]lares)\s+Nro\.?\s*([0-9][0-9./-]*)",
     re.IGNORECASE
@@ -65,8 +65,16 @@ BNA_CUENTA_CBU_RE = re.compile(
     r"NRO\.\s*CUENTA\s+SUCURSAL\s+CLAVE\s+BANCARIA\s+UNIFORME\s+\(CBU\)\s*[\r\n]+(\d+)\s+\d+\s+(\d{22})",
     re.IGNORECASE
 )
-BNA_ACC_ONLY_RE = re.compile(r"NRO\.\s*CUENTA\s+SUCURSAL\s*[:\-]?\s*[\r\n ]+(\d{6,})", re.IGNORECASE)
-BNA_GASTOS_RE = re.compile(r"-\s*(INTERESES|COMISION|SELLADOS|I\.V\.A\.?\s*BASE|SEGURO\s+DE\s+VIDA)\s*\$\s*([0-9\.\s]+,\d{2})", re.IGNORECASE)
+# Captura número de cuenta luego de "NRO. CUENTA SUCURSAL" (variante sin CBU en la misma caja)
+BNA_ACC_ONLY_RE = re.compile(
+    r"NRO\.\s*CUENTA\s+SUCURSAL\s*[:\-]?\s*[\r\n ]+(\d{6,})",
+    re.IGNORECASE
+)
+# Bloque de gastos finales post “SALDO FINAL”
+BNA_GASTOS_RE = re.compile(
+    r"-\s*(INTERESES|COMISION|SELLADOS|I\.V\.A\.?\s*BASE|SEGURO\s+DE\s+VIDA)\s*\$\s*([0-9\.\s]+,\d{2})",
+    re.IGNORECASE
+)
 
 # ---- NUEVO: Santa Fe - "SALDO ULTIMO RESUMEN" sin fecha ----
 SF_SALDO_ULT_RE = re.compile(r"SALDO\s+U?LTIMO\s+RESUMEN", re.IGNORECASE)
@@ -84,7 +92,6 @@ CREDICOOP_HINTS = (
 SPACED_CAPS_RE = re.compile(r'((?:[A-ZÁÉÍÓÚÜÑ]\s)+[A-ZÁÉÍÓÚÜÑ])')
 def _unspread_caps(s: str) -> str:
     return SPACED_CAPS_RE.sub(lambda m: m.group(0).replace(" ", ""), s)
-
 # Tokens XY Credicoop
 def credicoop_lines_words_xy(page, ytol=2.0):
     words = page.extract_words(extra_attrs=["x0","x1","top"])
@@ -428,7 +435,7 @@ def macro_split_account_blocks(file_like):
         blocks.append(acc)
     return blocks
 
-# ---------- Parsing movimientos (genérico: Macro/SF/BNA/Glacia) ----------
+# ---------- Parsing movimientos (genérico: Macro/SF/BNA/Galicia) ----------
 def parse_lines(lines) -> pd.DataFrame:
     rows = []
     seq = 0  # preserva orden exacto de aparición
@@ -508,6 +515,7 @@ def parse_santander_lines(lines: list[str]) -> pd.DataFrame:
         if len(am) >= 3:
             deb = normalize_money(am[0].group(0))
             cre = normalize_money(am[1].group(0))
+            # en algunos PDFs la columna vacía queda como 0, lo mantenemos
         else:
             mov = normalize_money(am[0].group(0))
             if prev_saldo is not None:
@@ -543,7 +551,9 @@ def parse_santander_lines(lines: list[str]) -> pd.DataFrame:
         prev_saldo = saldo
 
     df = pd.DataFrame(rows)
-    # No forzamos más nada acá: el saldo inicial se inyecta en synth_lines
+    if not df.empty:
+        # no forzamos saldos acá; se hace en render_account_report
+        pass
     return df
 
 # ---------- Saldos ----------
@@ -555,8 +565,32 @@ def _first_amount_value(line: str) -> float:
     return normalize_money(m.group(0)) if m else np.nan
 
 def find_saldo_final_from_lines(lines):
-    # 1) Macro/otros con formato expreso
+    """
+    Busca el saldo final en las líneas del PDF.
+    - Prioriza 'Saldo total' (Santander)
+    - Luego 'Saldo final al día ...'
+    - Variante 'Saldo final' sin fecha
+    - Ignora todo lo que venga después de 'Detalle impositivo'
+    """
+    out_fecha, out_saldo = pd.NaT, np.nan
+    skip_rest = False
+
     for ln in reversed(lines):
+        u = ln.upper()
+        # Si encontramos "DETALLE IMPOSITIVO", lo que esté DESPUÉS no se tiene en cuenta
+        if "DETALLE IMPOSITIVO" in u:
+            skip_rest = True
+            continue
+        if skip_rest:
+            continue
+
+        # 1) Caso Santander — "Saldo total" sin fecha
+        if "SALDO TOTAL" in u and _only_one_amount(ln):
+            v = _first_amount_value(ln)
+            if not np.isnan(v):
+                return pd.NaT, v
+
+        # 2) Caso general — "SALDO FINAL AL DÍA ..."
         if SALDO_FINAL_PREFIX.match(ln):
             d = DATE_RE.search(ln)
             if d and _only_one_amount(ln):
@@ -564,13 +598,14 @@ def find_saldo_final_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if pd.notna(fecha) and not np.isnan(saldo):
                     return fecha, saldo
-    # 2) Genérico: "SALDO FINAL" sin fecha
-    for ln in reversed(lines):
-        if "SALDO FINAL" in ln.upper() and _only_one_amount(ln):
+
+        # 3) Variante genérica — "SALDO FINAL" sin fecha
+        if "SALDO FINAL" in u and _only_one_amount(ln):
             saldo = _first_amount_value(ln)
             if not np.isnan(saldo):
                 return pd.NaT, saldo
-    return pd.NaT, np.nan
+
+    return out_fecha, out_saldo
 
 def find_saldo_anterior_from_lines(lines):
     # 1) Macro (expreso con fecha)
@@ -622,14 +657,14 @@ def find_saldo_anterior_from_lines(lines):
     return np.nan
 
 # ---------- Clasificación ----------
-# Santander — comisión y su IVA (texto típico: "Iva 21% reg de transfisc ley27743")
+RE_PERCEP_RG2408 = re.compile(r"PERCEPCI[ÓO]N\s+IVA\s+RG\.?\s*2408", re.IGNORECASE)
+
+# Santander — comisiones e IVA (Ley 27743 como texto de IVA en Santander)
 RE_SANTANDER_COMISION_CUENTA = re.compile(r"\bCOMISI[ÓO]N\s+POR\s+SERVICIO\s+DE\s+CUENTA\b", re.IGNORECASE)
 RE_SANTANDER_IVA_TRANSFSC = re.compile(
-    r"IVA\s*21\s*%?\s*(?:REG(?:\.|ISTRO)?\s*DE\s*)?(?:TRANSFISC|TRANSF\S*\s*SC).*LEY\s*27743",
+    r"\bIVA\s*21%\b.*\b(?:(?:REG(?:ISTRO)?\s*DE\s*)?(?:TRANSFISC|TRANSF\S*\s*SC))\b.*\bLEY\s*27743\b",
     re.IGNORECASE
 )
-
-RE_PERCEP_RG2408 = re.compile(r"PERCEPCI[ÓO]N\s+IVA\s+RG\.?\s*2408", re.IGNORECASE)
 
 def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     u = (desc or "").upper()
@@ -639,7 +674,7 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if RE_SANTANDER_COMISION_CUENTA.search(u) or RE_SANTANDER_COMISION_CUENTA.search(n):
         return "Gastos por comisiones"
 
-    # Santander — IVA 21% sobre comisiones (normativa IVA 27743)
+    # Santander — IVA 21% sobre comisiones (según ley 27743 en el texto del banco)
     if RE_SANTANDER_IVA_TRANSFSC.search(u) or RE_SANTANDER_IVA_TRANSFSC.search(n):
         return "IVA 21% (sobre comisiones)"
 
@@ -647,27 +682,30 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if "SALDO ANTERIOR" in u or "SALDO ANTERIOR" in n:
         return "SALDO ANTERIOR"
 
-    # Impuesto a los débitos y créditos bancarios — Ley 25.413 (0,6% débito / crédito)
-    if ("LEY 25.413" in u) or ("LEY 25413" in u) or ("IMPUESTO LEY 25.413" in u) or ("IMPUESTO LEY 25413" in u) or \
-       ("IMPTRANS" in u) or ("IMP.S/CREDS" in u) or ("IMPDBCR" in u) or ("N/D DBCR" in u) or \
-       ("LEY 25.413" in n) or ("LEY 25413" in n) or ("IMPUESTO LEY 25.413" in n) or ("IMPUESTO LEY 25413" in n) or \
-       ("IMPTRANS" in n) or ("IMP.S/CREDS" in n) or ("IMPDBCR" in n) or ("N/D DBCR" in n):
+    # Impuesto a los débitos y créditos bancarios (Ley 25.413)
+    if ("LEY 25413" in u) or ("IMPTRANS" in u) or ("IMP.S/CREDS" in u) or ("IMPDBCR 25413" in u) or ("N/D DBCR 25413" in u) or \
+       ("LEY 25413" in n) or ("IMPTRANS" in n) or ("IMP.S/CREDS" in n) or ("IMPDBCR 25413" in n) or ("N/D DBCR 25413" in n):
         return "LEY 25.413"
 
     # SIRCREB
-    if "SIRCREB" in u or "SIRCREB" in n:
+    if ("SIRCREB" in u) or ("SIRCREB" in n):
         return "SIRCREB"
 
-    # Percepciones IVA (RG 2408 / 3337)
-    if RE_PERCEP_RG2408.search(u) or RE_PERCEP_RG2408.search(n) or \
-       "PERCEPCION IVA" in u or "PERCEP IVA" in u or "RG 3337" in u or \
-       "PERCEPCION IVA" in n or "PERCEP IVA" in n or "RG 3337" in n:
+    # Percepciones IVA: atajo RG 2408 / 3337
+    if RE_PERCEP_RG2408.search(u) or RE_PERCEP_RG2408.search(n):
+        return "Percepciones de IVA"
+    if (
+        ("IVA PERC" in u) or ("IVA PERCEP" in u) or ("RG3337" in u) or
+        ("IVA PERC" in n) or ("IVA PERCEP" in n) or ("RG3337" in n) or
+        (("RETEN" in u or "RETENC" in u) and (("I.V.A" in u) or ("IVA" in u)) and (("RG.2408" in u) or ("RG 2408" in u) or ("RG2408" in u))) or
+        (("RETEN" in n or "RETENC" in n) and (("I.V.A" in n) or ("IVA" in n)) and (("RG.2408" in n) or ("RG 2408" in n) or ("RG2408" in n)))
+    ):
         return "Percepciones de IVA"
 
-    # IVA sobre comisiones (variantes de otros bancos)
+    # IVA sobre comisiones (otros bancos)
     if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) \
        or ("I.V.A" in u and "DÉBITO FISCAL" in u) or ("I.V.A" in n and "DEBITO FISCAL" in n):
-        if "10,5" in u or "10.5" in u or "10,5" in n or "10.5" in n:
+        if "10,5" in u or "10,5" in n or "10.5" in u or "10.5" in n:
             return "IVA 10,5% (sobre comisiones)"
         return "IVA 21% (sobre comisiones)"
 
@@ -783,7 +821,7 @@ def render_account_report(
         }])
         df = pd.concat([apertura, df], ignore_index=True)
 
-    # Débito/Crédito por delta de saldo (robusto para BNA)
+    # Débito/Crédito por delta de saldo (robusto para BNA/Santander/etc.)
     df = df.sort_values(["fecha", "orden"]).reset_index(drop=True)
     df["delta_saldo"] = df["saldo"].diff()
     df["debito"]  = np.where(df["delta_saldo"] < 0, -df["delta_saldo"], 0.0)
@@ -806,7 +844,7 @@ def render_account_report(
     diferencia = saldo_final_calculado - saldo_final_visto
     cuadra = abs(diferencia) < 0.01
 
-    date_suffix = f"_{fecha_cierre.strftime('%Y%m%d')}" if pd.notna(fecha_cierre) else ""
+    date_suffix = ""
     acc_suffix  = f"_{account_number}"
 
     st.caption("Resumen del período")
@@ -822,8 +860,6 @@ def render_account_report(
         st.success("Conciliado.") if cuadra else st.error("No cuadra la conciliación.")
     except Exception:
         st.write("Conciliación:", "OK" if cuadra else "No cuadra")
-    if pd.notna(fecha_cierre):
-        st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
     # ===== Resumen Operativo (IVA + Otros) =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
@@ -1110,11 +1146,9 @@ elif _bank_name == "Banco Credicoop":
     st.subheader(f"{titulo} · Nro {nro}")
     # Meta visible
     col1, col2 = st.columns(2)
-    with col1:
-        st.caption(f"Nro. de cuenta: {nro}")
+    with col1: st.caption(f"Nro. de cuenta: {nro}")
     if meta.get("cbu"):
-        with col2:
-            st.caption(f"CBU: {meta['cbu']}")
+        with col2: st.caption(f"CBU: {meta['cbu']}")
 
     if dfc.empty:
         st.info("Sin movimientos.")
@@ -1206,8 +1240,9 @@ elif _bank_name == "Banco Credicoop":
                     max_len = max(len(col), *(len(v) for v in col_values))
                     ws.set_column(idx, idx, min(max_len + 2, 50))
                 for c in ["debito","credito","saldo"]:
-                    j = dfc.columns.get_loc(c)
-                    ws.set_column(j, j, 16, money_fmt)
+                    if c in dfc.columns:
+                        j = dfc.columns.get_loc(c)
+                        ws.set_column(j, j, 16, money_fmt)
                 if "fecha" in dfc.columns:
                     j = dfc.columns.get_loc("fecha")
                     ws.set_column(j, j, 14, date_fmt)
@@ -1236,46 +1271,31 @@ elif _bank_name == "Banco Santander":
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     df_san = parse_santander_lines(all_lines)
 
-    # Armo líneas sintéticas para reutilizar el render genérico
-    synth_lines = []
-
-    # ---- SALDO INICIAL ----
-    # Tomamos "SALDO INICIAL" aunque no tenga fecha en la misma línea.
-    si_amount = None
-    si_date = None
-
-    # 1) Buscar una línea explícita con "SALDO INICIAL" (con o sin fecha)
-    for ln in all_lines:
-        U = ln.upper()
-        if "SALDO INICIAL" in U and _only_one_amount(ln):
-            si_amount = MONEY_RE.search(ln).group(0)
-            d = DATE_RE.search(ln)
-            if d:
-                si_date = d.group(0)
-            break
-
-    # 2) Si no hay fecha en esa línea, usamos la primera fecha de movimientos - 1 día
-    if si_amount and not si_date:
-        if not df_san.empty and pd.notna(df_san["fecha"].dropna().min()):
-            f0 = df_san["fecha"].dropna().min() - pd.Timedelta(days=1)
-            si_date = f0.strftime("%d/%m/%Y")
-        else:
-            # fallback neutro (no debería activarse en resúmenes reales)
-            si_date = "01/01/1900"
-
-    # 3) Inyectar línea sintética para que el render capte el saldo inicial
-    if si_amount and si_date:
-        synth_lines.append(f"{si_date} SALDO INICIAL {si_amount}")
-
+    # Si por algún motivo quedó vacío, caemos al genérico para no romper
     if df_san.empty:
-        # Si por algún motivo quedó vacío, caemos al genérico para no romper
         render_account_report(_bank_slug, "CUENTA (Santander)", "s/n", "santander-unica", all_lines)
     else:
-        # Reusar pipeline estándar: rearmamos líneas tipo "fecha desc mov saldo"
+        # Reusar pipeline estándar de render:
+        # Volvemos a armar "lines" de texto tipo "dd/mm/aa DESC ... monto ... saldo" para que el render funcione igual.
+        synth_lines = []
+
+        # Inyectar SALDO INICIAL (si en el PDF hay una línea con fecha + "Saldo inicial" y un solo monto)
+        si_line = None
+        for ln in all_lines:
+            U = ln.upper()
+            if "SALDO INICIAL" in U and _only_one_amount(ln) and DATE_RE.search(ln):
+                d = DATE_RE.search(ln).group(0)
+                m = MONEY_RE.search(ln).group(0)
+                si_line = f"{d} SALDO INICIAL {m}"
+                break
+        if si_line:
+            synth_lines.append(si_line)
+
         for _, r in df_san.iterrows():
             f = r["fecha"].strftime("%d/%m/%Y") if pd.notna(r["fecha"]) else "01/01/1900"
+            # armamos una línea compatible con parse_lines (fecha ... movimiento ... saldo)
             mov = r["credito"] if r["credito"] else ( -r["debito"] if r["debito"] else 0.0 )
-            def mk(x):
+            def mk(x):  # a , con separador y signo negativo al final
                 return f"{abs(x):,.2f}".replace(",", "§").replace(".", ",").replace("§", ".") + ( "-" if x<0 else "" )
             synth_lines.append(f"{f} {r['descripcion']} {mk(mov)} {mk(r['saldo'])}")
 
