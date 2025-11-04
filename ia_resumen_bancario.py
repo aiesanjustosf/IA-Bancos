@@ -40,7 +40,7 @@ LONG_INT_RE = re.compile(r"\b\d{6,}\b")
 
 # ====== PATRONES ESPECÍFICOS ======
 # ---- Banco Macro ----
-HYPH = r"[-\u2010\u2011\u2012\u2013\u2014\u2212]"  # guiones variantes
+HYPH = r"[-\u2010\u2011\u2012\u2013\u2014\u2212]"
 ACCOUNT_TOKEN_RE = re.compile(rf"\b\d\s*{HYPH}\s*\d{{3}}\s*{HYPH}\s*\d{{10}}\s*{HYPH}\s*\d\b")
 SALDO_ANT_PREFIX   = re.compile(r"^SALDO\s+U?LTIMO\s+EXTRACTO\s+AL", re.IGNORECASE)
 SALDO_FINAL_PREFIX = re.compile(r"^SALDO\s+FINAL\s+AL\s+D[ÍI]A",     re.IGNORECASE)
@@ -98,7 +98,7 @@ _MONEY_CH = set("0123456789.,-")
 _MONEY_RE_CRED = re.compile(r'(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2}-?')
 def _parse_credicoop_line(tokens: list[str]):
     joined = "".join(tokens)
-    m = re.match(r'^(\d{2}/\d{2}/\d{2})', joined)  # dd/mm/aa
+    m = re.match(r'^(\d{2}/\d{2}/\d{2})', joined)
     if not m:
         return None
     fecha = m.group(1)
@@ -422,13 +422,6 @@ def parse_lines(lines) -> pd.DataFrame:
 
 # ---------- NUEVO: Parser específico Santander ----------
 def parse_santander_lines(lines: list[str]) -> pd.DataFrame:
-    """
-    Santander: FECHA | DESCRIPCIÓN | REFERENCIA | DÉBITOS | CRÉDITOS | SALDO
-    Reglas:
-      * Último monto = SALDO
-      * Si hay 3+ montos: [débitos, créditos, saldo]
-      * Si hay 2 montos: [movimiento, saldo] -> signo por Δ saldo
-    """
     rows, seq = [], 0
     current_date = None
     prev_saldo = None
@@ -445,7 +438,7 @@ def parse_santander_lines(lines: list[str]) -> pd.DataFrame:
 
         am = list(MONEY_RE.finditer(s))
         if len(am) < 2:
-            continue  # ej. “Saldo inicial ...” (1 monto) -> la inyectamos aparte
+            continue
 
         saldo = normalize_money(am[-1].group(0))
 
@@ -545,71 +538,57 @@ def find_saldo_anterior_from_lines(lines):
     return np.nan
 
 # ---------- Clasificación ----------
-# Santander — comisiones e IVA (Ley 27743) — exactos según lo que pediste
 RE_SANTANDER_COMISION_CUENTA = re.compile(r"\bCOMISI[ÓO]N\s+POR\s+SERVICIO\s+DE\s+CUENTA\b", re.IGNORECASE)
 RE_SANTANDER_IVA_TRANSFSC = re.compile(r"\bIVA\s*21%\s+REG\s+DE\s+TRANSFISC\s+LEY\s*27743\b", re.IGNORECASE)
-RE_SIRCREB = re.compile(r"\bREGIMEN\s+DE\s+RECAUDACION\s+SIRCREB\s+R\b", re.IGNORECASE)
+RE_SIRCREB = re.compile(r"\bREGIMEN\s+DE\s+RECAUDACION\s+SIRCREB(?:\s+R)?\b", re.IGNORECASE)
 RE_PERCEP_RG2408 = re.compile(r"\bPERCEPCI[ÓO]N\s+IVA\s+RG\.?\s*2408\b", re.IGNORECASE)
+RE_LEY25413 = re.compile(r"\b(?:IMPUESTO\s+)?LEY\s*25\.?413\b|IMPDBCR\s*25413|N/?D\s*DBCR\s*25413", re.IGNORECASE)
 
 def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     u = (desc or "").upper()
     n = (desc_norm or "").upper()
 
-    # Santander — Comisiones (neto de servicio de cuenta)
     if RE_SANTANDER_COMISION_CUENTA.search(u) or RE_SANTANDER_COMISION_CUENTA.search(n):
         return "Gastos por comisiones"
-
-    # Santander — IVA 21% sobre comisión (Ley 27743)
     if RE_SANTANDER_IVA_TRANSFSC.search(u) or RE_SANTANDER_IVA_TRANSFSC.search(n):
         return "IVA 21% (sobre comisiones)"
-
-    # SIRCREB
     if RE_SIRCREB.search(u) or RE_SIRCREB.search(n) or ("SIRCREB" in u) or ("SIRCREB" in n):
         return "SIRCREB"
+    if "SALDO ANTERIOR" in u or "SALDO ANTERIOR" in n:
+        return "SALDO ANTERIOR"
 
-    # Saldos
-    if "SALDO ANTERIOR" in u or "SALDO ANTERIOR" in n: return "SALDO ANTERIOR"
-
-    # Impuesto a los débitos y créditos bancarios (Ley 25.413, con o sin punto)
-    if (("LEY 25.413" in u) or ("LEY 25413" in u) or ("IMPUESTO LEY 25.413" in u) or ("IMPUESTO LEY 25413" in u) or
-        ("LEY 25.413" in n) or ("LEY 25413" in n) or ("IMPUESTO LEY 25.413" in n) or ("IMPUESTO LEY 25413" in n) or
-        ("IMPTRANS" in u) or ("IMPTRANS" in n) or ("IMP.S/CREDS" in u) or ("IMP.S/CREDS" in n) or
-        ("IMPDBCR 25413" in u) or ("IMPDBCR 25413" in n) or ("N/D DBCR 25413" in u) or ("N/D DBCR 25413" in n)):
+    # 25.413 SOLO con patrones estrictos
+    if RE_LEY25413.search(u) or RE_LEY25413.search(n):
         return "LEY 25.413"
 
-    # Percepciones IVA (RG 2408 / 3337)
-    if RE_PERCEP_RG2408.search(u) or RE_PERCEP_RG2408.search(n): return "Percepciones de IVA"
+    # Percepciones IVA
+    if RE_PERCEP_RG2408.search(u) or RE_PERCEP_RG2408.search(n):
+        return "Percepciones de IVA"
     if (("IVA PERC" in u) or ("IVA PERCEP" in u) or ("RG3337" in u) or
         ("IVA PERC" in n) or ("IVA PERCEP" in n) or ("RG3337" in n) or
         (("RETEN" in u or "RETENC" in u) and (("I.V.A" in u) or ("IVA" in u)) and (("RG.2408" in u) or ("RG 2408" in u) or ("RG2408" in u))) or
         (("RETEN" in n or "RETENC" in n) and (("I.V.A" in n) or ("IVA" in n)) and (("RG.2408" in n) or ("RG 2408" in n) or ("RG2408" in n)))):
         return "Percepciones de IVA"
 
-    # IVA sobre comisiones (otras bancas)
+    # IVA otras bancas
     if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) \
        or ("I.V.A" in u and "DÉBITO FISCAL" in u) or ("I.V.A" in n and "DEBITO FISCAL" in n):
         if "10,5" in u or "10,5" in n or "10.5" in u or "10.5" in n: return "IVA 10,5% (sobre comisiones)"
         return "IVA 21% (sobre comisiones)"
 
-    # Plazo Fijo
+    # Plazo Fijo y resto (igual que antes)
     if ("PLAZO FIJO" in u) or ("PLAZO FIJO" in n) or ("P.FIJO" in u) or ("P.FIJO" in n) or ("P FIJO" in u) or ("P FIJO" in n) or ("PFIJO" in u) or ("PFIJO" in n):
         if cre and cre != 0: return "Acreditación Plazo Fijo"
         if deb and deb != 0: return "Débito Plazo Fijo"
         return "Plazo Fijo"
-
-    # Comisiones varias (genérico)
     if ("COMIS.TRANSF" in u) or ("COMIS.TRANSF" in n) or ("COMIS TRANSF" in u) or ("COMIS TRANSF" in n) or \
        ("COMIS.COMPENSACION" in u) or ("COMIS.COMPENSACION" in n) or ("COMIS COMPENSACION" in u) or ("COMIS COMPENSACION" in n):
         return "Gastos por comisiones"
     if ("MANTENIMIENTO MENSUAL PAQUETE" in u) or ("MANTENIMIENTO MENSUAL PAQUETE" in n) or \
        ("COMOPREM" in n) or ("COMVCAUT" in n) or ("COMTRSIT" in n) or ("COM.NEGO" in n) or ("CO.EXCESO" in n) or ("COM." in n):
         return "Gastos por comisiones"
-
-    # Débitos automáticos / Seguros
     if ("DB-SNP" in n) or ("DEB.AUT" in n) or ("DEB.AUTOM" in n) or ("SEGUROS" in n) or ("GTOS SEG" in n): return "Débito automático"
     if ("DEBITO INMEDIATO" in u) or ("DEBIN" in u): return "Débito automático"
-
-    # Varias
     if "DYC" in n: return "DyC"
     if ("AFIP" in n or "ARCA" in n) and deb and deb != 0: return "Débitos ARCA"
     if "API" in n: return "API"
@@ -731,12 +710,13 @@ def render_account_report(
     net21  = round(iva21  / 0.21,  2) if iva21  else 0.0
     net105 = round(iva105 / 0.105, 2) if iva105 else 0.0
     percep_iva = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
-    # >>>>> CORRECCIÓN: Ley 25.413 neteo débitos - créditos
+
+    # Ley 25.413: neto = débitos - créditos
     ley25413_deb = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25.413"), "debito"].sum())
     ley25413_cre = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25.413"), "credito"].sum())
     ley_25413    = ley25413_deb - ley25413_cre
-    # <<<<<
-    sircreb    = float(df_sorted.loc[df_sorted["Clasificación"].eq("SIRCREB"),            "debito"].sum())
+
+    sircreb    = float(df_sorted.loc[df_sorted["Clasificación"].eq("SIRCREB"), "debito"].sum())
 
     m1, m2, m3 = st.columns(3)
     with m1: st.metric("Neto Comisiones 21%", f"$ {fmt_ar(net21)}")
@@ -757,7 +737,7 @@ def render_account_report(
     styled = df_sorted.style.format({c: fmt_ar for c in ["debito","credito","importe","saldo"]}, na_rep="—")
     st.dataframe(styled, use_container_width=True)
 
-    # Descargas
+    # Descargas (igual que antes)
     st.caption("Descargar")
     try:
         import xlsxwriter
@@ -919,24 +899,25 @@ _bank_slug = ("macro" if _bank_name == "Banco Macro"
               else "galicia" if _bank_name == "Banco Galicia"
               else "generico")
 
-# ---- Helper SOLO SANTANDER: extraer “Saldo inicial” y “SALDO TOTAL” (antes de Detalle impositivo) ----
-def santander_extract_saldos(all_lines: list[str]):
-    saldo_inicial_line = None
-    saldo_final_line = None
-    # Cortar a la altura de “DETALLE IMPOSITIVO”
+# ---- SOLO SANTANDER: recorte de movimientos y saldos correctos ----
+def santander_cut_before_detalle(all_lines: list[str]) -> list[str]:
     cut = len(all_lines)
     for i, ln in enumerate(all_lines):
         if "DETALLE IMPOSITIVO" in ln.upper():
             cut = i
             break
-    for i, ln in enumerate(all_lines[:cut]):
+    return all_lines[:cut]
+
+def santander_extract_saldos(all_lines: list[str]):
+    saldo_inicial_line = None
+    saldo_final_line = None
+    for ln in all_lines:
         U = ln.upper()
         if ("SALDO INICIAL" in U) and _only_one_amount(ln) and DATE_RE.search(ln):
             d = DATE_RE.search(ln).group(0)
             m = MONEY_RE.search(ln).group(0)
             saldo_inicial_line = f"{d} SALDO INICIAL {m}"
         if ("SALDO TOTAL" in U) and _only_one_amount(ln):
-            # último “SALDO TOTAL” antes del corte
             m = MONEY_RE.search(ln).group(0)
             saldo_final_line = f"SALDO FINAL {m}"
     return saldo_inicial_line, saldo_final_line
@@ -1045,7 +1026,7 @@ elif _bank_name == "Banco Credicoop":
         ley25413_deb = float(dfc.loc[dfc["Clasificación"].eq("LEY 25.413"), "debito"].sum())
         ley25413_cre = float(dfc.loc[dfc["Clasificación"].eq("LEY 25.413"), "credito"].sum())
         ley_25413    = ley25413_deb - ley25413_cre
-        sircreb    = float(dfc.loc[dfc["Clasificación"].eq("SIRCREB"),            "debito"].sum())
+        sircreb    = float(dfc.loc[dfc["Clasificación"].eq("SIRCREB"), "debito"].sum())
 
         m1, m2, m3 = st.columns(3)
         with m1: st.metric("Neto Comisiones 21%", f"$ {fmt_ar(net21)}")
@@ -1107,22 +1088,21 @@ elif _bank_name == "Banco Credicoop":
             )
 
 elif _bank_name == "Banco Santander":
-    # 1) Líneas reales del PDF
+    # Líneas del PDF y recorte antes de DETALLE IMPOSITIVO
     all_lines_pairs = extract_all_lines(io.BytesIO(data))
-    all_lines = [l for _, l in all_lines_pairs]
+    all_lines_raw = [l for _, l in all_lines_pairs]
+    all_lines = santander_cut_before_detalle(all_lines_raw)
 
-    # 2) Parser específico
+    # Parser Santander
     df_san = parse_santander_lines(all_lines)
 
-    # 3) Inyectar saldos correctos desde “Saldo inicial” y “SALDO TOTAL” (antes de Detalle impositivo)
+    # Saldos (Saldo inicial / SALDO TOTAL)
     si_line, sf_line = santander_extract_saldos(all_lines)
     synth_lines = []
     if si_line: synth_lines.append(si_line)
 
     if df_san.empty:
-        # Fallback a genérico con líneas reales si algo salió mal
         lines_for_render = all_lines.copy()
-        # pero agrego "SALDO FINAL" si lo encontré para que la conciliación use el monto correcto
         if sf_line: lines_for_render.append(sf_line)
         render_account_report(_bank_slug, "Cuenta Corriente (Santander)", "s/n", "santander-unica", lines_for_render)
     else:
