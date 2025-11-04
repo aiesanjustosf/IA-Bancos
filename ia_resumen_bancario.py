@@ -970,9 +970,13 @@ elif _bank_name == "Banco Credicoop":
     acc_id = f"credicoop-{re.sub(r'[^0-9A-Za-z]+', '_', nro)}"
     st.markdown("---")
     st.subheader(f"{titulo} · Nro {nro}")
+   # Meta visible
     col1, col2 = st.columns(2)
-    with col1: st.caption(f"Nro. de cuenta: {nro}")
-    if meta.get("cbu"): with col2: st.caption(f"CBU: {meta['cbu']}")
+    with col1:
+        st.caption(f"Nro. de cuenta: {nro}")
+    if meta.get("cbu"):
+        with col2:
+            st.caption(f"CBU: {meta['cbu']}")
 
     if dfc.empty:
         st.info("Sin movimientos.")
