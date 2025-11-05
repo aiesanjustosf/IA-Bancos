@@ -204,6 +204,26 @@ BANK_GALICIA_HINTS = (
     "SALDO INICIAL",
     "SALDO FINAL",
 )
+# === Galicia: montos con signo al inicio o al final (sin afectar a otros bancos)
+G_MONEY_RE = re.compile(r'(?<!\S)-?(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
+
+def normalize_money_anysign(tok: str) -> float:
+    """Como normalize_money pero considera signo al INICIO o al FINAL y el '−' unicode."""
+    if not tok:
+        return np.nan
+    t = tok.replace("\xa0", " ").strip()
+    t = t.replace("−", "-")
+    neg = t.endswith("-") or t.startswith("-")
+    t = t.strip("-")
+    if "," not in t:
+        return np.nan
+    main, frac = t.rsplit(",", 1)
+    main = main.replace(".", "").replace(" ", "")
+    try:
+        val = float(f"{main}.{frac}")
+        return -val if neg else val
+    except Exception:
+        return np.nan
 
 # --- utils ---
 def normalize_money(tok: str) -> float:
@@ -918,52 +938,46 @@ def clasificar_galicia(desc: str) -> str:
 
 def parse_galicia_records(all_lines: list[str]) -> pd.DataFrame:
     """
-    Galicia: 'FECHA  DESCRIPCIÓN [ORIGEN]  CREDITO  DEBITO  SALDO'
-    - Créditos izquierda (positivos)
-    - Débitos derecha con '-' (se guardan POSITIVOS en df)
-    - Puede venir formato de 2 importes: MOVIMIENTO + SALDO
+    Galicia: FECHA  DESCRIPCIÓN [ORIGEN]  CREDITO  DÉBITO  SALDO
+    - En cada renglón solo 1 entre crédito/débito tiene valor.
+    - El signo NEGATIVO identifica DÉBITO (puede estar al inicio o al final).
+    - Si solo hay 2 importes, son: MOVIMIENTO y SALDO.
     """
     rows, seq = [], 0
 
     for ln in all_lines:
-        s = ln.strip()
-        if not s: continue
-        if HEADER_ROW_PAT.search(s) or NON_MOV_PAT.search(s): continue
+        s = (ln or "").strip()
+        if not s:
+            continue
+        if HEADER_ROW_PAT.search(s) or NON_MOV_PAT.search(s):
+            continue
 
         mdate = DATE_RE.search(s)
-        if not mdate: continue
+        if not mdate:
+            continue
         fecha = pd.to_datetime(mdate.group(0), dayfirst=True, errors="coerce")
-        if pd.isna(fecha): continue
+        if pd.isna(fecha):
+            continue
 
-        am = list(MONEY_RE.finditer(s))
+        am = list(G_MONEY_RE.finditer(s))  # <<< SOLO GALICIA
         if len(am) < 2:
             continue
 
-        a_saldo = am[-1]
-        saldo = normalize_money(a_saldo.group(0))
+        # El último importe de la línea es el SALDO
+        saldo = normalize_money_anysign(am[-1].group(0))
 
-        deb = 0.0
-        cre = 0.0
+        # Movimiento: el anterior al saldo
+        mov_match = am[-2]
+        mov_val = normalize_money_anysign(mov_match.group(0))
+        if np.isnan(mov_val):
+            continue
 
-        if len(am) >= 3:
-            a_credito, a_debito = am[-3], am[-2]
-            v_credito = normalize_money(a_credito.group(0))
-            v_debito  = normalize_money(a_debito.group(0))
-            cre = float(v_credito) if not np.isnan(v_credito) else 0.0
-            deb = float(-v_debito) if not np.isnan(v_debito) else 0.0
-            first_amt_start = a_credito.start()
-        else:
-            a_mov = am[-2]
-            v_mov = normalize_money(a_mov.group(0))
-            if not np.isnan(v_mov):
-                if v_mov < 0:
-                    deb = float(-v_mov)
-                else:
-                    cre = float(v_mov)
-            first_amt_start = a_mov.start()
-
+        # Texto entre la fecha y el primer importe del movimiento = descripción (y posible origen)
+        first_amt_start = mov_match.start()
         desc = s[mdate.end(): first_amt_start].strip()
+
         origen = ""
+        # Heurística suave para "ORIGEN"
         if " - " in desc:
             p = desc.split(" - ", 1)
             if len(p) == 2 and len(p[1]) <= 80:
@@ -973,6 +987,15 @@ def parse_galicia_records(all_lines: list[str]) -> pd.DataFrame:
             if len(p) == 2 and len(p[1]) <= 80:
                 origen = p[1].strip(); desc = p[0].strip()
 
+        # Clasificación específica Galicia (usa la descripción)
+        clase = clasificar_galicia(desc)
+
+        # Crédito / Débito según signo REAL del movimiento
+        if mov_val < 0:
+            deb, cre = float(-mov_val), 0.0
+        else:
+            deb, cre = 0.0, float(mov_val)
+
         seq += 1
         rows.append({
             "fecha": fecha,
@@ -981,7 +1004,7 @@ def parse_galicia_records(all_lines: list[str]) -> pd.DataFrame:
             "debito": deb,
             "credito": cre,
             "saldo": float(saldo) if not np.isnan(saldo) else np.nan,
-            "Clasificación": clasificar_galicia(desc),
+            "Clasificación": clase,
             "orden": seq
         })
 
