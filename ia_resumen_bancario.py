@@ -139,11 +139,8 @@ def _text_from_pdf(file_like) -> str:
 
 def detect_bank_from_text(txt: str) -> str:
     U = (txt or "").upper()
-
-    # Si dice explícitamente BANCO GALICIA o tiene el header típico -> Galicia primero.
     if ("BANCO GALICIA" in U) or ("RESUMEN DE CUENTA" in U) or GALICIA_HEADER_RE.search(U):
         return "Banco Galicia"
-
     scores = [
         ("Banco Macro",                  sum(1 for k in BANK_MACRO_HINTS      if k in U)),
         ("Banco de Santa Fe",            sum(1 for k in BANK_SANTAFE_HINTS    if k in U)),
@@ -324,7 +321,10 @@ def render_account_report_generic(
 
     if not np.isnan(saldo_inicial):
         first_date = df["fecha"].dropna().min()
-        fecha_apertura = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23,59,59) if pd.notna(first_date) else pd.NaT
+        fecha_apertura = (
+            (first_date - pd.Timedelta(days=1)).normalize() +
+            pd.Timedelta(hours=23, minutes=59, seconds=59)
+        ) if pd.notna(first_date) else pd.NaT
         apertura = pd.DataFrame([{
             "fecha": fecha_apertura, "descripcion":"SALDO ANTERIOR","desc_norm":"SALDO ANTERIOR",
             "debito":0.0,"credito":0.0,"importe":0.0,"saldo":float(saldo_inicial),"pagina":0,"orden":-1
@@ -381,7 +381,7 @@ def render_account_report_generic(
     with o2: metric_text("Ley 25.413 (neto)", ley_25413)
     with o3: metric_text("SIRCREB", sircreb)
 
-    # Tabla SIN Styler (evita StreamlitAPIException)
+    # Tabla SIN Styler
     st.caption("Detalle de movimientos")
     view = df_sorted.copy()
     for col in ["debito","credito","importe","saldo"]:
@@ -397,7 +397,6 @@ def render_account_report_galicia(account_title: str, account_number: str, acc_i
     fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(lines)
 
     df = df.sort_values(["fecha","orden"]).reset_index(drop=True)
-    # D/C por signo del PDF + fallback por delta
     df["debito"]  = np.where(df["monto_pdf"] < 0, -df["monto_pdf"], 0.0)
     df["credito"] = np.where(df["monto_pdf"] > 0,  df["monto_pdf"], 0.0)
     df["delta_saldo"] = df["saldo"].diff()
@@ -405,7 +404,6 @@ def render_account_report_galicia(account_title: str, account_number: str, acc_i
     df.loc[mask_neutral & (df["delta_saldo"] < 0), "debito"]  = -df.loc[mask_neutral & (df["delta_saldo"] < 0), "delta_saldo"]
     df.loc[mask_neutral & (df["delta_saldo"] > 0), "credito"] =  df.loc[mask_neutral & (df["delta_saldo"] > 0), "delta_saldo"]
 
-    # Saldos de encabezado o reconstrucción
     saldo_inicial = np.nan
     if header_saldos:
         if not np.isnan(header_saldos.get("saldo_inicial", np.nan)): saldo_inicial = float(header_saldos["saldo_inicial"])
@@ -416,7 +414,10 @@ def render_account_report_galicia(account_title: str, account_number: str, acc_i
 
     if not np.isnan(saldo_inicial):
         first_date = df["fecha"].dropna().min()
-        fecha_ap = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23,minutes=59,seconds=59) if pd.notna(first_date) else pd.NaT
+        fecha_ap = (
+            (first_date - pd.Timedelta(days=1)).normalize() +
+            pd.Timedelta(hours=23, minutes=59, seconds=59)
+        ) if pd.notna(first_date) else pd.NaT
         apertura = pd.DataFrame([{
             "fecha": fecha_ap, "descripcion":"SALDO ANTERIOR", "desc_norm":"SALDO ANTERIOR",
             "debito":0.0,"credito":0.0,"importe":0.0,"monto_pdf":0.0,"saldo":float(saldo_inicial),
@@ -424,7 +425,6 @@ def render_account_report_galicia(account_title: str, account_number: str, acc_i
         }])
         df = pd.concat([apertura, df], ignore_index=True).sort_values(["fecha","orden"]).reset_index(drop=True)
 
-    # Clasificación y totales
     df["Clasificación"] = df.apply(lambda r: clasificar(str(r.get("descripcion","")), str(r.get("desc_norm","")), r.get("debito",0.0), r.get("credito",0.0)), axis=1)
     df_sorted = df.drop(columns=["orden"]).reset_index(drop=True)
 
@@ -474,7 +474,7 @@ def render_account_report_galicia(account_title: str, account_number: str, acc_i
     with o2: metric_text("Ley 25.413 (neto)", ley_25413)
     with o3: metric_text("SIRCREB", sircreb)
 
-    # Tabla SIN Styler (evita StreamlitAPIException)
+    # Tabla SIN Styler
     st.caption("Detalle de movimientos")
     view = df_sorted.copy()
     for col in ["debito","credito","importe","saldo"]:
