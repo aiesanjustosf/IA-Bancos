@@ -303,7 +303,11 @@ def render_account_report(banco_slug, account_title, account_number, acc_id, lin
     with c4: metric_text("Saldo final (PDF/tabla)", saldo_final_visto)
     with c5: metric_text("Saldo final calculado", saldo_final_calculado)
     with c6: metric_text("Diferencia", diferencia)
-    st.success("Conciliado.") if cuadra else st.error("No cuadra la conciliación.")
+    if cuadra:
+    st.success("Conciliado.")
+    else:
+    st.error("No cuadra la conciliación.")
+
 
     # ===== Resumen Operativo =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
