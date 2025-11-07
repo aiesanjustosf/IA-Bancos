@@ -52,44 +52,81 @@ def fmt_ar(n) -> str:
 # -------- util extracción PDF --------
 def lines_from_text(page):
     txt = page.extract_text() or ""
-    return [" ".join(l.split()) for l in txt.splitlines()]
+    # Asegura siempre list[str] limpio y colapsado
+    return [" ".join(str(l).split()) for l in txt.splitlines() if str(l).strip()]
 
 def lines_from_words(page, ytol=2.0):
-    words = page.extract_words(extra_attrs=["x0", "top"])
+    """
+    Reconstruye líneas a partir de palabras manteniendo el orden visual.
+    Devuelve list[str] SIEMPRE (nunca listas/dicts) y sin duplicados/espacios extra.
+    """
+    words = page.extract_words(extra_attrs=["x0", "top"]) or []
+    if not isinstance(words, list):
+        return []
+
+    # Filtrar entradas inválidas y vacías
+    words = [w for w in words if isinstance(w, dict) and w.get("text") is not None]
     if not words:
         return []
-    words.sort(key=lambda w: (round(w["top"]/ytol), w["x0"]))
-    lines, cur, band = [], [], None
+
+    # Orden por banda vertical (top/ytol) y luego por x
+    def _band(w):
+        try:
+            return int(round(float(w["top"]) / float(ytol)))
+        except Exception:
+            return 0
+
+    def _x(w):
+        try:
+            return float(w["x0"])
+        except Exception:
+            return 0.0
+
+    words.sort(key=lambda w: (_band(w), _x(w)))
+
+    lines = []
+    cur = []
+    band = None
+
+    def flush():
+        if cur:
+            s = " ".join(x["text"] for x in cur if x.get("text"))
+            s = " ".join(s.split())
+            if s:
+                lines.append(s)
+
     for w in words:
-        b = round(w["top"]/ytol)
+        b = _band(w)
         if band is None or b == band:
             cur.append(w)
         else:
-            lines.append(" ".join(x["text"] for x in cur))
+            flush()
             cur = [w]
         band = b
-    if cur:
-        lines.append(" ".join(l.split()) for l in cur)
-        return [" ".join(l.split()) for l in lines]
-    return [" ".join(l.split()) for l in lines]
+    flush()
+
+    # Garantizar list[str]
+    return [s for s in lines if isinstance(s, str) and s.strip()]
 
 def extract_all_lines(file_like):
+    """
+    Combina líneas por texto y por palabras, deduplica y devuelve [(pageno, str_line)].
+    """
     out = []
     with pdfplumber.open(file_like) as pdf:
         for pi, p in enumerate(pdf.pages, start=1):
-            lt = lines_from_text(p)
-            lw = lines_from_words(p, ytol=2.0)
-            seen = set(lt)
-            combined = lt + [l for l in lw if l not in seen]
-            out.extend([(pi, l) for l in combined if l.strip()])
+            lt = lines_from_text(p)               # list[str]
+            lw = lines_from_words(p, ytol=2.0)    # list[str]
+            seen = set()
+            combined = []
+            for l in lt + lw:
+                s = " ".join(str(l).split())
+                if s and s not in seen:
+                    combined.append(s)
+                    seen.add(s)
+            out.extend((pi, s) for s in combined)
     return out
 
-def text_from_pdf(file_like) -> str:
-    try:
-        with pdfplumber.open(file_like) as pdf:
-            return "\n".join((p.extract_text() or "") for p in pdf.pages)
-    except Exception:
-        return ""
 
 # -------- Detección de banco --------
 BANK_MACRO_HINTS   = ("BANCO MACRO","CUENTA CORRIENTE BANCARIA","SALDO ULTIMO EXTRACTO AL","DEBITO FISCAL IVA BASICO","N/D DBCR 25413")
