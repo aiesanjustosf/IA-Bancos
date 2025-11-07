@@ -69,7 +69,8 @@ def lines_from_words(page, ytol=2.0):
             cur = [w]
         band = b
     if cur:
-        lines.append(" ".join(x["text"] for x in cur))
+        lines.append(" ".join(l.split()) for l in cur)
+        return [" ".join(l.split()) for l in lines]
     return [" ".join(l.split()) for l in lines]
 
 def extract_all_lines(file_like):
@@ -283,9 +284,10 @@ def render_account_report(
     for col in ["fecha","orden","monto_pdf","saldo","desc_norm","descripcion"]:
         if col not in df.columns:
             df[col] = np.nan
-    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-    if "orden" not in df.columns:
+    # orden y fecha seguras
+    if "orden" not in df.columns or df["orden"].isna().any():
         df["orden"] = np.arange(1, len(df)+1)
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
 
     fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(lines)
 
@@ -323,8 +325,13 @@ def render_account_report(
     # Insertar SALDO ANTERIOR sintético para conciliación estable
     if np.isnan(saldo_inicial):
         saldo_inicial = 0.0 if df.empty else float(df.loc[0,"saldo"])
+
     first_date = df["fecha"].dropna().min() if not df.empty else pd.NaT
-    fecha_apertura = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59) if pd.notna(first_date) else pd.NaT
+    if pd.notna(first_date):
+        fecha_apertura = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59)
+    else:
+        fecha_apertura = pd.NaT
+
     apertura = pd.DataFrame([{
         "fecha": fecha_apertura,
         "descripcion": "SALDO ANTERIOR",
@@ -341,9 +348,12 @@ def render_account_report(
 
     # Totales / conciliación
     saldo_inicial_show   = float(df.loc[0,"saldo"]) if not df.empty else 0.0
-    total_debitos        = float(df["debito"].sum())
-    total_creditos       = float(df["credito"].sum())
-    saldo_final_visto    = float(df["saldo"].iloc[-1]) if np.isnan(saldo_final_pdf) and not df.empty else float(saldo_final_pdf) if not np.isnan(saldo_final_pdf) else saldo_inicial_show
+    total_debitos        = float(df["debito"].sum()) if "debito" in df else 0.0
+    total_creditos       = float(df["credito"].sum()) if "credito" in df else 0.0
+    if np.isnan(saldo_final_pdf):
+        saldo_final_visto = float(df["saldo"].iloc[-1]) if not df.empty else saldo_inicial_show
+    else:
+        saldo_final_visto = float(saldo_final_pdf)
     saldo_final_calculado= saldo_inicial_show + total_creditos - total_debitos
     diferencia           = saldo_final_calculado - saldo_final_visto
     cuadra               = abs(diferencia) < 0.01
@@ -395,9 +405,13 @@ def render_account_report(
     total_operativo = net21 + iva21 + net105 + iva105 + percep_iva + ley_25413 + sircreb
     st.markdown(f"**Total Resumen Operativo**<br>$ {fmt_ar(total_operativo)}", unsafe_allow_html=True)
 
+    # Tabla (con fallback)
     st.caption("Detalle de movimientos")
     show_df = df[["fecha","descripcion","desc_norm","debito","credito","saldo","Clasificación"]].copy()
-    st.dataframe(show_df, use_container_width=True)
+    try:
+        st.dataframe(show_df, use_container_width=True)
+    except Exception:
+        st.write(show_df)
 
 # ======================== UI principal ========================
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
@@ -425,16 +439,24 @@ slug = ("santafe" if bank_name == "Banco de Santa Fe"
         else "galicia" if bank_name == "Banco Galicia"
         else "generico")
 
+# títulos seguros (sin split raro)
+TITLE_MAP = {
+    "Banco de Santa Fe": "Cuenta (Santa Fe)",
+    "Banco Macro": "Cuenta (Macro)",
+    "Banco de la Nación Argentina": "Cuenta (BNA)",
+    "Banco Santander": "Cuenta (Santander)",
+    "Banco Galicia": "Cuenta Corriente (Galicia)",
+    "Banco no identificado": "Cuenta",
+}
+
 if bank_name == "Banco Galicia":
     st.success("Detectado: Banco Galicia")
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
     if not any(GALICIA_HEADER_RE.search(l) for l in all_lines):
         st.info("No se encontró explícitamente el encabezado Galicia; se procesa igual por montos.")
     header_saldos = galicia_header_saldos_from_text(txt)
-    render_account_report("galicia", "Cuenta Corriente (Galicia)", "s/n", "galicia-unica", all_lines, header_saldos=header_saldos)
+    render_account_report("galicia", TITLE_MAP.get(bank_name, "Cuenta"), "s/n", "galicia-unica", all_lines, header_saldos=header_saldos)
 else:
     st.success(f"Detectado: {bank_name}")
-    # Resto de bancos: una cuenta consolidada (si necesitás partir por cuentas Macro, se puede sumar,
-    # pero esto mantiene todo lo que venía funcionando sin tocar Galicia).
     all_lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
-    render_account_report(slug, f"CUENTA ({bank_name.split()[-1]})", "s/n", f"{slug}-unica", all_lines)
+    render_account_report(slug, TITLE_MAP.get(bank_name, "Cuenta"), "s/n", f"{slug}-unica", all_lines)
