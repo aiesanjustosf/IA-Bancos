@@ -904,8 +904,20 @@ if uploaded is None:
 
 data = uploaded.read()
 
-_bank_txt = _text_from_pdf(io.BytesIO(data))
+_bank_txt = _text_from_pdf(io.BytesIO(data)).strip()
+
+# Si no hay texto, probablemente sea un PDF escaneado (solo imagen)
+if not _bank_txt:
+    st.error(
+        "No se pudo leer texto del PDF. "
+        "Este resumen parece estar escaneado (solo imagen). "
+        "La herramienta solo funciona con PDFs descargados del home banking, "
+        "donde el texto sea seleccionable."
+    )
+    st.stop()
+
 _auto_bank_name = detect_bank_from_text(_bank_txt)
+
 
 with st.expander("Opciones avanzadas (detección de banco)", expanded=False):
     forced = st.selectbox(
