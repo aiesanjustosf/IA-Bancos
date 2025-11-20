@@ -724,21 +724,28 @@ def render_account_report(
     if pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
-    # ===== Ajuste especial BANCO MACRO: IVA 21% vs 10,5% por contexto =====
+        # ===== Ajuste especial BANCO MACRO: IVA 21% vs 10,5% por contexto =====
     if banco_slug == "macro":
         prev_adel = False
         for idx, row in df_sorted.iterrows():
             desc_u = str(row.get("descripcion", "")).upper()
-            if "INTER.ADEL.CC C/ACUERD" in desc_u:
+            desc_n = str(row.get("desc_norm", "")).upper()
+
+            # Cualquier variante de INTER.ADEL
+            if "INTER.ADEL" in desc_u or "INTER.ADEL" in desc_n:
                 prev_adel = True
-            elif "DEBITO FISCAL IVA BASICO" in desc_u:
+
+            # IVA BASICO: decide 10,5 o 21 según la línea anterior
+            elif ("DEBITO FISCAL IVA BASICO" in desc_u) or ("DEBITO FISCAL IVA BASICO" in desc_n):
                 if prev_adel:
                     df_sorted.at[idx, "Clasificación"] = "IVA 10,5% (sobre comisiones)"
                 else:
                     df_sorted.at[idx, "Clasificación"] = "IVA 21% (sobre comisiones)"
                 prev_adel = False
+
             else:
                 prev_adel = False
+
 
     # ===== Resumen Operativo: Registración Módulo IVA =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
@@ -750,18 +757,17 @@ def render_account_report(
     iva105 = float(df_sorted.loc[iva105_mask, "debito"].sum())
 
     # Lógica general: netos calculados desde el IVA
-    net21 = round(iva21 / 0.21, 2) if iva21 else 0.0
+       net21 = round(iva21 / 0.21, 2) if iva21 else 0.0
     net105_general = round(iva105 / 0.105, 2) if iva105 else 0.0
 
-    # Caso especial: Banco Macro -> Neto 10,5% = suma de N/D INTER.ADEL.CC C/ACUERD
+    # Caso especial: Banco Macro -> Neto 10,5% = suma de todas las INTER.ADEL
     if banco_slug == "macro":
-        mask_net105_macro = df_sorted["descripcion"].str.upper().str.contains(
-            "N/D INTER.ADEL.CC C/ACUERD", na=False
-        )
+        mask_net105_macro = df_sorted["desc_norm"].str.upper().str.contains("INTER.ADEL", na=False)
         net105_macro = float(df_sorted.loc[mask_net105_macro, "debito"].sum())
         net105 = net105_macro if net105_macro else net105_general
     else:
         net105 = net105_general
+
 
     percep_iva = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
     ley_25413  = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25.413"),          "debito"].sum())
