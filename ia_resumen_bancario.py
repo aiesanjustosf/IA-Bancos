@@ -525,6 +525,11 @@ def find_saldo_anterior_from_lines(lines):
     return np.nan
 
 # ---------- Clasificación ----------
+    # RETENCION IVA PERCEPCION (Macro) -> Percepciones de IVA
+    if ("RETENCION" in u and "IVA" in u and "PERCEPCION" in u) or \
+       ("RETENCION" in n and "IVA" in n and "PERCEPCION" in n):
+        return "Percepciones de IVA"
+
 RE_PERCEP_RG2408 = re.compile(r"PERCEPCI[ÓO]N\s+IVA\s+RG\.?\s*2408", re.IGNORECASE)
 
 def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
@@ -557,12 +562,17 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     ):
         return "Percepciones de IVA"
 
-    # IVA sobre comisiones (BNA usa "I.V.A. BASE", Credicoop usa “I.V.A. - Débito Fiscal 21%”)
-    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) \
+       # IVA sobre comisiones (BNA usa "I.V.A. BASE", Credicoop usa “I.V.A. - Débito Fiscal 21%”)
+    # En Banco Macro, "DEBITO FISCAL IVA BASICO" corresponde al IVA 10,5% sobre comisiones
+    if ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n):
+        return "IVA 10,5% (sobre comisiones)"
+
+    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) \
        or ("I.V.A" in u and "DÉBITO FISCAL" in u) or ("I.V.A" in n and "DEBITO FISCAL" in n):
         if "10,5" in u or "10,5" in n or "10.5" in u or "10.5" in n:
             return "IVA 10,5% (sobre comisiones)"
         return "IVA 21% (sobre comisiones)"
+
 
     # Plazo Fijo (según signo)
     if ("PLAZO FIJO" in u) or ("PLAZO FIJO" in n) or ("P.FIJO" in u) or ("P.FIJO" in n) or ("P FIJO" in u) or ("P FIJO" in n) or ("PFIJO" in u) or ("PFIJO" in n):
@@ -718,17 +728,38 @@ def render_account_report(
     if pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
-    # ===== Resumen Operativo (IVA + Otros) =====
+       # ===== Resumen Operativo (IVA + Otros) =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
+
     iva21_mask  = df_sorted["Clasificación"].eq("IVA 21% (sobre comisiones)")
     iva105_mask = df_sorted["Clasificación"].eq("IVA 10,5% (sobre comisiones)")
+
     iva21  = float(df_sorted.loc[iva21_mask,  "debito"].sum())
     iva105 = float(df_sorted.loc[iva105_mask, "debito"].sum())
-    net21  = round(iva21  / 0.21,  2) if iva21  else 0.0
-    net105 = round(iva105 / 0.105, 2) if iva105 else 0.0
+
+    # Lógica general (no Macro): netos calculados desde el IVA
+    net21_general  = round(iva21  / 0.21,  2) if iva21  else 0.0
+    net105_general = round(iva105 / 0.105, 2) if iva105 else 0.0
+
+    # Caso especial: Banco Macro
+    if banco_slug == "macro":
+        # Neto comisiones 10,5% = suma de N/D INTER.ADEL.CC C/ACUERD
+        mask_net105_macro = df_sorted["descripcion"].str.upper().str.contains(
+            "N/D INTER.ADEL.CC C/ACUERD", na=False
+        )
+        net105 = float(df_sorted.loc[mask_net105_macro, "debito"].sum())
+        # si por algún motivo no hay nada matcheado, usamos el general como backup
+        if not net105 and iva105:
+            net105 = net105_general
+        net21 = net21_general
+    else:
+        net21  = net21_general
+        net105 = net105_general
+
     percep_iva = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
     ley_25413  = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25.413"),          "debito"].sum())
     sircreb    = float(df_sorted.loc[df_sorted["Clasificación"].eq("SIRCREB"),            "debito"].sum())
+
 
     # Métricas IVA
     m1, m2, m3 = st.columns(3)
