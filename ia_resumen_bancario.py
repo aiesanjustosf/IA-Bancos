@@ -474,7 +474,7 @@ def find_saldo_final_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if pd.notna(fecha) and not np.isnan(saldo):
                     return fecha, saldo
-    # 2) BNA: "SALDO FINAL" en línea, con un solo importe
+    # 2) BNA: "SALDO FINAL <importe>" sin fecha
     for ln in reversed(lines):
         if "SALDO FINAL" in ln.upper() and _only_one_amount(ln):
             saldo = _first_amount_value(ln)
@@ -548,11 +548,6 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if RE_PERCEP_RG2408.search(u) or RE_PERCEP_RG2408.search(n):
         return "Percepciones de IVA"
 
-    # RETENCION IVA PERCEPCION (Macro) -> Percepciones de IVA
-    if (("RETENCION" in u and "IVA" in u and "PERCEPCION" in u) or
-        ("RETENCION" in n and "IVA" in n and "PERCEPCION" in n)):
-        return "Percepciones de IVA"
-
     # Percepciones / Retenciones IVA (RG 3337 / RG 2408)
     if (
         ("IVA PERC" in u) or ("IVA PERCEP" in u) or ("RG3337" in u) or
@@ -563,9 +558,8 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
         return "Percepciones de IVA"
 
     # IVA sobre comisiones (BNA usa "I.V.A. BASE", Credicoop usa “I.V.A. - Débito Fiscal 21%”)
-    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or \
-       ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) or \
-       ("I.V.A" in u and "DÉBITO FISCAL" in u) or ("I.VA" in n and "DEBITO FISCAL" in n):
+    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) \
+       or ("I.V.A" in u and "DÉBITO FISCAL" in u) or ("I.V.A" in n and "DEBITO FISCAL" in n):
         if "10,5" in u or "10,5" in n or "10.5" in u or "10.5" in n:
             return "IVA 10,5% (sobre comisiones)"
         return "IVA 21% (sobre comisiones)"
@@ -628,7 +622,7 @@ def render_account_report(
     account_number: str,
     acc_id: str,
     lines: list[str],
-    bna_extras: dict | None = None   # extras BNA integrados al resumen operativo
+    bna_extras: dict | None = None   # extras BNA integrados al resumen operativo (reservado)
 ):
     st.markdown("---")
     st.subheader(f"{account_title} · Nro {account_number}")
@@ -724,40 +718,38 @@ def render_account_report(
     if pd.notna(fecha_cierre):
         st.caption(f"Cierre según PDF: {fecha_cierre.strftime('%d/%m/%Y')}")
 
-        # ===== Ajuste especial BANCO MACRO: IVA 21% vs 10,5% por contexto =====
+    # ===== Ajuste especial BANCO MACRO: IVA 21% vs 10,5% por contexto =====
     if banco_slug == "macro":
         prev_adel = False
         for idx, row in df_sorted.iterrows():
             desc_u = str(row.get("descripcion", "")).upper()
             desc_n = str(row.get("desc_norm", "")).upper()
 
-            # Cualquier variante de INTER.ADEL
+            # Cualquier variante de INTER.ADEL activa el flag para 10,5%
             if "INTER.ADEL" in desc_u or "INTER.ADEL" in desc_n:
                 prev_adel = True
+                continue
 
             # IVA BASICO: decide 10,5 o 21 según la línea anterior
-            elif ("DEBITO FISCAL IVA BASICO" in desc_u) or ("DEBITO FISCAL IVA BASICO" in desc_n):
+            if "DEBITO FISCAL IVA BASICO" in desc_u or "DEBITO FISCAL IVA BASICO" in desc_n:
                 if prev_adel:
                     df_sorted.at[idx, "Clasificación"] = "IVA 10,5% (sobre comisiones)"
                 else:
                     df_sorted.at[idx, "Clasificación"] = "IVA 21% (sobre comisiones)"
                 prev_adel = False
+                continue
 
-            else:
-                prev_adel = False
+            # Cualquier otra cosa resetea el flag
+            prev_adel = False
 
-
-    # ===== Resumen Operativo: Registración Módulo IVA =====
+    # ===== Resumen Operativo (IVA + Otros) =====
     st.caption("Resumen Operativo: Registración Módulo IVA")
-
     iva21_mask  = df_sorted["Clasificación"].eq("IVA 21% (sobre comisiones)")
     iva105_mask = df_sorted["Clasificación"].eq("IVA 10,5% (sobre comisiones)")
-
     iva21  = float(df_sorted.loc[iva21_mask,  "debito"].sum())
     iva105 = float(df_sorted.loc[iva105_mask, "debito"].sum())
 
-    # Lógica general: netos calculados desde el IVA
-       net21 = round(iva21 / 0.21, 2) if iva21 else 0.0
+    net21 = round(iva21 / 0.21, 2) if iva21 else 0.0
     net105_general = round(iva105 / 0.105, 2) if iva105 else 0.0
 
     # Caso especial: Banco Macro -> Neto 10,5% = suma de todas las INTER.ADEL
@@ -767,7 +759,6 @@ def render_account_report(
         net105 = net105_macro if net105_macro else net105_general
     else:
         net105 = net105_general
-
 
     percep_iva = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
     ley_25413  = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25.413"),          "debito"].sum())
@@ -789,13 +780,10 @@ def render_account_report(
     with o2: st.metric("Ley 25.413", f"$ {fmt_ar(ley_25413)}")
     with o3: st.metric("SIRCREB", f"$ {fmt_ar(sircreb)}")
 
-    # Tabla (grilla tipo Galicia)
+    # Tabla
     st.caption("Detalle de movimientos")
-    styled = df_sorted.style.format(
-        {"debito": fmt_ar, "credito": fmt_ar, "importe": fmt_ar, "saldo": fmt_ar},
-        na_rep="—"
-    )
-    st.dataframe(styled, use_container_width=True, hide_index=True)
+    styled = df_sorted.style.format({c: fmt_ar for c in ["debito","credito","importe","saldo"]}, na_rep="—")
+    st.dataframe(styled, use_container_width=True, height=500)
 
     # Descargas
     st.caption("Descargar")
@@ -997,6 +985,7 @@ if _bank_name == "Banco Macro":
     if not blocks:
         st.warning("No se detectaron encabezados de cuenta en Macro. Se intentará procesar todo el PDF (podría mezclar cuentas).")
         _lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
+
         render_account_report(_bank_slug, "CUENTA (PDF completo)", "s/n", "macro-pdf-completo", _lines)
     else:
         st.caption(f"Información de su/s Cuenta/s: {len(blocks)} cuenta(s) detectada(s).")
@@ -1035,7 +1024,7 @@ elif _bank_name == "Banco de la Nación Argentina":
     if meta.get("cbu"):
         with col3: st.caption(f"CBU: {meta['cbu']}")
 
-    # Extras BNA -> integrados al Resumen Operativo (si se usan)
+    # Extras BNA -> integrados al Resumen Operativo (reservado)
     txt_full = _text_from_pdf(io.BytesIO(data))
     bna_extras = bna_extract_gastos_finales(txt_full)
 
@@ -1045,8 +1034,7 @@ elif _bank_name == "Banco Credicoop":
     meta = credicoop_extract_meta(io.BytesIO(data))
     dfc, fecha_cierre, saldo_final_pdf, saldo_anterior_pdf = credicoop_parse_records_xy(io.BytesIO(data))
 
-    # Reusar el mismo render pero “inyectando” lo que necesita
-    # Armamos líneas de marcador para que el título/descargas funcionen igual
+    # Reusar el mismo esquema de presentación
     titulo = meta.get("title") or "CUENTA (Credicoop)"
     nro = meta.get("account_number") or "s/n"
     acc_id = f"credicoop-{re.sub(r'[^0-9A-Za-z]+', '_', nro)}"
@@ -1128,11 +1116,8 @@ elif _bank_name == "Banco Credicoop":
         for c in show_cols:
             if c not in dfc.columns:
                 dfc[c] = np.nan
-        styled = dfc[show_cols].style.format(
-            {"debito": fmt_ar, "credito": fmt_ar, "saldo": fmt_ar},
-            na_rep="—"
-        )
-        st.dataframe(styled, use_container_width=True, hide_index=True)
+        styled = dfc[show_cols].style.format({c: fmt_ar for c in ["debito","credito","saldo"]}, na_rep="—")
+        st.dataframe(styled, use_container_width=True, height=500)
 
         # Descargas
         st.caption("Descargar")
