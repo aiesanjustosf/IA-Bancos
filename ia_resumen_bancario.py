@@ -1,4 +1,4 @@
-# ia_resumen_bancario.py 
+# ia_resumen_bancario.py
 # Herramienta para uso interno - AIE San Justo
 
 import io, re
@@ -35,7 +35,12 @@ except Exception:
 
 # --- regex base ---
 DATE_RE  = re.compile(r"\b\d{1,2}/\d{2}/\d{2,4}\b")  # dd/mm/aa o dd/mm/aaaa
-MONEY_RE = re.compile(r'(?<!\S)(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)')
+
+# ACEPTA IMPORTES CON SIGNO ADELANTE O GUION ATRÁS (ej: -2.114.972,30 o 2.114.972,30-)
+MONEY_RE = re.compile(
+    r'(?<!\S)-?(?:\d{1,3}(?:\.\d{3})*|\d+)\s?,\s?\d{2}-?(?!\S)'
+)
+
 LONG_INT_RE = re.compile(r"\b\d{6,}\b")
 
 # ====== PATRONES ESPECÍFICOS ======
@@ -79,20 +84,17 @@ BNA_GASTOS_RE = re.compile(
 # ---- NUEVO: Santa Fe - "SALDO ULTIMO RESUMEN" sin fecha ----
 SF_SALDO_ULT_RE = re.compile(r"SALDO\s+U?LTIMO\s+RESUMEN", re.IGNORECASE)
 
-def _text_from_pdf(file_like) -> str:
-    try:
-        with pdfplumber.open(file_like) as pdf:
-            return "\n".join((p.extract_text() or "") for p in pdf.pages)
-    except Exception:
-        return ""
-
 # --- utils ---
 def normalize_money(tok: str) -> float:
+    """
+    Normaliza importes argentinos, aceptando:
+    -2.114.972,30   ó   2.114.972,30-
+    """
     if not tok:
         return np.nan
-    tok = tok.strip()
-    neg = tok.endswith("-")
-    tok = tok.rstrip("-")
+    tok = tok.strip().replace("−", "-")
+    neg = tok.endswith("-") or tok.startswith("-")
+    tok = tok.strip("-")
     if "," not in tok:
         return np.nan
     main, frac = tok.rsplit(",", 1)
@@ -143,18 +145,25 @@ def normalize_desc(desc: str) -> str:
     return u
 
 # ---------- Detección de banco (solo banner) ----------
-BANK_MACRO_HINTS = ("BANCO MACRO","CUENTA CORRIENTE BANCARIA","SALDO ULTIMO EXTRACTO AL","DEBITO FISCAL IVA BASICO","N/D DBCR 25413")
-BANK_SANTAFE_HINTS = ("BANCO DE SANTA FE","NUEVO BANCO DE SANTA FE","SALDO ANTERIOR","IMPTRANS","IVA GRAL")
-BANK_NACION_HINTS = (BNA_NAME_HINT, "SALDO ANTERIOR", "SALDO FINAL", "I.V.A. BASE", "COMIS.")
+BANK_MACRO_HINTS    = ("BANCO MACRO","CUENTA CORRIENTE BANCARIA","SALDO ULTIMO EXTRACTO AL","DEBITO FISCAL IVA BASICO","N/D DBCR 25413")
+BANK_SANTAFE_HINTS  = ("BANCO DE SANTA FE","NUEVO BANCO DE SANTA FE","SALDO ANTERIOR","IMPTRANS","IVA GRAL")
+BANK_NACION_HINTS   = (BNA_NAME_HINT, "SALDO ANTERIOR", "SALDO FINAL", "I.V.A. BASE", "COMIS.")
+
+def _text_from_pdf(file_like) -> str:
+    try:
+        with pdfplumber.open(file_like) as pdf:
+            return "\n".join((p.extract_text() or "") for p in pdf.pages)
+    except Exception:
+        return ""
 
 def detect_bank_from_text(txt: str) -> str:
     U = (txt or "").upper()
-    score_macro = sum(1 for k in BANK_MACRO_HINTS if k in U)
+    score_macro = sum(1 for k in BANK_MACRO_HINTS   if k in U)
     score_sf    = sum(1 for k in BANK_SANTAFE_HINTS if k in U)
-    score_bna   = sum(1 for k in BANK_NACION_HINTS if k in U)
+    score_bna   = sum(1 for k in BANK_NACION_HINTS  if k in U)
     scores = [
-        ("Banco Macro", score_macro),
-        ("Banco de Santa Fe", score_sf),
+        ("Banco Macro",              score_macro),
+        ("Banco de Santa Fe",        score_sf),
         ("Banco de la Nación Argentina", score_bna),
     ]
     scores.sort(key=lambda x: x[1], reverse=True)
@@ -342,7 +351,7 @@ def find_saldo_final_from_lines(lines):
                 saldo = _first_amount_value(ln)
                 if pd.notna(fecha) and not np.isnan(saldo):
                     return fecha, saldo
-    # 2) BNA: "SALDO FINAL <importe>" sin fecha
+    # 2) BNA: "SALDO FINAL" sin fecha
     for ln in reversed(lines):
         if "SALDO FINAL" in ln.upper() and _only_one_amount(ln):
             saldo = _first_amount_value(ln)
@@ -412,10 +421,8 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if ("SIRCREB" in u) or ("SIRCREB" in n):
         return "SIRCREB"
 
-    # Percepciones IVA directas
+    # Percepciones IVA: atajo RG 2408
     if RE_PERCEP_RG2408.search(u) or RE_PERCEP_RG2408.search(n):
-        return "Percepciones de IVA"
-    if "RETENCION IVA PERCEPCION" in u or "RETENCION IVA PERCEPCION" in n:
         return "Percepciones de IVA"
 
     # Percepciones / Retenciones IVA (RG 3337 / RG 2408)
@@ -427,10 +434,18 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     ):
         return "Percepciones de IVA"
 
-    # IVA sobre comisiones (BNA usa "I.V.A. BASE", Macro "DEBITO FISCAL IVA BASICO")
-    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or \
-       ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) or \
-       ("I.V.A" in u and "DÉBITO FISCAL" in u) or ("I.V.A" in n and "DEBITO FISCAL" in n):
+    # Percepciones IVA genéricas (Macro: RETENCION IVA PERCEPCION)
+    if (
+        ("RETENCION" in u and "IVA" in u and "PERCEP" in u) or
+        ("RETENCION" in n and "IVA" in n and "PERCEP" in n) or
+        ("RETEN" in u and "IVA" in u and "PERC" in u) or
+        ("RETEN" in n and "IVA" in n and "PERC" in n)
+    ):
+        return "Percepciones de IVA"
+
+    # IVA sobre comisiones (BNA usa "I.V.A. BASE")
+    if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) \
+       or ("I.V.A" in u and "DÉBITO FISCAL" in u) or ("I.V.A" in n and "DEBITO FISCAL" in n):
         if "10,5" in u or "10,5" in n or "10.5" in u or "10.5" in n:
             return "IVA 10,5% (sobre comisiones)"
         return "IVA 21% (sobre comisiones)"
@@ -486,6 +501,24 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if deb and deb != 0: return "Débito"
     return "Otros"
 
+# ---------- Ajuste específico Macro: IVA 10,5% INTER.ADEL.CC + DEBITO FISCAL ----------
+def ajustar_macro_iva_105(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    En Macro, cuando aparece:
+    N/D INTER.ADEL.CC C/ACUERD
+    DEBITO FISCAL IVA BASICO
+    la segunda línea es IVA 10,5% (sobre comisiones).
+    """
+    if df.empty:
+        return df
+    df = df.copy()
+    u = df["desc_norm"].astype(str).str.upper()
+    for i in range(len(df) - 1):
+        if "INTER.ADEL.CC" in u.iloc[i] and "C/ACUERD" in u.iloc[i]:
+            if "DEBITO FISCAL IVA BASICO" in u.iloc[i + 1]:
+                df.at[i + 1, "Clasificación"] = "IVA 10,5% (sobre comisiones)"
+    return df
+
 # ---------- Helper de UI por cuenta (genérico) ----------
 def render_account_report(
     banco_slug: str,
@@ -493,7 +526,7 @@ def render_account_report(
     account_number: str,
     acc_id: str,
     lines: list[str],
-    bna_extras: dict | None = None   # extras BNA integrados al resumen operativo (por ahora sin usar)
+    bna_extras: dict | None = None   # actualmente no usado
 ):
     st.markdown("---")
     st.subheader(f"{account_title} · Nro {account_number}")
@@ -547,7 +580,7 @@ def render_account_report(
         }])
         df = pd.concat([apertura, df], ignore_index=True)
 
-    # Débito/Crédito por delta de saldo (robusto para BNA)
+    # Débito/Crédito por delta de saldo
     df = df.sort_values(["fecha", "orden"]).reset_index(drop=True)
     df["delta_saldo"] = df["saldo"].diff()
     df["debito"]  = np.where(df["delta_saldo"] < 0, -df["delta_saldo"], 0.0)
@@ -560,23 +593,12 @@ def render_account_report(
         axis=1
     )
 
-    # Pasar a df_sorted
-    df_sorted = df.drop(columns=["orden"]).reset_index(drop=True)
-
-    # --- Ajuste especial Macro: INTER.ADEL.CC C/ACUERD + IVA BASICO al 10,5% ---
+    # Ajuste específico Macro: IVA 10,5% sobre INTER.ADEL.CC C/ACUERD
     if banco_slug == "macro":
-        desc_upper = df_sorted["desc_norm"].fillna("").str.upper()
-        for i, desc in enumerate(desc_upper):
-            if "INTER.ADEL.CC C/ACUERD" in desc:
-                # buscar hacia adelante el próximo DEBITO FISCAL IVA BASICO
-                for j in range(i + 1, len(df_sorted)):
-                    desc_j = str(df_sorted.loc[j, "desc_norm"]).upper()
-                    if "DEBITO FISCAL IVA BASICO" in desc_j:
-                        if df_sorted.loc[j, "Clasificación"] == "IVA 21% (sobre comisiones)":
-                            df_sorted.at[j, "Clasificación"] = "IVA 10,5% (sobre comisiones)"
-                        break
+        df = ajustar_macro_iva_105(df)
 
     # Totales / conciliación
+    df_sorted = df.drop(columns=["orden"]).reset_index(drop=True)
     saldo_inicial = float(df_sorted.loc[0, "saldo"])
     total_debitos = float(df_sorted["debito"].sum())
     total_creditos = float(df_sorted["credito"].sum())
@@ -632,13 +654,13 @@ def render_account_report(
     with o2: st.metric("Ley 25.413", f"$ {fmt_ar(ley_25413)}")
     with o3: st.metric("SIRCREB", f"$ {fmt_ar(sircreb)}")
 
-    # Tabla
+    # Tabla (grilla) con números formateados
     st.caption("Detalle de movimientos")
-    styled = df_sorted.style.format(
-        {c: fmt_ar for c in ["debito","credito","importe","saldo"]},
-        na_rep="—"
-    )
-    st.dataframe(styled, use_container_width=True, height=420)
+    df_view = df_sorted.copy()
+    for c in ["debito", "credito", "importe", "saldo"]:
+        if c in df_view.columns:
+            df_view[c] = df_view[c].map(fmt_ar)
+    st.dataframe(df_view, use_container_width=True)
 
     # Descargas
     st.caption("Descargar")
@@ -716,6 +738,7 @@ def render_account_report(
             elems.append(tbl)
             elems.append(Spacer(1, 12))
             elems.append(Paragraph("Herramienta para uso interno - AIE San Justo", styles["Normal"]))
+
             doc.build(elems)
             st.download_button(
                 "📄 Descargar PDF – Resumen Operativo (IVA)",
@@ -792,6 +815,7 @@ if uploaded is None:
     st.stop()
 
 data = uploaded.read()
+
 _bank_txt = _text_from_pdf(io.BytesIO(data)).strip()
 
 # Si no hay texto, probablemente sea un PDF escaneado (solo imagen)
@@ -825,12 +849,10 @@ elif _bank_name == "Banco de la Nación Argentina":
 else:
     st.warning("No se pudo identificar el banco automáticamente. Se intentará procesar.")
 
-_bank_slug = (
-    "macro" if _bank_name == "Banco Macro"
-    else "santafe" if _bank_name == "Banco de Santa Fe"
-    else "nacion" if _bank_name == "Banco de la Nación Argentina"
-    else "generico"
-)
+_bank_slug = ("macro" if _bank_name == "Banco Macro"
+              else "santafe" if _bank_name == "Banco de Santa Fe"
+              else "nacion" if _bank_name == "Banco de la Nación Argentina"
+              else "generico")
 
 # --- Flujo por banco ---
 if _bank_name == "Banco Macro":
@@ -876,7 +898,7 @@ elif _bank_name == "Banco de la Nación Argentina":
     if meta.get("cbu"):
         with col3: st.caption(f"CBU: {meta['cbu']}")
 
-    # Extras BNA -> integrados al Resumen Operativo (por ahora solo se calculan)
+    # Extras BNA -> integrados al Resumen Operativo (por ahora solo se leen)
     txt_full = _text_from_pdf(io.BytesIO(data))
     bna_extras = bna_extract_gastos_finales(txt_full)
 
