@@ -129,7 +129,7 @@ def lines_from_words(page, ytol=2.0):
             cur = [w]
         band = b
     if cur:
-        lines.append(" ".join(x["text"] for x in cur))
+        lines.append(" ".join(l.split()) for l in [" ".join(x["text"] for x in cur)])
     return [" ".join(l.split()) for l in lines]
 
 def normalize_desc(desc: str) -> str:
@@ -442,6 +442,12 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
         ("RETEN" in n and "IVA" in n and "PERC" in n)
     ):
         return "Percepciones de IVA"
+
+    # --- NUEVO: IVA reducido Banco Santa Fe (no trae '10,5' en texto) ---
+    # Ej: "IVA RINS IVA REDUC.R.I."
+    if ("IVA RINS" in u or "IVA RINS" in n or
+        "IVA REDUC" in u or "IVA REDUC" in n):
+        return "IVA 10,5% (sobre comisiones)"
 
     # IVA sobre comisiones (BNA usa "I.V.A. BASE")
     if ("I.V.A. BASE" in u) or ("I.V.A. BASE" in n) or ("IVA GRAL" in u) or ("IVA GRAL" in n) or ("DEBITO FISCAL IVA BASICO" in u) or ("DEBITO FISCAL IVA BASICO" in n) \
@@ -860,6 +866,7 @@ if _bank_name == "Banco Macro":
     if not blocks:
         st.warning("No se detectaron encabezados de cuenta en Macro. Se intentará procesar todo el PDF (podría mezclar cuentas).")
         _lines = [l for _, l in extract_all_lines(io.BytesIO(data))]
+
         render_account_report(_bank_slug, "CUENTA (PDF completo)", "s/n", "macro-pdf-completo", _lines)
     else:
         st.caption(f"Información de su/s Cuenta/s: {len(blocks)} cuenta(s) detectada(s).")
