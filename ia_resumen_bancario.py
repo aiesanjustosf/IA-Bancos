@@ -118,19 +118,21 @@ def lines_from_words(page, ytol=2.0):
     words = page.extract_words(extra_attrs=["x0", "top"])
     if not words:
         return []
-    words.sort(key=lambda w: (round(w["top"]/ytol), w["x0"]))
+    words.sort(key=lambda w: (round(w["top"] / ytol), w["x0"]))
     lines, cur, band = [], [], None
     for w in words:
-        b = round(w["top"]/ytol)
+        b = round(w["top"] / ytol)
         if band is None or b == band:
             cur.append(w)
         else:
+            # cerramos la línea anterior
             lines.append(" ".join(x["text"] for x in cur))
             cur = [w]
         band = b
     if cur:
-        lines.append(" ".join(l.split()) for l in [" ".join(x["text"] for x in cur)])
+        lines.append(" ".join(x["text"] for x in cur))
     return [" ".join(l.split()) for l in lines]
+
 
 def normalize_desc(desc: str) -> str:
     if not desc:
