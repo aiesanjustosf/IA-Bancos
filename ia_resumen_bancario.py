@@ -109,6 +109,27 @@ def fmt_ar(n) -> str:
     if n is None or (isinstance(n, float) and np.isnan(n)):
         return "—"
     return f"{n:,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+def metric_full(label: str, value: str):
+    st.markdown(
+        f"""
+        <div style="padding:0.15rem 0;">
+          <div style="font-size:0.85rem;color:rgba(49,51,63,0.6);margin-bottom:0.15rem;">
+            {label}
+          </div>
+          <div style="
+              font-size:1.65rem;
+              font-weight:650;
+              line-height:1.1;
+              white-space:normal;
+              overflow-wrap:anywhere;
+              letter-spacing:-0.01em;">
+            {value}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
 def lines_from_text(page):
     txt = page.extract_text() or ""
@@ -543,7 +564,7 @@ def render_account_report(
     fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(lines)
     saldo_anterior = find_saldo_anterior_from_lines(lines)
 
-    # Sin movimientos: mostrar saldos y conciliación
+      # Sin movimientos: mostrar saldos y conciliación
     if df.empty:
         total_debitos = 0.0
         total_creditos = 0.0
@@ -555,9 +576,10 @@ def render_account_report(
 
         st.caption("Resumen del período")
         c1, c2, c3 = st.columns(3)
-        with c1: st.metric("Saldo inicial", f"$ {fmt_ar(saldo_inicial)}")
-        with c2: st.metric("Total créditos (+)", f"$ {fmt_ar(total_creditos)}")
-        with c3: st.metric("Total débitos (–)", f"$ {fmt_ar(total_debitos)}")
+        with c1: metric_full("Saldo inicial", f"$ {fmt_ar(saldo_inicial)}")
+        with c2: metric_full("Total créditos (+)", f"$ {fmt_ar(total_creditos)}")
+        with c3: metric_full("Total débitos (–)", f"$ {fmt_ar(total_debitos)}")
+
         c4, c5, c6 = st.columns(3)
         with c4: st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final_visto)}")
         with c5: st.metric("Saldo final calculado", f"$ {fmt_ar(saldo_final_calculado)}")
@@ -571,22 +593,6 @@ def render_account_report(
         st.info("Sin Movimientos")
         return
 
-    # Con movimientos: insertar SALDO ANTERIOR si existe
-    if not np.isnan(saldo_anterior):
-        first_date = df["fecha"].dropna().min()
-        fecha_apertura = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59) if pd.notna(first_date) else pd.NaT
-        apertura = pd.DataFrame([{
-            "fecha": fecha_apertura,
-            "descripcion": "SALDO ANTERIOR",
-            "desc_norm": "SALDO ANTERIOR",
-            "debito": 0.0,
-            "credito": 0.0,
-            "importe": 0.0,
-            "saldo": float(saldo_anterior),
-            "pagina": 0,
-            "orden": 0
-        }])
-        df = pd.concat([apertura, df], ignore_index=True)
 
     # Débito/Crédito por delta de saldo
     df = df.sort_values(["fecha", "orden"]).reset_index(drop=True)
