@@ -105,11 +105,17 @@ def normalize_money(tok: str) -> float:
     except Exception:
         return np.nan
 
+
 def fmt_ar(n) -> str:
     if n is None or (isinstance(n, float) and np.isnan(n)):
         return "—"
     return f"{n:,.2f}".replace(",", "§").replace(".", ",").replace("§", ".")
+
+
 def metric_full(label: str, value: str):
+    """
+    Alternativa a st.metric para evitar truncado con '...' en valores largos.
+    """
     st.markdown(
         f"""
         <div style="padding:0.15rem 0;">
@@ -134,6 +140,7 @@ def metric_full(label: str, value: str):
 def lines_from_text(page):
     txt = page.extract_text() or ""
     return [" ".join(l.split()) for l in txt.splitlines()]
+
 
 def lines_from_words(page, ytol=2.0):
     words = page.extract_words(extra_attrs=["x0", "top"])
@@ -167,10 +174,12 @@ def normalize_desc(desc: str) -> str:
     u = " ".join(u.split())
     return u
 
+
 # ---------- Detección de banco (solo banner) ----------
 BANK_MACRO_HINTS    = ("BANCO MACRO","CUENTA CORRIENTE BANCARIA","SALDO ULTIMO EXTRACTO AL","DEBITO FISCAL IVA BASICO","N/D DBCR 25413")
 BANK_SANTAFE_HINTS  = ("BANCO DE SANTA FE","NUEVO BANCO DE SANTA FE","SALDO ANTERIOR","IMPTRANS","IVA GRAL")
 BANK_NACION_HINTS   = (BNA_NAME_HINT, "SALDO ANTERIOR", "SALDO FINAL", "I.V.A. BASE", "COMIS.")
+
 
 def _text_from_pdf(file_like) -> str:
     try:
@@ -178,6 +187,7 @@ def _text_from_pdf(file_like) -> str:
             return "\n".join((p.extract_text() or "") for p in pdf.pages)
     except Exception:
         return ""
+
 
 def detect_bank_from_text(txt: str) -> str:
     U = (txt or "").upper()
@@ -192,6 +202,7 @@ def detect_bank_from_text(txt: str) -> str:
     scores.sort(key=lambda x: x[1], reverse=True)
     return scores[0][0] if scores[0][1] > 0 else "Banco no identificado"
 
+
 # ---------- extracción de líneas ----------
 def extract_all_lines(file_like):
     out = []
@@ -204,9 +215,11 @@ def extract_all_lines(file_like):
             out.extend([(pi, l) for l in combined if l.strip()])
     return out
 
+
 # ---------- “Información de su/s Cuenta/s” (whitelist Macro) ----------
 def _normalize_account_token(tok: str) -> str:
     return re.sub(rf"\s*{HYPH}\s*", "-", tok)
+
 
 def macro_extract_account_whitelist(file_like) -> dict:
     info = {}
@@ -237,6 +250,7 @@ def macro_extract_account_whitelist(file_like) -> dict:
                     break
     return info
 
+
 def _normalize_title_from_pending(pending_title: str) -> str:
     t = pending_title.upper()
     if "CORRIENTE" in t and "ESPECIAL" in t and ("DOLAR" in t or "DÓLAR" in t): return "CUENTA CORRIENTE ESPECIAL EN DOLARES"
@@ -244,6 +258,7 @@ def _normalize_title_from_pending(pending_title: str) -> str:
     if "CORRIENTE" in t:                                                       return "CUENTA CORRIENTE BANCARIA"
     if "CAJA DE AHORRO" in t:                                                  return "CAJA DE AHORRO"
     return "CUENTA"
+
 
 # ---------- Macro: segmentación por cuentas (ID = número completo) ----------
 def macro_split_account_blocks(file_like):
@@ -323,6 +338,7 @@ def macro_split_account_blocks(file_like):
         blocks.append(acc)
     return blocks
 
+
 # ---------- Parsing movimientos (genérico: Macro/SF/BNA) ----------
 def parse_lines(lines) -> pd.DataFrame:
     rows = []
@@ -356,13 +372,16 @@ def parse_lines(lines) -> pd.DataFrame:
         })
     return pd.DataFrame(rows)
 
+
 # ---------- Saldos ----------
 def _only_one_amount(line: str) -> bool:
     return len(list(MONEY_RE.finditer(line))) == 1
 
+
 def _first_amount_value(line: str) -> float:
     m = MONEY_RE.search(line)
     return normalize_money(m.group(0)) if m else np.nan
+
 
 def find_saldo_final_from_lines(lines):
     # 1) Macro/otros con formato expreso
@@ -381,6 +400,7 @@ def find_saldo_final_from_lines(lines):
             if not np.isnan(saldo):
                 return pd.NaT, saldo
     return pd.NaT, np.nan
+
 
 def find_saldo_anterior_from_lines(lines):
     # 1) Macro (expreso con fecha)
@@ -424,8 +444,10 @@ def find_saldo_anterior_from_lines(lines):
             break
     return np.nan
 
+
 # ---------- Clasificación ----------
 RE_PERCEP_RG2408 = re.compile(r"PERCEPCI[ÓO]N\s+IVA\s+RG\.?\s*2408", re.IGNORECASE)
+
 
 def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     u = (desc or "").upper()
@@ -530,6 +552,7 @@ def clasificar(desc: str, desc_norm: str, deb: float, cre: float) -> str:
     if deb and deb != 0: return "Débito"
     return "Otros"
 
+
 # ---------- Ajuste específico Macro: IVA 10,5% INTER.ADEL.CC + DEBITO FISCAL ----------
 def ajustar_macro_iva_105(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -548,6 +571,7 @@ def ajustar_macro_iva_105(df: pd.DataFrame) -> pd.DataFrame:
                 df.at[i + 1, "Clasificación"] = "IVA 10,5% (sobre comisiones)"
     return df
 
+
 # ---------- Helper de UI por cuenta (genérico) ----------
 def render_account_report(
     banco_slug: str,
@@ -564,7 +588,7 @@ def render_account_report(
     fecha_cierre, saldo_final_pdf = find_saldo_final_from_lines(lines)
     saldo_anterior = find_saldo_anterior_from_lines(lines)
 
-      # Sin movimientos: mostrar saldos y conciliación
+    # Sin movimientos: mostrar saldos y conciliación
     if df.empty:
         total_debitos = 0.0
         total_creditos = 0.0
@@ -593,6 +617,22 @@ def render_account_report(
         st.info("Sin Movimientos")
         return
 
+    # Con movimientos: insertar SALDO ANTERIOR si existe
+    if not np.isnan(saldo_anterior):
+        first_date = df["fecha"].dropna().min()
+        fecha_apertura = (first_date - pd.Timedelta(days=1)).normalize() + pd.Timedelta(hours=23, minutes=59, seconds=59) if pd.notna(first_date) else pd.NaT
+        apertura = pd.DataFrame([{
+            "fecha": fecha_apertura,
+            "descripcion": "SALDO ANTERIOR",
+            "desc_norm": "SALDO ANTERIOR",
+            "debito": 0.0,
+            "credito": 0.0,
+            "importe": 0.0,
+            "saldo": float(saldo_anterior),
+            "pagina": 0,
+            "orden": 0
+        }])
+        df = pd.concat([apertura, df], ignore_index=True)
 
     # Débito/Crédito por delta de saldo
     df = df.sort_values(["fecha", "orden"]).reset_index(drop=True)
@@ -626,9 +666,9 @@ def render_account_report(
 
     st.caption("Resumen del período")
     c1, c2, c3 = st.columns(3)
-    with c1: st.metric("Saldo inicial", f"$ {fmt_ar(saldo_inicial)}")
-    with c2: st.metric("Total créditos (+)", f"$ {fmt_ar(total_creditos)}")
-    with c3: st.metric("Total débitos (–)", f"$ {fmt_ar(total_debitos)}")
+    with c1: metric_full("Saldo inicial", f"$ {fmt_ar(saldo_inicial)}")
+    with c2: metric_full("Total créditos (+)", f"$ {fmt_ar(total_creditos)}")
+    with c3: metric_full("Total débitos (–)", f"$ {fmt_ar(total_debitos)}")
     c4, c5, c6 = st.columns(3)
     with c4: st.metric("Saldo final (PDF)", f"$ {fmt_ar(saldo_final_visto)}")
     with c5: st.metric("Saldo final calculado", f"$ {fmt_ar(saldo_final_calculado)}")
@@ -675,7 +715,8 @@ def render_account_report(
         if c in df_view.columns:
             df_view[c] = df_view[c].map(fmt_ar)
     st.dataframe(df_view, use_container_width=True)
-        # ===== Detalle de créditos (préstamos) =====
+
+    # ===== Detalle de créditos (préstamos) =====
     st.caption("Detalle de créditos (préstamos)")
 
     credit_classes = ["Cuota de préstamo", "Acreditación Préstamos"]
@@ -690,9 +731,9 @@ def render_account_report(
         neto_creditos = total_acredit - total_cuotas
 
         k1, k2, k3 = st.columns(3)
-        with k1: st.metric("Acreditaciones de préstamos (+)", f"$ {fmt_ar(total_acredit)}")
-        with k2: st.metric("Cuotas de préstamo (–)", f"$ {fmt_ar(total_cuotas)}")
-        with k3: st.metric("Neto (acreditado – cuotas)", f"$ {fmt_ar(neto_creditos)}")
+        with k1: metric_full("Acreditaciones de préstamos (+)", f"$ {fmt_ar(total_acredit)}")
+        with k2: metric_full("Cuotas de préstamo (–)", f"$ {fmt_ar(total_cuotas)}")
+        with k3: metric_full("Neto (acreditado – cuotas)", f"$ {fmt_ar(neto_creditos)}")
 
         # Grilla (formateada)
         df_creditos_view = df_creditos.copy()
@@ -749,7 +790,6 @@ def render_account_report(
                 use_container_width=True,
                 key=f"dl_creditos_csv_{acc_id}",
             )
-
 
     # Descargas
     st.caption("Descargar")
@@ -840,6 +880,7 @@ def render_account_report(
         except Exception as e:
             st.info(f"No se pudo generar el PDF del Resumen Operativo: {e}")
 
+
 # ---------- Banco Santa Fe: extraer Nro de cuenta desde “Consolidado de cuentas” ----------
 def santafe_extract_accounts(file_like):
     """
@@ -863,6 +904,7 @@ def santafe_extract_accounts(file_like):
             uniq.append(it)
     return uniq
 
+
 # ---------- Banco Nación: meta (Cuenta/CBU/Período) + gastos finales ----------
 def bna_extract_gastos_finales(txt: str) -> dict:
     out = {}
@@ -873,6 +915,7 @@ def bna_extract_gastos_finales(txt: str) -> dict:
             etiqueta = "I.V.A. BASE"
         out[etiqueta] = float(importe) if importe is not None else np.nan
     return out
+
 
 def bna_extract_meta(file_like):
     """
@@ -896,6 +939,7 @@ def bna_extract_meta(file_like):
             acc = monly.group(1)
 
     return {"account_number": acc, "cbu": cbu, "period_start": pstart, "period_end": pend}
+
 
 # ---------- UI principal ----------
 uploaded = st.file_uploader("Subí un PDF del resumen bancario", type=["pdf"])
