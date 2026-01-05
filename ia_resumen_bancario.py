@@ -669,6 +669,81 @@ def render_account_report(
         if c in df_view.columns:
             df_view[c] = df_view[c].map(fmt_ar)
     st.dataframe(df_view, use_container_width=True)
+        # ===== Detalle de créditos (préstamos) =====
+    st.caption("Detalle de créditos (préstamos)")
+
+    credit_classes = ["Cuota de préstamo", "Acreditación Préstamos"]
+    df_creditos = df_sorted.loc[df_sorted["Clasificación"].isin(credit_classes)].copy()
+
+    if df_creditos.empty:
+        st.info("Sin movimientos de créditos/préstamos en el período.")
+    else:
+        # Resumen
+        total_cuotas = float(df_creditos.loc[df_creditos["Clasificación"].eq("Cuota de préstamo"), "debito"].sum())
+        total_acredit = float(df_creditos.loc[df_creditos["Clasificación"].eq("Acreditación Préstamos"), "credito"].sum())
+        neto_creditos = total_acredit - total_cuotas
+
+        k1, k2, k3 = st.columns(3)
+        with k1: st.metric("Acreditaciones de préstamos (+)", f"$ {fmt_ar(total_acredit)}")
+        with k2: st.metric("Cuotas de préstamo (–)", f"$ {fmt_ar(total_cuotas)}")
+        with k3: st.metric("Neto (acreditado – cuotas)", f"$ {fmt_ar(neto_creditos)}")
+
+        # Grilla (formateada)
+        df_creditos_view = df_creditos.copy()
+        for c in ["debito", "credito", "importe", "saldo"]:
+            if c in df_creditos_view.columns:
+                df_creditos_view[c] = df_creditos_view[c].map(fmt_ar)
+        st.dataframe(df_creditos_view, use_container_width=True)
+
+        # Descarga (Excel con fallback CSV) — sufijos calculados localmente para evitar UnboundLocalError
+        st.caption("Descargar detalle de créditos (préstamos)")
+
+        credit_date_suffix = f"_{fecha_cierre.strftime('%Y%m%d')}" if pd.notna(fecha_cierre) else ""
+        credit_acc_suffix  = f"_{account_number}"
+
+        try:
+            import xlsxwriter
+            output_c = io.BytesIO()
+            with pd.ExcelWriter(output_c, engine="xlsxwriter") as writer:
+                df_creditos.to_excel(writer, index=False, sheet_name="Creditos")
+                wb = writer.book
+                ws = writer.sheets["Creditos"]
+                money_fmt = wb.add_format({"num_format": "#,##0.00"})
+                date_fmt  = wb.add_format({"num_format": "dd/mm/yyyy"})
+
+                for idx, col in enumerate(df_creditos.columns, start=0):
+                    col_values = df_creditos[col].astype(str)
+                    max_len = max(len(col), *(len(v) for v in col_values))
+                    ws.set_column(idx, idx, min(max_len + 2, 40))
+
+                for c in ["debito", "credito", "importe", "saldo"]:
+                    if c in df_creditos.columns:
+                        j = df_creditos.columns.get_loc(c)
+                        ws.set_column(j, j, 16, money_fmt)
+
+                if "fecha" in df_creditos.columns:
+                    j = df_creditos.columns.get_loc("fecha")
+                    ws.set_column(j, j, 14, date_fmt)
+
+            st.download_button(
+                "📥 Descargar Excel – Detalle Créditos",
+                data=output_c.getvalue(),
+                file_name=f"detalle_creditos_{banco_slug}{credit_acc_suffix}{credit_date_suffix}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"dl_creditos_xlsx_{acc_id}",
+            )
+        except Exception:
+            csv_bytes_c = df_creditos.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 Descargar CSV – Detalle Créditos (fallback)",
+                data=csv_bytes_c,
+                file_name=f"detalle_creditos_{banco_slug}{credit_acc_suffix}{credit_date_suffix}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key=f"dl_creditos_csv_{acc_id}",
+            )
+
 
     # Descargas
     st.caption("Descargar")
