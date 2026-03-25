@@ -689,7 +689,10 @@ def render_account_report(
     net21  = round(iva21  / 0.21,  2) if iva21  else 0.0
     net105 = round(iva105 / 0.105, 2) if iva105 else 0.0
     percep_iva = float(df_sorted.loc[df_sorted["Clasificación"].eq("Percepciones de IVA"), "debito"].sum())
-    ley_25413  = float(df_sorted.loc[df_sorted["Clasificación"].eq("LEY 25.413"),          "debito"].sum())
+    ley_25413_mask = df_sorted["Clasificación"].eq("LEY 25.413")
+    ley_25413_debitos  = float(df_sorted.loc[ley_25413_mask, "debito"].sum())
+    ley_25413_creditos = float(df_sorted.loc[ley_25413_mask, "credito"].sum())
+    ley_25413  = ley_25413_debitos - ley_25413_creditos
     sircreb    = float(df_sorted.loc[df_sorted["Clasificación"].eq("SIRCREB"),            "debito"].sum())
 
     # Métricas IVA
